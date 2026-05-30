@@ -1558,7 +1558,7 @@ class Substrates2Test implements Substrates {
       final var cortex = Substrates.cortex ();
       final var circuit = cortex.circuit ();
       try {
-        var reservoir = circuit.reservoir ();
+        var reservoir = circuit.reservoir ( 1024 );
         assertNotNull ( reservoir );
       } finally {
         circuit.close ();

@@ -249,11 +249,11 @@ public final class FsConduit < E > implements Conduit < E > {
   @New
   @NotNull
   @Override
-  public Reservoir < E > reservoir () {
+  public Reservoir < E > reservoir ( int capacity ) {
     requireOpen ( "reservoir" );
     FsSubject < Reservoir < E > > resSubject = new FsSubject <> ( cortex ().name ( "reservoir" ),
       (FsSubject < ? >) subject, Reservoir.class );
-    FsReservoir < E > reservoir = new FsReservoir <> ( resSubject );
+    FsReservoir < E > reservoir = new FsReservoir <> ( resSubject, capacity );
 
     FsSubscriber < E > sub = new FsSubscriber <> (
       new FsSubject <> ( cortex ().name ( "reservoir.subscriber" ), resSubject, Subscriber.class ),

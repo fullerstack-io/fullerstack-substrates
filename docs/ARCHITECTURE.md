@@ -39,6 +39,10 @@ FsCortexProvider (SPI entry point)
               │     └── FsDerivedPool (derived view: pool(Function), pool(Flow), pool(Fiber))
               ├── FsBank (2.5 — closeable name-indexed conduit factory)
               ├── FsCell (2.7 — circuit-owned single-slot state; receptor-pipe + volatile)
+              ├── FsPin (2.9 — circuit-owned, owner-context-guarded state handle;
+              │          immediate get/set on the worker thread, ISE elsewhere)
+              ├── FsPort (2.9 — circuit-owned queued mutation handle without read;
+              │           emit/replace/update via CircuitJob submission)
               ├── FsFlow (type-changing composition: map / scan / window / flow / fiber / pipe —
               │           uniform Wrap[] storage; 2.6/2.7 adds scan, window(int), window(Duration, int),
               │           flow(Function<Subject, Flow>))
@@ -58,7 +62,7 @@ FsCortexProvider (SPI entry point)
               │             a lazy single-thread daemon ScheduledExecutorService shared
               │             across all tickers on the circuit, shut down on circuit close)
               ├── FsWindow (2.6 — strided view over a rolling buffer; restriction ops share buffer)
-              └── FsReservoir (buffered emission capture)
+              └── FsReservoir (bounded buffered emission capture — 2.9 ArrayDeque with eviction)
 
 FsName (hierarchical dot-notation names with interning)
 FsSubject (identity: Id + Name + State + Type)

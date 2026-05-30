@@ -673,7 +673,7 @@ final class CircuitTest
           Integer.class
         );
 
-      final Reservoir < Integer > reservoir = conduit.reservoir ();
+      final Reservoir < Integer > reservoir = conduit.reservoir ( 1024 );
 
       final Pipe < Integer > pipe =
         conduit.get ( cortex.name ( "integration.channel" ) );
@@ -715,7 +715,7 @@ final class CircuitTest
           Integer.class
         );
 
-      final Reservoir < Integer > reservoir = conduit.reservoir ();
+      final Reservoir < Integer > reservoir = conduit.reservoir ( 1024 );
 
       final Pipe < Integer > pipe =
         conduit.get ( cortex.name ( "flow.channel" ) );
@@ -755,8 +755,8 @@ final class CircuitTest
       final var conduit2 =
         circuit.conduit ( cortex.name ( "conduit.two" ), Integer.class );
 
-      final Reservoir < String > reservoir1 = conduit1.reservoir ();
-      final Reservoir < Integer > reservoir2 = conduit2.reservoir ();
+      final Reservoir < String > reservoir1 = conduit1.reservoir ( 1024 );
+      final Reservoir < Integer > reservoir2 = conduit2.reservoir ( 1024 );
 
       final Pipe < String > pipe1 =
         conduit1.get ( cortex.name ( "channel.alpha" ) );

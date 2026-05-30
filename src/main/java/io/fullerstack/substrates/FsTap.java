@@ -237,11 +237,11 @@ final class FsTap < T > implements Tap < T > {
   @New
   @NotNull
   @Override
-  public Reservoir < T > reservoir () {
+  public Reservoir < T > reservoir ( int capacity ) {
     requireOpen ( "reservoir" );
     FsSubject < Reservoir < T > > resSubject = new FsSubject <> ( cortex ().name ( "reservoir" ), (FsSubject < ? >) subject,
       Reservoir.class );
-    FsReservoir < T > reservoir = new FsReservoir <> ( resSubject );
+    FsReservoir < T > reservoir = new FsReservoir <> ( resSubject, capacity );
     FsSubscriber < T > sub = new FsSubscriber <> (
       new FsSubject <> ( cortex ().name ( "reservoir.subscriber" ), resSubject, Subscriber.class ),
       ( pipeSubject, registrar ) -> registrar.register ( emission -> reservoir.capture ( emission, pipeSubject ) ) );

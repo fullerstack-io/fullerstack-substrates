@@ -46,7 +46,7 @@ final class ReservoirTest
           Object.class
         );
 
-      final var reservoir = conduit.reservoir ();
+      final var reservoir = conduit.reservoir ( 1024 );
 
       final var name = cortex.name ( "test.channel" );
       final var pipe = conduit.get ( name );

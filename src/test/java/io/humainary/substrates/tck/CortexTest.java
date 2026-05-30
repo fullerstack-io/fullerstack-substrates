@@ -94,7 +94,7 @@ final class CortexTest
           String.class
         );
 
-      final Reservoir < String > reservoir = conduit.reservoir ();
+      final Reservoir < String > reservoir = conduit.reservoir ( 1024 );
 
       final Pipe < String > pipe =
         conduit.get ( cortex.name ( "integration.channel" ) );
@@ -267,7 +267,7 @@ final class CortexTest
       final var conduit =
         circuit.conduit ( Integer.class );
 
-      final Reservoir < Integer > reservoir = conduit.reservoir ();
+      final Reservoir < Integer > reservoir = conduit.reservoir ( 1024 );
 
       final Pipe < Integer > pipe =
         conduit.get ( cortex.name ( "test.channel" ) );
@@ -307,7 +307,7 @@ final class CortexTest
         circuit.conduit ( Integer.class );
 
       // Conduit is a Context
-      final Reservoir < Integer > reservoir = conduit.reservoir ();
+      final Reservoir < Integer > reservoir = conduit.reservoir ( 1024 );
 
       assertNotNull ( reservoir );
 
@@ -331,7 +331,7 @@ final class CortexTest
       final var conduit =
         circuit.conduit ( String.class );
 
-      final Reservoir < String > reservoir = conduit.reservoir ();
+      final Reservoir < String > reservoir = conduit.reservoir ( 1024 );
 
       assertNotNull ( reservoir );
       assertNotNull ( reservoir.subject () );
@@ -425,7 +425,7 @@ final class CortexTest
       final var conduit =
         circuit.conduit ( String.class );
 
-      final Reservoir < String > reservoir = conduit.reservoir ();
+      final Reservoir < String > reservoir = conduit.reservoir ( 1024 );
 
       final Pipe < String > pipe =
         conduit.get ( cortex.name ( "test.channel" ) );
@@ -472,7 +472,7 @@ final class CortexTest
       final var conduit =
         circuit.conduit ( String.class );
 
-      final var reservoir = conduit.reservoir ();
+      final var reservoir = conduit.reservoir ( 1024 );
 
       assertEquals ( Reservoir.class, reservoir.subject ().type () );
 

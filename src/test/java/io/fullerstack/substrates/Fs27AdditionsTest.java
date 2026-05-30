@@ -28,17 +28,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 ///   - Flow.pipe(Cell)               — terminate Flow into Cell
 class Fs27AdditionsTest {
 
-  // ── Circuit.cell() — requireOpen contract (spec §11.3) ─────────────────
-
-  @Test
-  @DisplayName("Circuit.cell() throws Fault on closed circuit")
-  void cellOnClosedCircuitThrows() {
-    Cortex cortex = Substrates.cortex();
-    Circuit circuit = cortex.circuit();
-    circuit.close();
-    assertThatThrownBy(circuit::cell)
-        .isInstanceOf(io.humainary.substrates.api.Substrates.Fault.class);
-  }
+  // ── Circuit.cell(initial) — requireOpen contract (spec §11.3) ──────────
 
   @Test
   @DisplayName("Circuit.cell(initial) throws Fault on closed circuit")

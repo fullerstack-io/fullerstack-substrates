@@ -15,7 +15,9 @@ import io.humainary.substrates.api.Substrates.Idempotent;
 import io.humainary.substrates.api.Substrates.Name;
 import io.humainary.substrates.api.Substrates.New;
 import io.humainary.substrates.api.Substrates.NotNull;
+import io.humainary.substrates.api.Substrates.Pin;
 import io.humainary.substrates.api.Substrates.Pipe;
+import io.humainary.substrates.api.Substrates.Port;
 import io.humainary.substrates.api.Substrates.Provided;
 import io.humainary.substrates.api.Substrates.Pulse;
 import io.humainary.substrates.api.Substrates.Queued;
@@ -721,14 +723,6 @@ public final class FsCircuit implements Circuit {
   @New
   @NotNull
   @Override
-  public < E > Cell < E > cell () {
-    requireOpen ( "cell" );
-    return new FsCell <> ( (FsSubject < ? >) subject, nextCellName (), this, null );
-  }
-
-  @New
-  @NotNull
-  @Override
   public < E > Cell < E > cell ( @NotNull E initial ) {
     requireNonNull ( initial );
     requireOpen ( "cell" );
@@ -736,9 +730,65 @@ public final class FsCircuit implements Circuit {
   }
 
   private final AtomicLong cellSeq = new AtomicLong ();
+  private final AtomicLong pinSeq  = new AtomicLong ();
+  private final AtomicLong portSeq = new AtomicLong ();
 
   private Name nextCellName () {
     return cortex ().name ( "cell." + cellSeq.getAndIncrement () );
+  }
+
+  private Name nextPinName () {
+    return cortex ().name ( "pin." + pinSeq.getAndIncrement () );
+  }
+
+  private Name nextPortName () {
+    return cortex ().name ( "port." + portSeq.getAndIncrement () );
+  }
+
+  // ===================================================================================
+  // Factory Methods - Pin (2.9 §5118-5184)
+  // ===================================================================================
+
+  @New
+  @NotNull
+  @Override
+  public < E > Pin < E > pin ( @NotNull E initial ) {
+    requireNonNull ( initial );
+    requireOpen ( "pin" );
+    return new FsPin <> ( (FsSubject < ? >) subject, nextPinName (), this, initial );
+  }
+
+  @New
+  @NotNull
+  @Override
+  public < E > Pin < E > pin ( @NotNull Name name, @NotNull E initial ) {
+    requireNonNull ( name );
+    requireNonNull ( initial );
+    requireOpen ( "pin" );
+    return new FsPin <> ( (FsSubject < ? >) subject, name, this, initial );
+  }
+
+  // ===================================================================================
+  // Factory Methods - Port (2.9 §5405-5564)
+  // ===================================================================================
+
+  @New
+  @NotNull
+  @Override
+  public < E > Port < E > port ( @NotNull E initial ) {
+    requireNonNull ( initial );
+    requireOpen ( "port" );
+    return new FsPort <> ( (FsSubject < ? >) subject, nextPortName (), this, initial );
+  }
+
+  @New
+  @NotNull
+  @Override
+  public < E > Port < E > port ( @NotNull Name name, @NotNull E initial ) {
+    requireNonNull ( name );
+    requireNonNull ( initial );
+    requireOpen ( "port" );
+    return new FsPort <> ( (FsSubject < ? >) subject, name, this, initial );
   }
 
   // ===================================================================================
@@ -804,8 +854,8 @@ public final class FsCircuit implements Circuit {
   @New
   @NotNull
   @Override
-  public Reservoir < State > reservoir () {
-    return stateConduit ().reservoir ();
+  public Reservoir < State > reservoir ( int capacity ) {
+    return stateConduit ().reservoir ( capacity );
   }
 
   // ===================================================================================

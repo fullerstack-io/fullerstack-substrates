@@ -124,7 +124,7 @@ public class ReservoirOps
 
     final var
       reservoir =
-      conduit.reservoir ();
+      conduit.reservoir ( COUNT );
 
     final var
       pipe =
@@ -175,7 +175,7 @@ public class ReservoirOps
 
     final var
       reservoir =
-      conduit.reservoir ();
+      conduit.reservoir ( COUNT );
 
     final var
       pipe =
@@ -226,7 +226,7 @@ public class ReservoirOps
 
     final var
       reservoir =
-      conduit.reservoir ();
+      conduit.reservoir ( COUNT );
 
     final var
       pipe =
@@ -275,7 +275,7 @@ public class ReservoirOps
 
     final var
       reservoir =
-      conduit.reservoir ();
+      conduit.reservoir ( COUNT );
 
     final var
       pipe =
@@ -325,7 +325,7 @@ public class ReservoirOps
 
     final var
       reservoir =
-      conduit.reservoir ();
+      conduit.reservoir ( COUNT );
 
     final var
       pipe =
@@ -386,7 +386,7 @@ public class ReservoirOps
 
     final var
       reservoir =
-      conduit.reservoir ();
+      conduit.reservoir ( COUNT );
 
     final var
       pipe =
@@ -426,7 +426,7 @@ public class ReservoirOps
 
     final var
       reservoir =
-      conduit.reservoir ();
+      conduit.reservoir ( COUNT );
 
     final var
       pipe =
@@ -473,7 +473,7 @@ public class ReservoirOps
 
     final var
       reservoir =
-      conduit.reservoir ();
+      conduit.reservoir ( COUNT );
 
     final var
       pipe =
@@ -525,7 +525,7 @@ public class ReservoirOps
 
     final var
       reservoir =
-      conduit.reservoir ();
+      conduit.reservoir ( COUNT );
 
     final var
       pipe =
@@ -579,7 +579,7 @@ public class ReservoirOps
 
     final var
       reservoir =
-      conduit.reservoir ();
+      conduit.reservoir ( COUNT );
 
     final var
       pipe =

@@ -205,7 +205,7 @@ class Substrates25Test implements Substrates {
       try {
         final Conduit < Integer > c = circuit.conduit ( Integer.class );
         c.close ();
-        assertThrows ( Fault.class, c::reservoir );
+        assertThrows ( Fault.class, () -> c.reservoir ( 1024 ) );
       } finally {
         circuit.close ();
       }

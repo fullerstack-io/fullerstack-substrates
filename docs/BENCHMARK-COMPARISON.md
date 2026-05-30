@@ -1,6 +1,6 @@
 # Benchmark Comparison: Fullerstack vs Humainary Substrates
 
-**Substrates/Serventis 2.8.0** · `io.fullerstack:fullerstack-substrates:2.8.0-RC1`
+**Substrates/Serventis 2.9.0** · `io.fullerstack:fullerstack-substrates:2.9.0`
 
 > **2.8 status:** the tables below are post-2.4 measurements. 2.5 added new API
 > surface (Bank, closeAwait, 6 new Fiber operators) and tightened spec conformance with

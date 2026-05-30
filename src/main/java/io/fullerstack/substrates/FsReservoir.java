@@ -9,6 +9,7 @@ import io.humainary.substrates.api.Substrates.Reservoir;
 import io.humainary.substrates.api.Substrates.Tenure;
 import io.humainary.substrates.api.Substrates.Subject;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Stream;
@@ -32,18 +33,25 @@ public final class FsReservoir < E > implements Reservoir < E > {
   /// The subject identity for this reservoir.
   private final Subject < Reservoir < E > > subject;
 
-  /// Internal buffer storing captured emissions.
-  private final List < Cap < E > > buffer = new ArrayList <> ();
+  /// Bounded capacity (2.9 spec §6006-6012: oldest evicted when full).
+  private final int capacity;
+
+  /// Internal buffer storing captured emissions, bounded by `capacity`.
+  /// ArrayDeque gives O(1) pollFirst for eviction.
+  private final ArrayDeque < Cap < E > > buffer;
 
   /// Closed flag. Spec §9.1 requires `close()` be idempotent — explicit gate
   /// here keeps the contract intact if cleanup grows beyond `buffer.clear()`.
   private volatile boolean closed;
 
-  /// Creates a new reservoir with the given subject identity.
+  /// Creates a new reservoir with the given subject identity and bounded capacity.
   ///
-  /// @param subject the subject identity for this reservoir
-  public FsReservoir ( Subject < Reservoir < E > > subject ) {
-    this.subject = subject;
+  /// @param subject  the subject identity for this reservoir
+  /// @param capacity the maximum number of captures retained; older entries are evicted when full
+  public FsReservoir ( Subject < Reservoir < E > > subject, int capacity ) {
+    this.subject  = subject;
+    this.capacity = capacity;
+    this.buffer   = new ArrayDeque <> ( Math.max ( 16, Math.min ( capacity, 1024 ) ) );
   }
 
   /// Returns the subject identity of this reservoir.
@@ -61,14 +69,15 @@ public final class FsReservoir < E > implements Reservoir < E > {
   /// @see Capture
   public Stream < Capture < E > > drain () {
     if ( closed ) throw new Fault ( subject, "drain", "reservoir is closed" );
-    // Optimized: use buffer snapshot instead of toArray allocation
     List < Cap < E > > snapshot = new ArrayList <> ( buffer );
     buffer.clear ();
     return snapshot.stream ().map ( c -> c );
   }
 
-  /// Captures an emission with its channel subject.
+  /// Captures an emission with its channel subject. Evicts the oldest entry
+  /// when the buffer is at capacity (2.9 spec §6006-6012).
   void capture ( E emission, Subject < Pipe < E > > channelSubject ) {
+    if ( buffer.size () >= capacity ) buffer.pollFirst ();
     buffer.add ( new Cap <> ( emission, channelSubject ) );
   }
 

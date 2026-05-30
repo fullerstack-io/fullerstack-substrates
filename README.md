@@ -4,10 +4,10 @@ SPI provider implementation of the [Humainary Substrates API](https://github.com
 
 | | |
 |---|---|
-| **Version** | 2.8.0-RC1 |
-| **API** | Substrates 2.8.0 + Serventis 2.8.0 |
+| **Version** | 2.9.0 |
+| **API** | Substrates 2.9.0 + Serventis 2.9.0 |
 | **Java** | 26 (Virtual Threads + Preview) |
-| **Tests** | 588 (575 carry-forward + 13 new for the 2.8 `Ticker` primitive: monotonic sequence, fixed-rate, close, circuit-close, throw isolation, fault paths, mean-interval convergence) |
+| **Tests** | 587 (passing on the 2.9 API surface — adds `FsPin` and `FsPort` implementations, bounded `FsReservoir` with eviction, removes the no-arg `cell()` factory) |
 | **Benchmarks** | 14 JMH groups, 185+ benchmarks |
 
 ## Prerequisites
@@ -30,7 +30,7 @@ SPI provider implementation of the [Humainary Substrates API](https://github.com
 ## Build & Test
 
 ```bash
-mvn clean install        # Build + run all 588 tests
+mvn clean install        # Build + run all 587 tests
 mvn test                 # Tests only
 ```
 
@@ -54,7 +54,7 @@ The artifact is published to [GitHub Packages](https://github.com/fullerstack-io
   <dependency>
     <groupId>io.fullerstack</groupId>
     <artifactId>fullerstack-substrates</artifactId>
-    <version>2.8.0-RC1</version>
+    <version>2.9.0</version>
   </dependency>
 </dependencies>
 ```
@@ -127,7 +127,7 @@ Selected results (ns/op, JDK 26, GitHub Codespaces 2 vCPU). Cross-platform numbe
 | [Developer Guide](docs/DEVELOPER-GUIDE.md) | Usage patterns, best practices, Serventis integration |
 | [Architecture](docs/ARCHITECTURE.md) | Implementation decisions, queue internals, async model, thread safety, performance |
 | [Benchmark Comparison](docs/BENCHMARK-COMPARISON.md) | Cross-platform JMH results vs Humainary baseline |
-| [2.8 Migration](docs/2.8-MIGRATION.md) | Upgrade notes from 2.7 to 2.8 |
+| [2.9 Migration](docs/2.9-MIGRATION.md) | Upgrade notes from 2.8 to 2.9 (Pin/Port, bounded Reservoir, no-arg cell removal) |
 
 ### External References
 

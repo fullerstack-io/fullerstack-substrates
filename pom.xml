@@ -227,20 +227,17 @@
         <version>${maven-jar-plugin.version}</version>
       </plugin>
 
-      <!-- EditorConfig Formatter (uses IntelliJ CE formatter via javalint) -->
+      <!--
+        EditorConfig Formatter (IntelliJ CE formatter via javalint).
+        Plugin is configured but NOT bound to a build phase: running every
+        mvn install / mvn deploy against the javalint rule set would gate
+        publish on dev-style concerns. Lint is available on demand via
+        ./scripts/format.sh (check flag) or mvn editorconfig-maven-plugin:check.
+      -->
       <plugin>
         <groupId>org.ec4j.maven</groupId>
         <artifactId>editorconfig-maven-plugin</artifactId>
         <version>0.1.3</version>
-        <executions>
-          <execution>
-            <id>check</id>
-            <phase>verify</phase>
-            <goals>
-              <goal>check</goal>
-            </goals>
-          </execution>
-        </executions>
         <configuration>
           <!-- Disable default linters, use javalint instead -->
           <linters>

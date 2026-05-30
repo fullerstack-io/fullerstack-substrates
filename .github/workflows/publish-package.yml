@@ -26,17 +26,19 @@ jobs:
           distribution: 'temurin'
           cache: maven
 
+      # Clone Humainary APIs OUTSIDE the workspace so the editorconfig
+      # plugin (and any other workspace-walking tool) does not descend
+      # into upstream's source tree. The artifacts land in ~/.m2 and are
+      # picked up by our build from there.
       - name: Clone and install Humainary Substrates API
         run: |
-          git clone https://github.com/humainary-io/substrates-api-java.git
-          cd substrates-api-java/api
-          mvn clean install -DskipTests
+          git clone https://github.com/humainary-io/substrates-api-java.git "$RUNNER_TEMP/substrates-api-java"
+          mvn -f "$RUNNER_TEMP/substrates-api-java/api/pom.xml" clean install -DskipTests
 
       - name: Clone and install Humainary Serventis API
         run: |
-          git clone https://github.com/humainary-io/serventis-api-java.git
-          cd serventis-api-java/api
-          mvn clean install -DskipTests
+          git clone https://github.com/humainary-io/serventis-api-java.git "$RUNNER_TEMP/serventis-api-java"
+          mvn -f "$RUNNER_TEMP/serventis-api-java/api/pom.xml" clean install -DskipTests
 
       - name: Build and publish to GitHub Packages
         run: mvn -B clean deploy -DskipTests

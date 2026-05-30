@@ -730,32 +730,27 @@ public final class FsCircuit implements Circuit {
   }
 
   private final AtomicLong cellSeq = new AtomicLong ();
-  private final AtomicLong pinSeq  = new AtomicLong ();
-  private final AtomicLong portSeq = new AtomicLong ();
 
   private Name nextCellName () {
     return cortex ().name ( "cell." + cellSeq.getAndIncrement () );
   }
 
-  private Name nextPinName () {
-    return cortex ().name ( "pin." + pinSeq.getAndIncrement () );
-  }
-
-  private Name nextPortName () {
-    return cortex ().name ( "port." + portSeq.getAndIncrement () );
-  }
-
   // ===================================================================================
-  // Factory Methods - Pin (2.9 §5118-5184)
+  // Factory Methods - Pin (2.9 SPEC §11.7)
   // ===================================================================================
 
+  /// SPEC §11.7: "when no name is supplied, the implementation uses the
+  /// owning circuit's name." FsSubject treats `name == null` as a delegation
+  /// to the parent's name(), and Id is freshly generated per subject — so
+  /// distinct pin handles still have distinct subject identities even when
+  /// they share a name with the owning circuit.
   @New
   @NotNull
   @Override
   public < E > Pin < E > pin ( @NotNull E initial ) {
     requireNonNull ( initial );
     requireOpen ( "pin" );
-    return new FsPin <> ( (FsSubject < ? >) subject, nextPinName (), this, initial );
+    return new FsPin <> ( (FsSubject < ? >) subject, null, this, initial );
   }
 
   @New
@@ -769,16 +764,17 @@ public final class FsCircuit implements Circuit {
   }
 
   // ===================================================================================
-  // Factory Methods - Port (2.9 §5405-5564)
+  // Factory Methods - Port (2.9 SPEC §11.6)
   // ===================================================================================
 
+  /// SPEC §11.6: same name-inheritance contract as Pin.
   @New
   @NotNull
   @Override
   public < E > Port < E > port ( @NotNull E initial ) {
     requireNonNull ( initial );
     requireOpen ( "port" );
-    return new FsPort <> ( (FsSubject < ? >) subject, nextPortName (), this, initial );
+    return new FsPort <> ( (FsSubject < ? >) subject, null, this, initial );
   }
 
   @New

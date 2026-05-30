@@ -14,11 +14,26 @@ import java.util.function.UnaryOperator;
 
 /// **FsPort** — 2.9 circuit-owned, queued mutation handle without read.
 ///
-/// Each Port operation enqueues a `CircuitJob` on the owning circuit. The
-/// stored value is read and written **only** on the worker thread, so the
-/// field is plain (no volatile / atomics). Transform failures (throws or
-/// `null` returns) are isolated under spec §15.4: the previous value is
-/// retained and the operation is dropped silently from the caller's view.
+/// Each Port operation enqueues a `CircuitJob` on the owning circuit. When
+/// called from outside the worker the job is routed via the ingress queue;
+/// when called from the worker (transit work, spec §5437-5443) the job is
+/// routed via the transit queue, so it lands *after* pending cascade work
+/// rather than jumping ahead of it.
+///
+/// The stored value is read and written **only** on the worker thread, so
+/// the field is plain — no volatile, no atomics. Initial-state publication
+/// to the first worker access is provided by the queue's enqueue → dequeue
+/// happens-before edge.
+///
+/// Transform failures (§15.4):
+///
+/// - `update` fn throws → the throwable propagates out of the `CircuitJob`
+///   to the IngressQueue's outer catch, where it is isolated as an external
+///   callback failure. The previous value is retained.
+/// - `update` fn returns null → surfaced as a `Fault(subject(), "update", …)`
+///   so structured observers can distinguish framework-detected contract
+///   violations from arbitrary user throws (§5454-5459). The previous value
+///   is retained; the Fault itself rides the same isolation path.
 @SuppressWarnings ( "unchecked" )
 public final class FsPort < E > implements Port < E > {
 
@@ -46,39 +61,47 @@ public final class FsPort < E > implements Port < E > {
       throw new Fault ( subject, "emit", "target pipe is not from this runtime provider" );
     }
     final Pipe < ? super E > target = pipe;
-    circuit.submitIngress ( new FsCircuit.CircuitJob ( () -> target.emit ( value ) ), null );
+    submit ( () -> target.emit ( value ) );
   }
 
   @Override
   public void replace ( @NotNull E value ) {
     requireNonNull ( value );
-    circuit.submitIngress ( new FsCircuit.CircuitJob ( () -> this.value = value ), null );
+    submit ( () -> this.value = value );
   }
 
   @Override
   public void update ( @NotNull UnaryOperator < E > fn ) {
     requireNonNull ( fn );
-    circuit.submitIngress ( new FsCircuit.CircuitJob ( () -> {
-      try {
-        E next = fn.apply ( value );
-        if ( next != null ) value = next;
-      } catch ( Throwable ignored ) {
-        // §15.4 failure isolation: retain previous value, drop the operation
-      }
-    } ), null );
+    submit ( () -> {
+      E next = fn.apply ( value );
+      if ( next == null ) throw new Fault ( subject, "update", "transform returned null" );
+      value = next;
+    } );
   }
 
   @Override
   public < A > void update ( @NotNull A arg, @NotNull BiFunction < ? super E, ? super A, ? extends E > fn ) {
     requireNonNull ( arg );
     requireNonNull ( fn );
-    circuit.submitIngress ( new FsCircuit.CircuitJob ( () -> {
-      try {
-        E next = fn.apply ( value, arg );
-        if ( next != null ) value = next;
-      } catch ( Throwable ignored ) {
-        // §15.4 failure isolation
-      }
-    } ), null );
+    submit ( () -> {
+      E next = fn.apply ( value, arg );
+      if ( next == null ) throw new Fault ( subject, "update", "transform returned null" );
+      value = next;
+    } );
+  }
+
+  /// Spec §11.6: ops from the worker are transit work, ops from any other
+  /// context are ingress work. After the owning circuit accepts close, ops
+  /// MUST NOT throw and MUST NOT take effect — silently drop, same as
+  /// `FsPipe.emit`.
+  private void submit ( Runnable action ) {
+    if ( circuit.closed ) return;
+    FsCircuit.CircuitJob job = new FsCircuit.CircuitJob ( action );
+    if ( Thread.currentThread () == circuit.worker () ) {
+      circuit.submitTransit ( job, null );
+    } else {
+      circuit.submitIngress ( job, null );
+    }
   }
 }

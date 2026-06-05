@@ -258,7 +258,14 @@ public final class FsConduit < E > implements Conduit < E > {
     FsSubscriber < E > sub = new FsSubscriber <> (
       new FsSubject <> ( cortex ().name ( "reservoir.subscriber" ), resSubject, Subscriber.class ),
       ( pipeSubject, registrar ) -> registrar.register (
-        emission -> reservoir.capture ( emission, pipeSubject ) ) );
+        // 2.10 Capture.current() (spec §392-414): for a cascade this coincides
+        // with Circuit#current(). The reservoir subscriber callback always
+        // fires on the worker thread post-dispatch, so circuit.current() is
+        // the correct emitting context. State defaults to empty per spec §425.
+        emission -> reservoir.capture (
+          emission, pipeSubject,
+          circuit.current ().subject (),
+          cortex ().state () ) ) );
     subscribe ( sub );
     return reservoir;
   }

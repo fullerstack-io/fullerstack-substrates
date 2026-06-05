@@ -4,6 +4,7 @@ import static io.humainary.substrates.api.Substrates.cortex;
 import static java.util.Objects.requireNonNull;
 
 import io.humainary.substrates.api.Substrates.Bank;
+import io.humainary.substrates.api.Substrates.Capture;
 import io.humainary.substrates.api.Substrates.Cell;
 import io.humainary.substrates.api.Substrates.Circuit;
 import io.humainary.substrates.api.Substrates.Conduit;
@@ -25,6 +26,7 @@ import io.humainary.substrates.api.Substrates.Receptor;
 import io.humainary.substrates.api.Substrates.Registrar;
 import io.humainary.substrates.api.Substrates.Reservoir;
 import io.humainary.substrates.api.Substrates.Routing;
+import io.humainary.substrates.api.Substrates.Sink;
 import io.humainary.substrates.api.Substrates.State;
 import io.humainary.substrates.api.Substrates.Subject;
 import io.humainary.substrates.api.Substrates.Subscriber;
@@ -478,8 +480,12 @@ public final class FsCircuit implements Circuit {
     }
 
     long stop = System.nanoTime ();
-    return Optional.of ( new Pulse ( start, enqueued, probe.dequeued, stop ) );
+    return Optional.of ( new PulseImpl ( start, enqueued, probe.dequeued, stop ) );
   }
+
+  /// 2.10 spec §5887-5917: Pulse changed from record to interface. Provider
+  /// returns an immutable carrier of the four nanosecond probe readings.
+  private record PulseImpl ( long start, long enqueued, long dequeued, long stop ) implements Pulse {}
 
   private void awaitClosed () {
     try {
@@ -624,6 +630,44 @@ public final class FsCircuit implements Circuit {
     requireNonNull ( routing );
     requireOpen ( "conduit" );
     return new FsConduit <> ( (FsSubject < ? >) subject, name, this, routing );
+  }
+
+  // ===================================================================================
+  // Factory Methods - Sink (2.10, SPEC §1290-1343)
+  // ===================================================================================
+
+  /// 2.10: Returns a sink — the output-closed dual of Conduit — that wraps each
+  /// emission as a `Capture` and forwards it to `endpoint`. Uses this circuit's
+  /// subject name; for an explicit name see [#sink(Name, Pipe)].
+  @New
+  @NotNull
+  @Override
+  public < E > Sink < E > sink ( @NotNull Pipe < Capture < E > > endpoint ) {
+    requireNonNull ( endpoint );
+    requireOpen ( "sink" );
+    // SPEC §1307 — endpoint must be a runtime-provided implementation.
+    if ( ! ( endpoint instanceof FsPipe < ? > ) ) {
+      throw new Fault ( subject, "sink", "endpoint pipe is not from this runtime provider" );
+    }
+    return new FsSink <> ( (FsSubject < ? >) subject, subject.name (), this, endpoint );
+  }
+
+  /// 2.10: Named sink variant.
+  @New
+  @NotNull
+  @Override
+  public < E > Sink < E > sink ( @NotNull Name name, @NotNull Pipe < Capture < E > > endpoint ) {
+    requireNonNull ( name );
+    requireNonNull ( endpoint );
+    requireOpen ( "sink" );
+    // SPEC §1332 — name and endpoint must both be from this runtime provider.
+    if ( ! ( name instanceof FsName ) ) {
+      throw new Fault ( subject, "sink", "name is not from this runtime provider" );
+    }
+    if ( ! ( endpoint instanceof FsPipe < ? > ) ) {
+      throw new Fault ( subject, "sink", "endpoint pipe is not from this runtime provider" );
+    }
+    return new FsSink <> ( (FsSubject < ? >) subject, name, this, endpoint );
   }
 
   // ===================================================================================

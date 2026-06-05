@@ -382,6 +382,25 @@ public final class FsFiber < E > implements Fiber < E > {
     return append ( d -> new FsOperators.EveryTime <> ( nanos, d ) );
   }
 
+  /// 2.10: drop consecutive duplicates, but re-emit the held value as a
+  /// heartbeat once a run of duplicates has persisted at least `maxSilence`
+  /// processing time. First emission always passes. Spec §3403-3441.
+  @NotNull
+  @Override
+  public Fiber < E > heartbeat ( @NotNull java.time.Duration maxSilence ) {
+    Objects.requireNonNull ( maxSilence, "maxSilence" );
+    if ( maxSilence.isZero () || maxSilence.isNegative () ) {
+      throw new IllegalArgumentException ( "maxSilence must be > 0" );
+    }
+    final long nanos;
+    try {
+      nanos = maxSilence.toNanos ();
+    } catch ( ArithmeticException overflow ) {
+      throw new IllegalArgumentException ( "maxSilence cannot be represented in nanoseconds", overflow );
+    }
+    return append ( d -> new FsOperators.Heartbeat <> ( nanos, d ) );
+  }
+
   @NotNull
   @Override
   public Fiber < E > fiber ( @NotNull Fiber < E > next ) {

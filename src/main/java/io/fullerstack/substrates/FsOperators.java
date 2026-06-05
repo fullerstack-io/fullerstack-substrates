@@ -317,6 +317,60 @@ final class FsOperators {
 
   /// Time-based rate limit (2.7) — per spec §6.2.3 `Fiber.every(Duration)`:
   ///
+  /// 2.10 heartbeat — diff with a max-silence escape valve.
+  ///
+  /// Tracks the last emitted value and an anchor timestamp for the current
+  /// run of duplicates. The first emission always passes. A *changing* value
+  /// passes and clears the anchor (no clock read). A duplicate either anchors
+  /// the run (first dup) and is dropped, or — if the anchor is `maxSilence`
+  /// nanos old — re-emits the held value and re-anchors.
+  ///
+  /// Per spec §3415-3425 the clock is read **only on duplicates**, so a
+  /// continuously-changing stream costs no more than `diff()`.
+  static final class Heartbeat < E > implements Consumer < E > {
+
+    private final long                  maxSilenceNanos;
+    private final Consumer < ? super E > downstream;
+
+    private E       prev;
+    private boolean hasEmitted;
+    private boolean anchored;
+    private long    anchorNanos;
+
+    Heartbeat ( long maxSilenceNanos, Consumer < ? super E > downstream ) {
+      this.maxSilenceNanos = maxSilenceNanos;
+      this.downstream      = downstream;
+    }
+
+    @Override
+    public void accept ( E value ) {
+      if ( ! hasEmitted ) {
+        hasEmitted = true;
+        prev       = value;
+        anchored   = false;
+        downstream.accept ( value );
+        return;
+      }
+      if ( ! Objects.equals ( value, prev ) ) {
+        prev     = value;
+        anchored = false;
+        downstream.accept ( value );
+        return;
+      }
+      // Duplicate — consult the clock.
+      long now = System.nanoTime ();
+      if ( ! anchored ) {
+        anchored    = true;
+        anchorNanos = now;
+        return;
+      }
+      if ( now - anchorNanos >= maxSilenceNanos ) {
+        anchorNanos = now;
+        downstream.accept ( prev );
+      }
+    }
+  }
+
   ///   - The **first observed value anchors the interval and is dropped**.
   ///   - A later value observed after at least `durationNanos` has
   ///     elapsed is emitted.

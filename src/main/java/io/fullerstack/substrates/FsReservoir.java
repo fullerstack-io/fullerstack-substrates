@@ -1,11 +1,13 @@
 package io.fullerstack.substrates;
 
 import io.humainary.substrates.api.Substrates.Capture;
+import io.humainary.substrates.api.Substrates.Current;
 import io.humainary.substrates.api.Substrates.Fault;
 import io.humainary.substrates.api.Substrates.Pipe;
 import io.humainary.substrates.api.Substrates.Idempotent;
 import io.humainary.substrates.api.Substrates.Provided;
 import io.humainary.substrates.api.Substrates.Reservoir;
+import io.humainary.substrates.api.Substrates.State;
 import io.humainary.substrates.api.Substrates.Tenure;
 import io.humainary.substrates.api.Substrates.Subject;
 
@@ -27,7 +29,14 @@ import java.util.stream.Stream;
 public final class FsReservoir < E > implements Reservoir < E > {
 
   /// A capture of an emitted value from a channel with its associated subject.
-  private record Cap < E >( E emission, Subject < Pipe < E > > subject ) implements Capture < E > {
+  /// 2.10 spec §390-465: also carries `current()` (emitting context) and `state()`
+  /// (per-emission measures; empty by default).
+  private record Cap < E >(
+    E emission,
+    Subject < Pipe < E > > subject,
+    Subject < Current > current,
+    State state
+  ) implements Capture < E > {
   }
 
   /// The subject identity for this reservoir.
@@ -75,10 +84,13 @@ public final class FsReservoir < E > implements Reservoir < E > {
   }
 
   /// Captures an emission with its channel subject. Evicts the oldest entry
-  /// when the buffer is at capacity (2.9 spec §6006-6012).
-  void capture ( E emission, Subject < Pipe < E > > channelSubject ) {
+  /// when the buffer is at capacity (2.9 spec §6006-6012). 2.10: also records
+  /// the emitting `current` and per-emission `state` for `Capture.current()`
+  /// and `Capture.state()`.
+  void capture ( E emission, Subject < Pipe < E > > channelSubject,
+                 Subject < Current > current, State state ) {
     if ( buffer.size () >= capacity ) buffer.pollFirst ();
-    buffer.add ( new Cap <> ( emission, channelSubject ) );
+    buffer.add ( new Cap <> ( emission, channelSubject, current, state ) );
   }
 
   /// Closes this reservoir, releasing the captured emissions buffer.

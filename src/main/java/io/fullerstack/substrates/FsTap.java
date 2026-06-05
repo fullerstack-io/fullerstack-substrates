@@ -244,7 +244,13 @@ final class FsTap < T > implements Tap < T > {
     FsReservoir < T > reservoir = new FsReservoir <> ( resSubject, capacity );
     FsSubscriber < T > sub = new FsSubscriber <> (
       new FsSubject <> ( cortex ().name ( "reservoir.subscriber" ), resSubject, Subscriber.class ),
-      ( pipeSubject, registrar ) -> registrar.register ( emission -> reservoir.capture ( emission, pipeSubject ) ) );
+      ( pipeSubject, registrar ) -> registrar.register (
+        // 2.10 Capture.current() (spec §392-414): cascade => Circuit#current().
+        // The reservoir subscriber callback fires on the worker thread.
+        emission -> reservoir.capture (
+          emission, pipeSubject,
+          circuit.current ().subject (),
+          cortex ().state () ) ) );
     subscribe ( sub );
     return reservoir;
   }

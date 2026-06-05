@@ -2,12 +2,14 @@ package io.fullerstack.substrates;
 
 import io.fullerstack.substrates.FsOperators.Wrap;
 import io.humainary.substrates.api.Substrates.Cell;
+import io.humainary.substrates.api.Substrates.Change;
 import io.humainary.substrates.api.Substrates.Fiber;
 import io.humainary.substrates.api.Substrates.Flow;
 import io.humainary.substrates.api.Substrates.New;
 import io.humainary.substrates.api.Substrates.NotNull;
 import io.humainary.substrates.api.Substrates.Pipe;
 import io.humainary.substrates.api.Substrates.Provided;
+import io.humainary.substrates.api.Substrates.Run;
 import io.humainary.substrates.api.Substrates.Subject;
 import io.humainary.substrates.api.Substrates.Window;
 
@@ -579,6 +581,136 @@ public final class FsFlow < I, O > implements Flow < I, O > {
     return pipe ( cell.pipe () );
   }
 
+
+  /// 3.0: emits a [Run] per admission carrying the value and its consecutive-run
+  /// length. Length resets to 1 on a change (`Objects.equals`-difference), increments
+  /// on a repeat. First admission emits with length=1. Spec §4632-4655.
+  @NotNull
+  @Override
+  public Flow < I, Run < O > > run () {
+    return appendOp ( new RunWrap () );
+  }
+
+  /// 3.0: emits a [Change] only at a run boundary — when an admission is
+  /// value-unequal to its predecessor. Carries the closed run's terminal value
+  /// and length, plus the value that opened the next run. First admission opens
+  /// the first run and emits nothing; the open or final run is never reported.
+  /// Spec §4223-4248.
+  @NotNull
+  @Override
+  public Flow < I, Change < O > > change () {
+    return appendOp ( new ChangeWrap () );
+  }
+
+  /// Immutable Run carrier — per-admission envelope produced by [#run()].
+  /// `@Tenure(EPHEMERAL) @ReadOnly @Provided` per spec §6700.
+  private record RunImpl < E > ( E emission, long length ) implements Run < E > {}
+
+  /// Immutable Change carrier — run-boundary envelope produced by [#change()].
+  /// `@Tenure(EPHEMERAL) @ReadOnly @Provided` per spec §550.
+  private record ChangeImpl < E > ( E from, E to, long length ) implements Change < E > {}
+
+  /// 3.0 run — stateful per-materialization. Each admission emits a fresh
+  /// [Run] with the value and its consecutive-run length.
+  ///
+  /// State: `prev` (last value seen) + `length` (running count). On admission:
+  /// if `Objects.equals(value, prev)` then `length++`; else reset
+  /// `prev = value; length = 1`. Always emit `(value, length)`.
+  @SuppressWarnings ( { "unchecked", "rawtypes" } )
+  static final class RunWrap implements Wrap < Object > {
+    @Override
+    public Consumer < Object > wrap ( Consumer < Object > downstream ) {
+      final Object[] prev   = { null };
+      final long[]   length = { 0L };
+      final boolean[] seeded = { false };
+      return v -> {
+        if ( ! seeded[ 0 ] || ! Objects.equals ( v, prev[ 0 ] ) ) {
+          prev[ 0 ]   = v;
+          length[ 0 ] = 1L;
+          seeded[ 0 ] = true;
+        } else {
+          length[ 0 ]++;
+        }
+        downstream.accept ( new RunImpl ( v, length[ 0 ] ) );
+      };
+    }
+  }
+
+  /// 3.0 change — stateful per-materialization. Emits a [Change] only at a run
+  /// boundary; the first admission opens the first run silently; the trailing
+  /// open run is never reported.
+  ///
+  /// State: `prev` + `length` + `hasPrev`. First admission: seed `prev`,
+  /// `length = 1`, emit nothing. Same as `prev`: `length++`, emit nothing.
+  /// Different from `prev`: emit `Change(prev, value, length)`, then reset
+  /// `prev = value; length = 1`.
+  @SuppressWarnings ( { "unchecked", "rawtypes" } )
+  static final class ChangeWrap implements Wrap < Object > {
+    @Override
+    public Consumer < Object > wrap ( Consumer < Object > downstream ) {
+      final Object[]  prev    = { null };
+      final long[]    length  = { 0L };
+      final boolean[] hasPrev = { false };
+      return v -> {
+        if ( ! hasPrev[ 0 ] ) {
+          prev[ 0 ]    = v;
+          length[ 0 ]  = 1L;
+          hasPrev[ 0 ] = true;
+          return;       // first admission opens the first run silently
+        }
+        if ( Objects.equals ( v, prev[ 0 ] ) ) {
+          length[ 0 ]++;
+          return;       // still in the same run
+        }
+        // Run boundary — emit Change for the closed run.
+        downstream.accept ( new ChangeImpl ( prev[ 0 ], v, length[ 0 ] ) );
+        prev[ 0 ]   = v;
+        length[ 0 ] = 1L;
+      };
+    }
+  }
+
+  /// 2.10: type-changing sibling of `Fiber.relate(E, BinaryOperator<E>)`.
+  /// Emits projection of each `(prev, curr)` relation, advancing `prev` on
+  /// every emission (including those `op` filtered via null). Spec §4549-4554.
+  @NotNull
+  @Override
+  public < P > Flow < I, P > relate (
+      O initial,
+      @NotNull BiFunction < ? super O, ? super O, ? extends P > op ) {
+    Objects.requireNonNull ( op, "op" );
+    return appendOp ( new RelateWrap ( initial, op ) );
+  }
+
+  /// 2.10 relate — tracks `prev` (seeded from `initial`), advances on every
+  /// emission, projects via `op(prev, curr) -> P`. Returning null filters
+  /// the projection but does NOT prevent `prev` advancing.
+  @SuppressWarnings ( { "unchecked", "rawtypes" } )
+  static final class RelateWrap implements Wrap < Object > {
+    final Object                                initial;
+    final BiFunction < Object, Object, Object > op;
+
+    RelateWrap ( Object initial, BiFunction op ) {
+      this.initial = initial;
+      this.op      = (BiFunction < Object, Object, Object >) op;
+    }
+
+    @Override
+    public Consumer < Object > wrap ( Consumer < Object > downstream ) {
+      final Object[] prev = { initial };
+      return v -> {
+        Object p = prev[ 0 ];
+        prev[ 0 ] = v;          // advance regardless of projection / throw
+        Object projection;
+        try {
+          projection = op.apply ( p, v );
+        } catch ( RuntimeException re ) {
+          return;
+        }
+        if ( projection != null ) downstream.accept ( projection );
+      };
+    }
+  }
 
   /// 2.6: heterogeneous fold (scan) with state-only projection.
   @NotNull

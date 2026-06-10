@@ -66,6 +66,29 @@ final class FsOperators {
     }
   }
 
+  /// Edge detector — emits on a transition between *consecutive* values.
+  /// Unlike [GuardStateful] (which advances `prev` only on pass, per the `guard`
+  /// contract), `prev` advances on **every** input regardless of pass/drop, so
+  /// the bi-predicate always sees the immediately preceding value. Generalizes
+  /// [Diff] to an arbitrary transition predicate.
+  static final class Edge < E > implements Consumer < E > {
+    final BiPredicate < ? super E, ? super E > p;
+    final Consumer < E >                       d;
+    Object prev;
+
+    Edge ( E initial, BiPredicate < ? super E, ? super E > p, Consumer < E > d ) {
+      this.prev = initial; this.p = p; this.d = d;
+    }
+
+    @Override
+    @SuppressWarnings ( "unchecked" )
+    public void accept ( E v ) {
+      final boolean fire = p.test ( (E) prev, v );
+      prev = v;                       // advance on every input, not only on pass
+      if ( fire ) d.accept ( v );
+    }
+  }
+
   /// GuardStateful that allows null initial values (high/low operators).
   static final class GuardStatefulNullable < E > implements Consumer < E > {
     final BiPredicate < ? super E, ? super E > p;

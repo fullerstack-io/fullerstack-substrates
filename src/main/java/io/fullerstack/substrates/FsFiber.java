@@ -359,7 +359,7 @@ public final class FsFiber < E > implements Fiber < E > {
   public Fiber < E > edge ( @NotNull E initial, @NotNull BiPredicate < ? super E, ? super E > transition ) {
     Objects.requireNonNull ( initial );
     Objects.requireNonNull ( transition );
-    return append ( d -> new FsOperators.GuardStateful <> ( initial, transition, d ) );
+    return append ( d -> new FsOperators.Edge <> ( initial, transition, d ) );
   }
 
   @NotNull

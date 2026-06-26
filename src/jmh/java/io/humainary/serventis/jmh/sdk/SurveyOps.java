@@ -45,7 +45,7 @@ public class SurveyOps implements Substrates {
   public Survey < Outcomes.Sign > survey_from_conduit () {
 
     return
-      Surveys.pool ( Outcomes.Sign.class, conduit ).get (
+      Surveys.pool ( Outcomes.SIGNS, conduit ).get (
         name
       );
 
@@ -63,7 +63,7 @@ public class SurveyOps implements Substrates {
       i++
     ) {
       result =
-        Surveys.pool ( Outcomes.Sign.class, conduit ).get (
+        Surveys.pool ( Outcomes.SIGNS, conduit ).get (
         name
         );
     }
@@ -161,7 +161,7 @@ public class SurveyOps implements Substrates {
     conduit = c;
 
     survey =
-      Surveys.pool ( Outcomes.Sign.class, conduit ).get (
+      Surveys.pool ( Outcomes.SIGNS, conduit ).get (
         name
       );
 

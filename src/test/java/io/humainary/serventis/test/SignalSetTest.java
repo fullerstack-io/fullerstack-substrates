@@ -1,11 +1,12 @@
 package io.humainary.serventis.test;
 
-import io.humainary.serventis.sdk.SignalSet;
 import io.humainary.serventis.sdk.Statuses;
 import io.humainary.serventis.sdk.Systems;
 
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+
+import java.util.function.BiFunction;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -18,10 +19,10 @@ class SignalSetTest {
   @Test
   @DisplayName ( "Factory creates a Signal from sign and dimension" )
   void factoryCreatesSignal () {
-    final SignalSet.Factory < Statuses.Sign, Statuses.Dimension, Statuses.Signal > factory =
+    final BiFunction < Statuses.Sign, Statuses.Dimension, Statuses.Signal > factory =
       Statuses.Signal::new;
 
-    final var signal = factory.create ( Statuses.Sign.STABLE, Statuses.Dimension.CONFIRMED );
+    final var signal = factory.apply ( Statuses.Sign.STABLE, Statuses.Dimension.CONFIRMED );
     assertThat ( signal ).isNotNull ();
     assertThat ( signal.sign () ).isEqualTo ( Statuses.Sign.STABLE );
     assertThat ( signal.dimension () ).isEqualTo ( Statuses.Dimension.CONFIRMED );
@@ -31,9 +32,8 @@ class SignalSetTest {
   @DisplayName ( "SignalSet pre-allocates every Sign x Dimension combination for Statuses" )
   void preallocatesAllStatusesCombinations () {
     final var signals =
-      new SignalSet < Statuses.Sign, Statuses.Dimension, Statuses.Signal > (
-        Statuses.Sign.class,
-        Statuses.Dimension.class,
+      Statuses.SIGNS.signals (
+        Statuses.DIMENSIONS,
         Statuses.Signal::new
       );
 
@@ -51,9 +51,8 @@ class SignalSetTest {
   @DisplayName ( "SignalSet.get returns the same instance for the same key (zero-allocation lookup)" )
   void getReturnsCachedInstance () {
     final var signals =
-      new SignalSet < Statuses.Sign, Statuses.Dimension, Statuses.Signal > (
-        Statuses.Sign.class,
-        Statuses.Dimension.class,
+      Statuses.SIGNS.signals (
+        Statuses.DIMENSIONS,
         Statuses.Signal::new
       );
 
@@ -68,9 +67,8 @@ class SignalSetTest {
   @DisplayName ( "SignalSet works for Systems (4 signs x 4 dimensions = 16 combinations)" )
   void worksForSystems () {
     final var signals =
-      new SignalSet < Systems.Sign, Systems.Dimension, Systems.Signal > (
-        Systems.Sign.class,
-        Systems.Dimension.class,
+      Systems.SIGNS.signals (
+        Systems.DIMENSIONS,
         Systems.Signal::new
       );
 

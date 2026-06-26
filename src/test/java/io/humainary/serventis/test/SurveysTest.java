@@ -65,7 +65,7 @@ class SurveysTest {
       );
 
       final var survey =
-        Surveys.of ( Outcomes.Sign.class, conduit.get ( cortex.name ( "survey1" ) ) );
+        Surveys.of ( Outcomes.SIGNS, conduit.get ( cortex.name ( "survey1" ) ) );
 
       survey.signal ( Outcomes.Sign.SUCCESS, Dimension.UNANIMOUS );
       survey.signal ( Outcomes.Sign.FAIL,    Dimension.MAJORITY );
@@ -104,7 +104,7 @@ class SurveysTest {
       );
 
       final var survey =
-        Surveys.of ( Statuses.Sign.class, conduit.get ( cortex.name ( "survey.statuses" ) ) );
+        Surveys.of ( Statuses.SIGNS, conduit.get ( cortex.name ( "survey.statuses" ) ) );
 
       survey.signal ( Statuses.Sign.STABLE,    Dimension.UNANIMOUS );
       survey.signal ( Statuses.Sign.DEGRADED,  Dimension.MAJORITY );
@@ -120,13 +120,13 @@ class SurveysTest {
   }
 
   @Test
-  @DisplayName ( "Surveys.pool(class, conduit) returns a working pool" )
+  @DisplayName ( "Surveys.pool(signs, conduit) returns a working pool" )
   void poolFactory () throws Exception {
     final var cortex = Substrates.cortex ();
     final var circuit = cortex.circuit ();
     try {
       final Conduit < Signal < Outcomes.Sign > > conduit = signalConduit ( circuit );
-      final var pool = Surveys.pool ( Outcomes.Sign.class, conduit );
+      final var pool = Surveys.pool ( Outcomes.SIGNS, conduit );
       assertThat ( pool ).isNotNull ();
 
       final List < Signal < Outcomes.Sign > > captured = new CopyOnWriteArrayList <> ();
@@ -156,7 +156,7 @@ class SurveysTest {
     final var circuit = cortex.circuit ();
     try {
       final Conduit < Signal < Outcomes.Sign > > conduit = signalConduit ( circuit );
-      final var pool = Surveys.pool ( Outcomes.Sign.class, conduit );
+      final var pool = Surveys.pool ( Outcomes.SIGNS, conduit );
       final var name = cortex.name ( "survey.shared" );
 
       final List < Signal < Outcomes.Sign > > captured = new CopyOnWriteArrayList <> ();

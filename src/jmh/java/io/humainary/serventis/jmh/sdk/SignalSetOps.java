@@ -3,6 +3,7 @@
 package io.humainary.serventis.jmh.sdk;
 
 import io.humainary.serventis.sdk.SignalSet;
+import io.humainary.serventis.sdk.Situations;
 import io.humainary.serventis.sdk.Situations.Dimension;
 import io.humainary.serventis.sdk.Situations.Sign;
 import io.humainary.serventis.sdk.Situations.Signal;
@@ -37,9 +38,8 @@ public class SignalSetOps {
   private static final int         BATCH_SIZE = 1000;
 
   private static final SignalSet < Sign, Dimension, Signal > SIGNALS =
-    new SignalSet <> (
-      Sign.class,
-      Dimension.class,
+    Situations.SIGNS.signals (
+      Situations.DIMENSIONS,
       Signal::new
     );
 

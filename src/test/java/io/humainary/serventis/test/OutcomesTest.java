@@ -18,10 +18,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 class OutcomesTest {
 
   @Test
-  @DisplayName ( "Sign enum has SUCCESS and FAIL constants with non-empty names" )
+  @DisplayName ( "Sign enum has SUCCESS, FAIL and UNKNOWN constants with non-empty names" )
   void signEnumExhaustive () {
     final var values = Sign.values ();
-    assertThat ( values ).containsExactly ( Sign.SUCCESS, Sign.FAIL );
+    assertThat ( values ).containsExactly ( Sign.SUCCESS, Sign.FAIL, Sign.UNKNOWN );
     for ( final var sign : values ) {
       assertThat ( sign.name () ).isNotNull ().isNotEmpty ();
     }

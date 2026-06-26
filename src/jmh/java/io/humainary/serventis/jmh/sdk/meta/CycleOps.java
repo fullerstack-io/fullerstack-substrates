@@ -47,7 +47,7 @@ public class CycleOps implements Substrates {
   public Cycle < Resources.Sign > cycle_from_conduit () {
 
     return
-      Cycles.pool ( Resources.Sign.class, conduit ).get (
+      Cycles.pool ( Resources.SIGNS, conduit ).get (
         name
       );
 
@@ -69,7 +69,7 @@ public class CycleOps implements Substrates {
       i++
     ) {
       result =
-        Cycles.pool ( Resources.Sign.class, conduit ).get (
+        Cycles.pool ( Resources.SIGNS, conduit ).get (
         name
         );
     }
@@ -233,7 +233,7 @@ public class CycleOps implements Substrates {
     conduit = c;
 
     cycle =
-      Cycles.pool ( Resources.Sign.class, conduit ).get (
+      Cycles.pool ( Resources.SIGNS, conduit ).get (
         name
       );
 

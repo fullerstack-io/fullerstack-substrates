@@ -18,10 +18,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 class OperationsTest {
 
   @Test
-  @DisplayName ( "Sign enum has BEGIN and END constants with non-empty names" )
+  @DisplayName ( "Sign enum has BEGIN, ADVANCE and END constants with non-empty names" )
   void signEnumExhaustive () {
     final var values = Sign.values ();
-    assertThat ( values ).containsExactly ( Sign.BEGIN, Sign.END );
+    assertThat ( values ).containsExactly ( Sign.BEGIN, Sign.ADVANCE, Sign.END );
     for ( final var sign : values ) {
       assertThat ( sign.name () ).isNotNull ().isNotEmpty ();
     }

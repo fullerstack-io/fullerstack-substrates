@@ -10,6 +10,7 @@ import io.humainary.substrates.api.Substrates.Flow;
 import io.humainary.substrates.api.Substrates.Name;
 import io.humainary.substrates.api.Substrates.New;
 import io.humainary.substrates.api.Substrates.NotNull;
+import io.humainary.substrates.api.Substrates.Pool;
 import io.humainary.substrates.api.Substrates.Provided;
 import io.humainary.substrates.api.Substrates.Scope;
 import io.humainary.substrates.api.Substrates.Slot;
@@ -127,6 +128,43 @@ final class FsCortex implements Cortex {
   @Override
   public Name name ( Member member ) {
     return FsName.fromMember ( member );
+  }
+
+  // =========================================================================
+  // Pool factory method — root pool (3.0)
+  // =========================================================================
+
+  /// The identity source that roots a cortex pool: each name resolves to
+  /// itself, so the derived pool's function receives the Name directly.
+  /// FsDerivedPool supplies the once-per-name caching contract (success,
+  /// null-rejection, and failure all memoised).
+  private static final Pool < Name > NAME_IDENTITY = new Pool <> () {
+
+    @NotNull
+    @Override
+    public Name get ( @NotNull Name name ) {
+      return name;
+    }
+
+    @NotNull
+    @Override
+    public < U > Pool < U > pool ( @NotNull Function < ? super Name, ? extends U > fn ) {
+      requireNonNull ( fn );
+      return new FsDerivedPool <> ( this, fn );
+    }
+
+  };
+
+  /// 3.0: root pool — materializes values on demand from names, invoking the
+  /// factory function exactly once per name (cached result or failure replayed
+  /// for subsequent lookups). Holds values for lookup but does not own them —
+  /// no close, no lifecycle cascade (use Bank for owned Resources).
+  @New
+  @NotNull
+  @Override
+  public < T > Pool < T > pool ( @NotNull Function < ? super Name, ? extends T > fn ) {
+    requireNonNull ( fn, "fn must not be null" );
+    return new FsDerivedPool <> ( NAME_IDENTITY, fn );
   }
 
   // =========================================================================

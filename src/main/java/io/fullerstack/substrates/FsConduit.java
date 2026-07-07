@@ -13,12 +13,10 @@ import io.humainary.substrates.api.Substrates.Pool;
 import io.humainary.substrates.api.Substrates.Provided;
 import io.humainary.substrates.api.Substrates.Queued;
 import io.humainary.substrates.api.Substrates.Receptor;
-import io.humainary.substrates.api.Substrates.Reservoir;
 import io.humainary.substrates.api.Substrates.Routing;
 import io.humainary.substrates.api.Substrates.Subject;
 import io.humainary.substrates.api.Substrates.Subscriber;
 import io.humainary.substrates.api.Substrates.Subscription;
-import io.humainary.substrates.api.Substrates.Tap;
 
 import java.util.IdentityHashMap;
 import java.util.Map;
@@ -246,54 +244,4 @@ public final class FsConduit < E > implements Conduit < E > {
     circuit.submitIngress ( new FsCircuit.CircuitJob ( () -> hub.removeSubscriber ( subscriber ) ), null );
   }
 
-  @New
-  @NotNull
-  @Override
-  public Reservoir < E > reservoir ( int capacity ) {
-    requireOpen ( "reservoir" );
-    FsSubject < Reservoir < E > > resSubject = new FsSubject <> ( cortex ().name ( "reservoir" ),
-      (FsSubject < ? >) subject, Reservoir.class );
-    FsReservoir < E > reservoir = new FsReservoir <> ( resSubject, capacity );
-
-    FsSubscriber < E > sub = new FsSubscriber <> (
-      new FsSubject <> ( cortex ().name ( "reservoir.subscriber" ), resSubject, Subscriber.class ),
-      ( pipeSubject, registrar ) -> registrar.register (
-        // 2.10 Capture.current() (spec §392-414): for a cascade this coincides
-        // with Circuit#current(). The reservoir subscriber callback always
-        // fires on the worker thread post-dispatch, so circuit.current() is
-        // the correct emitting context. State defaults to empty per spec §425.
-        emission -> reservoir.capture (
-          emission, pipeSubject,
-          circuit.current ().subject (),
-          cortex ().state () ) ) );
-    subscribe ( sub );
-    return reservoir;
-  }
-
-  @New
-  @NotNull
-  @Override
-  public < T > Tap < T > tap ( @NotNull Function < Pipe < T >, Pipe < E > > fn ) {
-    requireNonNull ( fn, "fn must not be null" );
-    requireOpen ( "tap" );
-    return new FsTap <> ( (FsSubject < ? >) subject, cortex ().name ( "tap" ), this, circuit, fn );
-  }
-
-  /// 2.3: tap with flow transformation (E → T).
-  @New
-  @NotNull
-  @Override
-  public < T > Tap < T > tap ( @NotNull Flow < E, T > flow ) {
-    requireNonNull ( flow, "flow must not be null" );
-    return tap ( target -> flow.pipe ( target ) );
-  }
-
-  /// 2.3: type-preserving tap with fiber per-emission processing.
-  @New
-  @NotNull
-  @Override
-  public Tap < E > tap ( @NotNull Fiber < E > fiber ) {
-    requireNonNull ( fiber, "fiber must not be null" );
-    return tap ( (Function < Pipe < E >, Pipe < E > >) target -> fiber.pipe ( target ) );
-  }
 }

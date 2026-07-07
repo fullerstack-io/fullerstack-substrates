@@ -523,7 +523,7 @@ public final class FsFlow < I, O > implements Flow < I, O > {
   @NotNull
   @Override
   @SuppressWarnings ( "unchecked" )
-  public Pipe < I > pipe ( @NotNull Pipe < O > target ) {
+  public Pipe < I > pipe ( @NotNull Pipe < ? super O > target ) {
     Objects.requireNonNull ( target );
     // Empty flow elision — no operators AND no pending factories means I == O.
     if ( count == 0 && factories == null && flowFactories == null ) return (Pipe < I >) (Pipe < ? >) target;
@@ -576,7 +576,7 @@ public final class FsFlow < I, O > implements Flow < I, O > {
   /// 2.7: attach this flow's pipeline before a Cell's update pipe.
   @NotNull
   @Override
-  public Pipe < I > pipe ( @NotNull Cell < O > cell ) {
+  public Pipe < I > pipe ( @NotNull Cell < ? super O > cell ) {
     Objects.requireNonNull ( cell, "cell must not be null" );
     return pipe ( cell.pipe () );
   }

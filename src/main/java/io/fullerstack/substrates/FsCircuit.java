@@ -4,14 +4,13 @@ import static io.humainary.substrates.api.Substrates.cortex;
 import static java.util.Objects.requireNonNull;
 
 import io.humainary.substrates.api.Substrates.Bank;
+import io.humainary.substrates.api.Substrates.Basin;
 import io.humainary.substrates.api.Substrates.Capture;
 import io.humainary.substrates.api.Substrates.Cell;
 import io.humainary.substrates.api.Substrates.Circuit;
 import io.humainary.substrates.api.Substrates.Conduit;
 import io.humainary.substrates.api.Substrates.Fault;
 import io.humainary.substrates.api.Substrates.Current;
-import io.humainary.substrates.api.Substrates.Fiber;
-import io.humainary.substrates.api.Substrates.Flow;
 import io.humainary.substrates.api.Substrates.Idempotent;
 import io.humainary.substrates.api.Substrates.Name;
 import io.humainary.substrates.api.Substrates.New;
@@ -24,19 +23,16 @@ import io.humainary.substrates.api.Substrates.Pulse;
 import io.humainary.substrates.api.Substrates.Queued;
 import io.humainary.substrates.api.Substrates.Receptor;
 import io.humainary.substrates.api.Substrates.Registrar;
-import io.humainary.substrates.api.Substrates.Reservoir;
 import io.humainary.substrates.api.Substrates.Routing;
 import io.humainary.substrates.api.Substrates.Sink;
-import io.humainary.substrates.api.Substrates.State;
 import io.humainary.substrates.api.Substrates.Subject;
 import io.humainary.substrates.api.Substrates.Subscriber;
-import io.humainary.substrates.api.Substrates.Subscription;
-import io.humainary.substrates.api.Substrates.Tap;
 import io.humainary.substrates.api.Substrates.Ticker;
 
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.time.Duration;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -105,10 +101,6 @@ public final class FsCircuit implements Circuit {
 
   private final Subject < Circuit > subject;
   private final Thread              worker;
-
-  /// Internal conduit for State emissions — lazy, created on first Source<State> operation.
-  /// Backs circuit.subscribe(State), circuit.tap(), and circuit.reservoir().
-  private volatile FsConduit < State > stateConduit;
 
   /// 2.4: lazily-initialised Current for this circuit's execution context.
   /// Must remain stable for the circuit's lifetime (spec §11.3).
@@ -424,14 +416,14 @@ public final class FsCircuit implements Circuit {
   }
 
   /// Conformance §9.1 + §16.1 #9: open-required synchronous operations
-  /// (conduit, bank, subscriber, subscribe, reservoir, tap, Bank.get, Reservoir.drain)
+  /// (conduit, bank, basin, cell, subscriber, subscribe, Bank.get)
   /// MUST signal a closed-resource Fault when the receiver has accepted close.
   void requireOpen ( String op ) {
     if ( closed ) throw new Fault ( subject, op, "circuit is closed" );
   }
 
   /// Whether this circuit has accepted close. Used by owned resources
-  /// (Conduit/Tap/Ticker) to propagate the open-required guard through
+  /// (Conduit/Ticker/Basin) to propagate the open-required guard through
   /// to their own open-required ops.
   boolean isClosed () {
     return closed;
@@ -729,17 +721,79 @@ public final class FsCircuit implements Circuit {
     return newPipe ( v -> { /* no-op */ } );
   }
 
+  /// 3.0: target widened to `Pipe<? super E>` — a `Pipe<Number>` hop can carry
+  /// `Long` emissions. Same-circuit targets are returned as-is (the cast is
+  /// safe: a pipe that accepts `? super E` accepts every `E`).
   @New ( conditional = true )
   @NotNull
   @Override
-  public < E > Pipe < E > pipe ( @NotNull Pipe < E > target ) {
+  @SuppressWarnings ( "unchecked" )
+  public < E > Pipe < E > pipe ( @NotNull Pipe < ? super E > target ) {
     requireNonNull ( target );
     // Same-circuit pipe already routes through this circuit — return as-is
-    if ( target instanceof FsPipe < E > fsPipe && fsPipe.circuit () == this ) {
-      return target;
+    if ( target instanceof FsPipe < ? > fsPipe && fsPipe.circuit () == this ) {
+      return (Pipe < E >) target;
     }
     // Cross-circuit: wrap in a receptor pipe that calls target.emit()
     return newPipe ( target::emit );
+  }
+
+  /// 3.0: list fan-out. Targets are snapshotted at creation and dispatched in
+  /// list order; duplicates receive the emission once per occurrence. Empty
+  /// collapses to [#pipe()], single-element to [#pipe(Pipe)].
+  @New
+  @NotNull
+  @Override
+  public < E > Pipe < E > pipe ( @NotNull List < ? extends Pipe < ? super E > > targets ) {
+    List < Pipe < ? super E > > snapshot = snapshotTargets ( targets );
+    requireOpen ( "pipe" );
+    if ( snapshot.isEmpty () ) return pipe ();
+    if ( snapshot.size () == 1 ) return pipe ( snapshot.get ( 0 ) );
+    return newPipe ( fanOut ( snapshot ) );
+  }
+
+  /// 3.0: named list fan-out. Always mints a named pipe — an empty list yields
+  /// a named no-op pipe, a single-target list a named forwarder — because the
+  /// supplied name must be honored on the returned pipe's subject.
+  @New
+  @NotNull
+  @Override
+  public < E > Pipe < E > pipe ( @NotNull Name name, @NotNull List < ? extends Pipe < ? super E > > targets ) {
+    requireNonNull ( name );
+    List < Pipe < ? super E > > snapshot = snapshotTargets ( targets );
+    if ( ! ( name instanceof FsName ) ) {
+      throw new Fault ( subject, "pipe", "name is not from this runtime provider" );
+    }
+    requireOpen ( "pipe" );
+    Receptor < E > receptor =
+      snapshot.isEmpty ()      ? v -> { /* named no-op */ }
+      : snapshot.size () == 1  ? snapshot.get ( 0 )::emit
+      :                          fanOut ( snapshot );
+    return new FsPipe <> ( new ReceptorAdapter <> ( receptor ), this, name, (FsSubject < ? >) subject );
+  }
+
+  /// Rejects null lists / null elements synchronously (NPE via `List.copyOf`)
+  /// and non-provider targets (Fault), returning the creation-time snapshot.
+  private < E > List < Pipe < ? super E > > snapshotTargets ( List < ? extends Pipe < ? super E > > targets ) {
+    requireNonNull ( targets );
+    List < Pipe < ? super E > > snapshot = List.copyOf ( targets );
+    for ( Pipe < ? super E > target : snapshot ) {
+      if ( ! ( target instanceof FsPipe < ? > ) ) {
+        throw new Fault ( subject, "pipe", "target pipe is not from this runtime provider" );
+      }
+    }
+    return snapshot;
+  }
+
+  /// Fan-out receptor — runs on this circuit's worker. Same-circuit targets
+  /// observe list order on this circuit (transit-queue FIFO); cross-circuit
+  /// targets are enqueued in list order onto their own circuits' ingress.
+  private static < E > Receptor < E > fanOut ( List < Pipe < ? super E > > targets ) {
+    return value -> {
+      for ( Pipe < ? super E > target : targets ) {
+        target.emit ( value );
+      }
+    };
   }
 
   @New
@@ -771,6 +825,21 @@ public final class FsCircuit implements Circuit {
     requireNonNull ( initial );
     requireOpen ( "cell" );
     return new FsCell <> ( (FsSubject < ? >) subject, nextCellName (), this, initial );
+  }
+
+  /// 3.0: named cell — same semantics as [#cell(Object)] with the supplied
+  /// name bound to the cell's subject. The name must come from this runtime.
+  @New
+  @NotNull
+  @Override
+  public < E > Cell < E > cell ( @NotNull Name name, @NotNull E initial ) {
+    requireNonNull ( name );
+    requireNonNull ( initial );
+    if ( ! ( name instanceof FsName ) ) {
+      throw new Fault ( subject, "cell", "name is not from this runtime provider" );
+    }
+    requireOpen ( "cell" );
+    return new FsCell <> ( (FsSubject < ? >) subject, name, this, initial );
   }
 
   private final AtomicLong cellSeq = new AtomicLong ();
@@ -832,70 +901,21 @@ public final class FsCircuit implements Circuit {
   }
 
   // ===================================================================================
-  // Source<State, Circuit> — delegates to internal State conduit
+  // Factory Methods - Basin (3.0, SPEC §11: circuit-owned bounded buffer)
   // ===================================================================================
 
-  private FsConduit < State > stateConduit () {
-    FsConduit < State > c = stateConduit;
-    if ( c == null ) {
-      synchronized ( this ) {
-        c = stateConduit;
-        if ( c == null ) {
-          c = new FsConduit <> ( (FsSubject < ? >) subject,
-            cortex ().name ( "circuit.state" ), this );
-          stateConduit = c;
-        }
-      }
+  /// 3.0: circuit-owned bounded buffer — the multi-value sibling of Cell.
+  /// The element type is recovered by target typing; see the class-token
+  /// default `basin(Class, int)` inherited from the API for inference help.
+  @New
+  @NotNull
+  @Override
+  public < E > Basin < E > basin ( int capacity ) {
+    if ( capacity < 1 ) {
+      throw new IllegalArgumentException ( "basin capacity must be >= 1: " + capacity );
     }
-    return c;
-  }
-
-  @New
-  @NotNull
-  @Override
-  public < T > Tap < T > tap ( @NotNull Function < Pipe < T >, Pipe < State > > fn ) {
-    requireNonNull ( fn );
-    return stateConduit ().tap ( fn );
-  }
-
-  @New
-  @NotNull
-  @Override
-  public < T > Tap < T > tap ( @NotNull Flow < State, T > flow ) {
-    requireNonNull ( flow );
-    return stateConduit ().tap ( flow );
-  }
-
-  @New
-  @NotNull
-  @Override
-  public Tap < State > tap ( @NotNull Fiber < State > fiber ) {
-    requireNonNull ( fiber );
-    return stateConduit ().tap ( fiber );
-  }
-
-  @New
-  @NotNull
-  @Override
-  public Subscription subscribe ( @NotNull Subscriber < State > subscriber ) {
-    requireNonNull ( subscriber );
-    return stateConduit ().subscribe ( subscriber );
-  }
-
-  @NotNull
-  @Override
-  public Subscription subscribe ( @NotNull Subscriber < State > subscriber,
-                                  @NotNull @Queued Consumer < ? super Subscription > onClose ) {
-    requireNonNull ( subscriber );
-    requireNonNull ( onClose );
-    return stateConduit ().subscribe ( subscriber, onClose );
-  }
-
-  @New
-  @NotNull
-  @Override
-  public Reservoir < State > reservoir ( int capacity ) {
-    return stateConduit ().reservoir ( capacity );
+    requireOpen ( "basin" );
+    return new FsBasin <> ( (FsSubject < ? >) subject, this, capacity );
   }
 
   // ===================================================================================
@@ -913,9 +933,5 @@ public final class FsCircuit implements Circuit {
     return new FsSubscriber <> (
       new FsSubject <> ( name, (FsSubject < ? >) subject, Subscriber.class ), callback );
   }
-
-  // 1-arg `subscribe(Subscriber<State>)` is inherited from Source's default impl,
-  // which delegates to the 2-arg subscribe. We don't override it — the previous
-  // override added to a `subscribers` list that nothing read, dropping callbacks.
 
 }

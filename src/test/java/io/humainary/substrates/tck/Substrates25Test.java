@@ -198,17 +198,12 @@ class Substrates25Test implements Substrates {
     }
 
     @Test
-    @DisplayName ( "conduit.reservoir() after conduit close raises Fault" )
-    void reservoirAfterConduitClose () {
+    @DisplayName ( "circuit.basin() after circuit close raises Fault (3.0)" )
+    void basinAfterCircuitClose () {
       final var cortex  = Substrates.cortex ();
       final var circuit = cortex.circuit ();
-      try {
-        final Conduit < Integer > c = circuit.conduit ( Integer.class );
-        c.close ();
-        assertThrows ( Fault.class, () -> c.reservoir ( 1024 ) );
-      } finally {
-        circuit.close ();
-      }
+      circuit.close ();
+      assertThrows ( Fault.class, () -> circuit.basin ( 1024 ) );
     }
   }
 

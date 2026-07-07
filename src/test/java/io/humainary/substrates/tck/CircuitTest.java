@@ -577,10 +577,12 @@ final class CircuitTest
 
     try {
 
-      // Circuit implements Source directly through Context
+      // 3.0: Circuit is a Resource (not a Source); Conduit is the sole
+      // required source type — the circuit provides sources via conduit()
 
       assertNotNull ( circuit );
       assertNotNull ( circuit.subject () );
+      assertNotNull ( circuit.< String >conduit () );
 
     } finally {
 
@@ -595,7 +597,7 @@ final class CircuitTest
   // ===========================
 
   @Test
-  void testCircuitSourceSubscription () {
+  void testConduitSourceSubscription () {
 
     final var circuit = cortex.circuit ();
 
@@ -612,7 +614,8 @@ final class CircuitTest
           }
         );
 
-      final var subscription = circuit.subscribe ( subscriber );
+      // 3.0: Conduit is the sole required source type
+      final var subscription = circuit.< State >conduit ().subscribe ( subscriber );
 
       assertNotNull ( subscription );
 
@@ -659,7 +662,7 @@ final class CircuitTest
   // ===========================
 
   @Test
-  void testCircuitWithConduitAndReservoir () {
+  void testCircuitWithConduitAndBasin () {
 
     final var circuit = cortex.circuit (
       cortex.name ( "integration.circuit" )
@@ -673,7 +676,15 @@ final class CircuitTest
           Integer.class
         );
 
-      final Reservoir < Integer > reservoir = conduit.reservoir ( 1024 );
+      // 3.0: capture-from-a-source is the Basin + Sink composition
+      final Basin < Capture < Integer > > basin = circuit.basin ( 1024 );
+
+      conduit.subscribe (
+        circuit.subscriber (
+          cortex.name ( "integration.capture" ),
+          circuit.sink ( basin.pipe () )
+        )
+      );
 
       final Pipe < Integer > pipe =
         conduit.get ( cortex.name ( "integration.channel" ) );
@@ -684,55 +695,14 @@ final class CircuitTest
 
       circuit.await ();
 
-      final var captures =
-        reservoir.drain ().toList ();
+      final List < Capture < Integer > > captures = new ArrayList <> ();
+      basin.drain ( circuit.pipe ( captures::add ) );
+      circuit.await ();
 
       assertEquals ( 3, captures.size () );
       assertEquals ( 10, captures.get ( 0 ).emission () );
       assertEquals ( 20, captures.get ( 1 ).emission () );
       assertEquals ( 30, captures.get ( 2 ).emission () );
-
-      reservoir.close ();
-
-    } finally {
-
-      circuit.close ();
-
-    }
-
-  }
-
-  // @Test -- removed in 2.0
-  void DISABLED_testCircuitWithFlowConfiguration () {
-
-    final var circuit = cortex.circuit ();
-
-    try {
-
-      final var conduit =
-        circuit.conduit (
-          cortex.name ( "flow.conduit" ),
-          Integer.class
-        );
-
-      final Reservoir < Integer > reservoir = conduit.reservoir ( 1024 );
-
-      final Pipe < Integer > pipe =
-        conduit.get ( cortex.name ( "flow.channel" ) );
-
-      pipe.emit ( 1 );
-      pipe.emit ( 2 );
-      pipe.emit ( 3 ); // Should be limited
-
-      circuit.await ();
-
-      final var captures =
-        reservoir.drain ().toList ();
-
-      // Limit should restrict to first 2 emissions
-      assertEquals ( 2, captures.size () );
-
-      reservoir.close ();
 
     } finally {
 
@@ -755,8 +725,13 @@ final class CircuitTest
       final var conduit2 =
         circuit.conduit ( cortex.name ( "conduit.two" ), Integer.class );
 
-      final Reservoir < String > reservoir1 = conduit1.reservoir ( 1024 );
-      final Reservoir < Integer > reservoir2 = conduit2.reservoir ( 1024 );
+      final Basin < Capture < String > > basin1 = circuit.basin ( 1024 );
+      final Basin < Capture < Integer > > basin2 = circuit.basin ( 1024 );
+
+      conduit1.subscribe (
+        circuit.subscriber ( cortex.name ( "capture.one" ), circuit.sink ( basin1.pipe () ) ) );
+      conduit2.subscribe (
+        circuit.subscriber ( cortex.name ( "capture.two" ), circuit.sink ( basin2.pipe () ) ) );
 
       final Pipe < String > pipe1 =
         conduit1.get ( cortex.name ( "channel.alpha" ) );
@@ -769,11 +744,14 @@ final class CircuitTest
 
       circuit.await ();
 
-      assertEquals ( 1, reservoir1.drain ().count () );
-      assertEquals ( 1, reservoir2.drain ().count () );
+      final List < Object > drained1 = new ArrayList <> ();
+      final List < Object > drained2 = new ArrayList <> ();
+      basin1.drain ( circuit.pipe ( drained1::add ) );
+      basin2.drain ( circuit.pipe ( drained2::add ) );
+      circuit.await ();
 
-      reservoir1.close ();
-      reservoir2.close ();
+      assertEquals ( 1, drained1.size () );
+      assertEquals ( 1, drained2.size () );
 
     } finally {
 

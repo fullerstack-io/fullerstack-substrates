@@ -80,7 +80,7 @@ final class CortexTest
   }
 
   @Test
-  void testCircuitConduitReservoirIntegration () {
+  void testCircuitConduitBasinIntegration () {
 
     final var circuit = cortex.circuit (
       cortex.name ( "integration.circuit" )
@@ -94,7 +94,15 @@ final class CortexTest
           String.class
         );
 
-      final Reservoir < String > reservoir = conduit.reservoir ( 1024 );
+      // 3.0: capture-from-a-source is the Basin + Sink composition
+      final Basin < Capture < String > > basin = circuit.basin ( 1024 );
+
+      conduit.subscribe (
+        circuit.subscriber (
+          cortex.name ( "integration.capture" ),
+          circuit.sink ( basin.pipe () )
+        )
+      );
 
       final Pipe < String > pipe =
         conduit.get ( cortex.name ( "integration.channel" ) );
@@ -103,8 +111,9 @@ final class CortexTest
 
       circuit.await ();
 
-      final var captures =
-        reservoir.drain ().toList ();
+      final List < Capture < String > > captures = new ArrayList <> ();
+      basin.drain ( circuit.pipe ( captures::add ) );
+      circuit.await ();
 
       assertEquals ( 1, captures.size () );
       assertEquals ( "integration-test", captures.getFirst ().emission () );
@@ -112,8 +121,6 @@ final class CortexTest
         Pipe.class,
         captures.getFirst ().subject ().type ()
       );
-
-      reservoir.close ();
 
     } finally {
 
@@ -258,7 +265,7 @@ final class CortexTest
   // ===========================
 
   @Test
-  void testReservoirCapturesEmissions () {
+  void testBasinCapturesEmissions () {
 
     final var circuit = cortex.circuit ();
 
@@ -267,7 +274,14 @@ final class CortexTest
       final var conduit =
         circuit.conduit ( Integer.class );
 
-      final Reservoir < Integer > reservoir = conduit.reservoir ( 1024 );
+      final Basin < Capture < Integer > > basin = circuit.basin ( 1024 );
+
+      conduit.subscribe (
+        circuit.subscriber (
+          cortex.name ( "test.capture" ),
+          circuit.sink ( basin.pipe () )
+        )
+      );
 
       final Pipe < Integer > pipe =
         conduit.get ( cortex.name ( "test.channel" ) );
@@ -278,16 +292,15 @@ final class CortexTest
 
       circuit.await ();
 
-      final var captures =
-        reservoir.drain ().toList ();
+      final List < Capture < Integer > > captures = new ArrayList <> ();
+      basin.drain ( circuit.pipe ( captures::add ) );
+      circuit.await ();
 
       assertEquals ( 3, captures.size () );
       assertEquals ( 10, captures.get ( 0 ).emission () );
       assertEquals ( 20, captures.get ( 1 ).emission () );
       assertEquals ( 30, captures.get ( 2 ).emission () );
 
-      reservoir.close ();
-
     } finally {
 
       circuit.close ();
@@ -297,21 +310,18 @@ final class CortexTest
   }
 
   @Test
-  void testReservoirCreationFromContext () {
+  void testBasinCreationFromCircuit () {
 
     final var circuit = cortex.circuit ();
 
     try {
 
-      final var conduit =
-        circuit.conduit ( Integer.class );
+      // 3.0: the basin is circuit-owned (Reservoir's source-bound role is gone)
+      final Basin < Integer > basin = circuit.basin ( 1024 );
 
-      // Conduit is a Context
-      final Reservoir < Integer > reservoir = conduit.reservoir ( 1024 );
-
-      assertNotNull ( reservoir );
-
-      reservoir.close ();
+      assertNotNull ( basin );
+      assertNotNull ( basin.subject () );
+      assertNotNull ( basin.pipe () );
 
     } finally {
 
@@ -322,21 +332,17 @@ final class CortexTest
   }
 
   @Test
-  void testReservoirCreationFromSource () {
+  void testBasinCreationWithTypeWitness () {
 
     final var circuit = cortex.circuit ();
 
     try {
 
-      final var conduit =
-        circuit.conduit ( String.class );
+      // Class-token convenience overload for inference
+      final Basin < String > basin = circuit.basin ( String.class, 1024 );
 
-      final Reservoir < String > reservoir = conduit.reservoir ( 1024 );
-
-      assertNotNull ( reservoir );
-      assertNotNull ( reservoir.subject () );
-
-      reservoir.close ();
+      assertNotNull ( basin );
+      assertNotNull ( basin.subject () );
 
     } finally {
 
@@ -346,77 +352,17 @@ final class CortexTest
 
   }
 
-  /// Validates incremental drain behavior: each drain returns only new emissions.
+  /// Validates incremental drain behavior: each drain forwards only values
+  /// retained since the previous drain.
   ///
-  /// This test verifies that Reservoir.drain() operates incrementally, returning only
-  /// emissions that occurred since the last drain. Previously drained emissions
-  /// are NOT returned again, enabling efficient polling and incremental processing
-  /// without duplicate handling.
+  /// 3.0 Basin semantics: `drain(pipe)` forwards the retained values in
+  /// emission order and then evicts them, so drains are naturally incremental —
+  /// a second drain sees only what arrived after the first, enabling polling
+  /// loops without client-side deduplication.
   ///
-  /// Test Scenario:
-  /// 1. Emit "first", wait for processing
-  /// 2. First drain → returns "first" (1 emission)
-  /// 3. Emit "second", wait for processing
-  /// 4. Second drain → returns "second" (1 emission, not 2!)
-  ///
-  /// Drain Semantics (cursor-based):
-  /// ```
-  /// Reservoir maintains internal cursor position:
-  ///   emissions: [________________]
-  ///   cursor:     ^
-  ///
-  /// After first drain:
-  ///   emissions: [first___________]
-  ///   cursor:           ^          (moved forward)
-  ///
-  /// After second emission:
-  ///   emissions: [first, second___]
-  ///   cursor:           ^          (still here)
-  ///
-  /// After second drain:
-  ///   emissions: [first, second___]
-  ///   cursor:                   ^  (moved forward again)
-  /// ```
-  ///
-  /// Why incremental matters:
-  /// - **Polling loops**: Can periodically drain without tracking what was seen
-  /// - **Memory efficiency**: Old emissions can be garbage collected after drain
-  /// - **Batch processing**: Process chunks incrementally (e.g., flush every 100)
-  /// - **No duplication**: Each emission processed exactly once
-  ///
-  /// Contrast with alternative semantics:
-  /// - **drain() returns ALL**: Would require client-side deduplication
-  /// - **drain() clears ALL**: Would lose emissions between drains (race condition)
-  /// - **drain() since timestamp**: Would require clock synchronization
-  /// - **drain() with cursor**: Correct - cursor maintained by reservoir internally
-  ///
-  /// Usage Pattern:
-  /// ```java
-  /// // Polling loop with incremental drain
-  /// while (running) {
-  ///   Thread.sleep(100);
-  ///   reservoir.drain().forEach(capture -> {
-  ///     process(capture.emission());
-  ///   });
-  /// }
-  /// // No need to track "last processed" - reservoir handles it
-  /// ```
-  ///
-  /// Critical behaviors verified:
-  /// - First drain returns emission count = 1 (only "first")
-  /// - Second drain returns emission count = 1 (only "second", not 2)
-  /// - Drains are independent (second doesn't include first)
-  /// - Cursor advances automatically after each drain
-  ///
-  /// Real-world applications:
-  /// - Log aggregation (drain logs every second)
-  /// - Metrics collection (drain counters periodically)
-  /// - Event streaming (batch events for bulk processing)
-  /// - Testing/debugging (inspect emissions without affecting system)
-  ///
-  /// Expected: First `drain=[first]`, second `drain=[second]` (incremental, not cumulative)
+  /// Expected: first drain=["first"], second drain=["second"] (not cumulative)
   @Test
-  void testReservoirDrainCapturesNewEmissions () {
+  void testBasinDrainCapturesNewEmissions () {
 
     final var circuit = cortex.circuit ();
 
@@ -425,7 +371,14 @@ final class CortexTest
       final var conduit =
         circuit.conduit ( String.class );
 
-      final Reservoir < String > reservoir = conduit.reservoir ( 1024 );
+      final Basin < Capture < String > > basin = circuit.basin ( 1024 );
+
+      conduit.subscribe (
+        circuit.subscriber (
+          cortex.name ( "test.capture" ),
+          circuit.sink ( basin.pipe () )
+        )
+      );
 
       final Pipe < String > pipe =
         conduit.get ( cortex.name ( "test.channel" ) );
@@ -434,8 +387,9 @@ final class CortexTest
 
       circuit.await ();
 
-      final var firstDrain =
-        reservoir.drain ().toList ();
+      final List < Capture < String > > firstDrain = new ArrayList <> ();
+      basin.drain ( circuit.pipe ( firstDrain::add ) );
+      circuit.await ();
 
       assertEquals ( 1, firstDrain.size () );
       assertEquals ( "first", firstDrain.getFirst ().emission () );
@@ -446,13 +400,12 @@ final class CortexTest
       circuit.await ();
 
       // Second drain should have only new emissions since last drain
-      final var secondDrain =
-        reservoir.drain ().toList ();
+      final List < Capture < String > > secondDrain = new ArrayList <> ();
+      basin.drain ( circuit.pipe ( secondDrain::add ) );
+      circuit.await ();
 
       assertEquals ( 1, secondDrain.size () );
       assertEquals ( "second", secondDrain.getFirst ().emission () );
-
-      reservoir.close ();
 
     } finally {
 
@@ -463,20 +416,15 @@ final class CortexTest
   }
 
   @Test
-  void testReservoirSubjectType () {
+  void testBasinSubjectType () {
 
     final var circuit = cortex.circuit ();
 
     try {
 
-      final var conduit =
-        circuit.conduit ( String.class );
+      final var basin = circuit.basin ( String.class, 1024 );
 
-      final var reservoir = conduit.reservoir ( 1024 );
-
-      assertEquals ( Reservoir.class, reservoir.subject ().type () );
-
-      reservoir.close ();
+      assertEquals ( Basin.class, basin.subject ().type () );
 
     } finally {
 
@@ -487,7 +435,7 @@ final class CortexTest
   }
 
   // ===========================
-  // Reservoir Tests
+  // Basin Tests
   // ===========================
 
   @Test

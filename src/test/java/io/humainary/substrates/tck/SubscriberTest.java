@@ -521,16 +521,16 @@ final class SubscriberTest
   }
 
 
-  /// Validates cross-circuit rejection works for the circuit's own source.
+  /// Validates cross-circuit rejection on another circuit's conduit.
   ///
-  /// Circuits themselves implement Source, so subscribers can subscribe directly
-  /// to the circuit to receive state change notifications. This test verifies
-  /// that the valve check also applies to circuit-level subscriptions.
+  /// 3.0: Circuit no longer implements Source; Conduit is the sole required
+  /// source type. This test verifies the valve check applies when a subscriber
+  /// minted by one circuit is subscribed to a conduit owned by another.
   ///
-  /// Expected: Substrates.Fault thrown when subscribing to circuit with
-  /// a subscriber from a different circuit
+  /// Expected: Substrates.Fault thrown when subscribing to circuit1's conduit
+  /// with a subscriber from circuit2
   @Test
-  void testCrossCircuitSubscriptionRejectedForCircuitSource () {
+  void testCrossCircuitSubscriptionRejectedForForeignConduit () {
 
     final var circuit2 = cortex.circuit ();
 
@@ -545,11 +545,11 @@ final class SubscriberTest
             } )
         );
 
-      // Attempt to subscribe to circuit1's state source
+      // Attempt to subscribe to a conduit owned by circuit1
       final var exception =
         assertThrows (
           Substrates.Fault.class,
-          () -> circuit.subscribe ( subscriber )
+          () -> circuit.< State >conduit ().subscribe ( subscriber )
         );
 
       assertEquals (

@@ -9,6 +9,7 @@ import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
 import io.humainary.substrates.api.Substrates.Circuit;
+import io.humainary.substrates.api.Substrates.Conduit;
 import io.humainary.substrates.api.Substrates.Scope;
 import io.humainary.substrates.api.Substrates.State;
 import io.humainary.substrates.api.Substrates.Subscriber;
@@ -193,7 +194,7 @@ class IdempotentAnnotationContractTest {
       try {
         Subscriber < State > subscriber = circuit.subscriber ( cortex ().name ( "sub" ), ( subject, registrar ) -> {
         } );
-        Subscription subscription = circuit.subscribe ( subscriber );
+        Subscription subscription = circuit.< State >conduit ().subscribe ( subscriber );
 
         // First close should work
         assertDoesNotThrow ( () -> subscription.close (), "First close() should not throw" );
@@ -215,7 +216,7 @@ class IdempotentAnnotationContractTest {
       try {
         Subscriber < State > subscriber = circuit.subscriber ( cortex ().name ( "sub" ), ( subject, registrar ) -> {
         } );
-        Subscription subscription = circuit.subscribe ( subscriber );
+        Subscription subscription = circuit.< State >conduit ().subscribe ( subscriber );
 
         // Simulate multiple threads closing concurrently
         Thread[] threads = new Thread[10];
@@ -257,8 +258,9 @@ class IdempotentAnnotationContractTest {
         Subscriber < State > subscriber2 = circuit.subscriber ( cortex ().name ( "sub2" ), ( subject, registrar ) -> {
         } );
 
-        Subscription subscription1 = circuit.subscribe ( subscriber1 );
-        Subscription subscription2 = circuit.subscribe ( subscriber2 );
+        Conduit < State > conduit = circuit.conduit ();
+        Subscription subscription1 = conduit.subscribe ( subscriber1 );
+        Subscription subscription2 = conduit.subscribe ( subscriber2 );
 
         // Close subscription1 multiple times
         assertDoesNotThrow ( () -> subscription1.close () );
@@ -324,7 +326,7 @@ class IdempotentAnnotationContractTest {
       Circuit circuit = cortex ().circuit ( cortex ().name ( "circuit" ) );
       Subscriber < State > subscriber = circuit.subscriber ( cortex ().name ( "sub" ), ( subject, registrar ) -> {
       } );
-      Subscription subscription = circuit.subscribe ( subscriber );
+      Subscription subscription = circuit.< State >conduit ().subscribe ( subscriber );
 
       // Interleaved closes (all idempotent)
       assertDoesNotThrow ( () -> subscription.close () );

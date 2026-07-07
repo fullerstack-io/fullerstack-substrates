@@ -1513,53 +1513,37 @@ class Substrates2Test implements Substrates {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // Circuit as Source<State> tests
+  // Circuit-owned buffer tests (3.0: Circuit is no longer a Source; the former
+  // circuit.subscribe/tap/reservoir surface is gone — Conduit is the sole
+  // required source type, and buffering is the circuit-owned Basin)
   // ═══════════════════════════════════════════════════════════════════════════
 
   @Nested
-  @DisplayName ( "Circuit Source<State>" )
-  class CircuitSourceTests {
+  @DisplayName ( "Circuit Basin (3.0)" )
+  class CircuitBasinTests {
 
     @Test
-    @DisplayName ( "circuit.subscribe(State) returns subscription" )
-    void circuitSubscribe_returnsSubscription () {
+    @DisplayName ( "circuit.basin() returns a basin with a stable feed pipe" )
+    void circuitBasin_returnsBasin () {
       final var cortex = Substrates.cortex ();
       final var circuit = cortex.circuit ();
       try {
-        var subscription = circuit.subscribe (
-          circuit.subscriber (
-            cortex.name ( "state.sub" ),
-            ( subject, registrar ) -> registrar.register ( (Receptor < State >) s -> {} )
-          )
-        );
-        assertNotNull ( subscription );
+        var basin = circuit.< Integer >basin ( 16 );
+        assertNotNull ( basin );
+        assertNotNull ( basin.subject () );
+        assertSame ( basin.pipe (), basin.pipe (), "pipe() must return the same feed instance" );
       } finally {
         circuit.close ();
       }
     }
 
     @Test
-    @DisplayName ( "circuit.tap() returns a tap" )
-    void circuitTap_returnsTap () {
+    @DisplayName ( "basin capacity < 1 raises IllegalArgumentException" )
+    void circuitBasin_rejectsNonPositiveCapacity () {
       final var cortex = Substrates.cortex ();
       final var circuit = cortex.circuit ();
       try {
-        Tap < State > tap = circuit.tap ( p -> p );
-        assertNotNull ( tap );
-        tap.close ();
-      } finally {
-        circuit.close ();
-      }
-    }
-
-    @Test
-    @DisplayName ( "circuit.reservoir() returns a reservoir" )
-    void circuitReservoir_returnsReservoir () {
-      final var cortex = Substrates.cortex ();
-      final var circuit = cortex.circuit ();
-      try {
-        var reservoir = circuit.reservoir ( 1024 );
-        assertNotNull ( reservoir );
+        assertThrows ( IllegalArgumentException.class, () -> circuit.basin ( 0 ) );
       } finally {
         circuit.close ();
       }

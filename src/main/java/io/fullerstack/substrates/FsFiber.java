@@ -102,19 +102,21 @@ public final class FsFiber < E > implements Fiber < E > {
   /// Delegates to the standard `pipe(Pipe)` form with `cell.pipe()` as target.
   @NotNull
   @Override
-  public Pipe < E > pipe ( @NotNull Cell < E > cell ) {
+  public Pipe < E > pipe ( @NotNull Cell < ? super E > cell ) {
     Objects.requireNonNull ( cell, "cell must not be null" );
     return pipe ( cell.pipe () );
   }
 
+  /// 3.0: target widened to `Pipe<? super E>` — the elision cast is safe
+  /// because a pipe accepting `? super E` accepts every `E`.
   @NotNull
   @Override
   @SuppressWarnings ( "unchecked" )
-  public Pipe < E > pipe ( @NotNull Pipe < E > target ) {
+  public Pipe < E > pipe ( @NotNull Pipe < ? super E > target ) {
     Objects.requireNonNull ( target, "target must not be null" );
     // Empty fiber elision — no operators means nothing to do. Returning
     // target directly skips the transit hop that wraps a no-op chain.
-    if ( count == 0 ) return target;
+    if ( count == 0 ) return (Pipe < E >) target;
     final Consumer < E > chain;
     if ( target instanceof FsPipe < ? > fp ) {
       final FsCircuit c = fp.circuit ();
@@ -138,7 +140,7 @@ public final class FsFiber < E > implements Fiber < E > {
       }
       @Override
       public Subject < Pipe < E > > subject () {
-        return target.subject ();
+        return (Subject < Pipe < E > >) (Subject < ? >) target.subject ();
       }
     };
   }

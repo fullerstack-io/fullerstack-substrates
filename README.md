@@ -21,10 +21,10 @@ SPI provider implementation of the [Humainary Substrates API](https://github.com
 2. **Humainary APIs** (not yet on Maven Central):
    ```bash
    git clone https://github.com/humainary-io/substrates-api-java.git
-   cd substrates-api-java/api && mvn clean install -DskipTests && cd ../..
+   cd substrates-api-java && mvn clean install -DskipTests && cd ..
 
    git clone https://github.com/humainary-io/serventis-api-java.git
-   cd serventis-api-java/api && mvn clean install -DskipTests && cd ../..
+   cd serventis-api-java && mvn clean install -DskipTests && cd ..
    ```
 
 ## Build & Test

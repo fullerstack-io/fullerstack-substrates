@@ -38,7 +38,10 @@ fi
 # Build shaded benchmark jar
 echo ""
 echo "=== Building benchmark jar ==="
-mvn -f "${SUBSTRATES_DIR}/pom.xml" clean install -DskipTests -Deditorconfig.skip=true -q
+# `package`, not `install`: under -Pbench the main jar also carries the benchmark classes,
+# and installing that into ~/.m2 would hand downstream products a 6.6 MB jar with a JMH
+# harness in it. The profile also hard-disables install/deploy, so this is belt and braces.
+mvn -f "${SUBSTRATES_DIR}/pom.xml" clean package -DskipTests -Deditorconfig.skip=true -Pbench -q
 
 BENCHMARK_JAR="${SUBSTRATES_DIR}/target/benchmarks.jar"
 if [[ ! -f "${BENCHMARK_JAR}" ]]; then

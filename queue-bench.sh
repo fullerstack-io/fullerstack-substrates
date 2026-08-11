@@ -12,9 +12,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Build first
+# Build first. Benchmarks live behind the `bench` profile — they are not part of the
+# published jar, so this flag is required, not optional.
 echo "Building benchmarks..."
-mvn clean package -DskipTests -Deditorconfig.skip=true -q
+mvn clean package -DskipTests -Deditorconfig.skip=true -Pbench -q
 
 echo ""
 echo "=== Running QueueBenchmark ==="

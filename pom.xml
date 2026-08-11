@@ -17,6 +17,7 @@
   <url>https://github.com/fullerstack-io/fullerstack-substrates</url>
 
   <properties>
+    <jmh.version>1.37</jmh.version>
     <!-- Java 26 (required for Substrates API) -->
     <java.version>26</java.version>
     <maven.compiler.source>26</maven.compiler.source>
@@ -161,17 +162,6 @@
       <version>4.0.0</version>
     </dependency>
 
-    <!-- JMH for Performance Benchmarking -->
-    <dependency>
-      <groupId>org.openjdk.jmh</groupId>
-      <artifactId>jmh-core</artifactId>
-      <version>1.37</version>
-    </dependency>
-    <dependency>
-      <groupId>org.openjdk.jmh</groupId>
-      <artifactId>jmh-generator-annprocess</artifactId>
-      <version>1.37</version>
-    </dependency>
   </dependencies>
 
   <build>
@@ -188,13 +178,6 @@
             <arg>--add-exports</arg>
             <arg>java.base/jdk.internal.vm.annotation=ALL-UNNAMED</arg>
           </compilerArgs>
-          <annotationProcessorPaths>
-            <path>
-              <groupId>org.openjdk.jmh</groupId>
-              <artifactId>jmh-generator-annprocess</artifactId>
-              <version>1.37</version>
-            </path>
-          </annotationProcessorPaths>
         </configuration>
       </plugin>
       <plugin>
@@ -261,84 +244,139 @@
         </dependencies>
       </plugin>
 
-      <!-- JMH Benchmark Execution -->
-      <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-shade-plugin</artifactId>
-        <version>3.5.1</version>
-        <executions>
-          <execution>
-            <phase>package</phase>
-            <goals>
-              <goal>shade</goal>
-            </goals>
-            <configuration>
-              <finalName>benchmarks</finalName>
-              <createDependencyReducedPom>false</createDependencyReducedPom>
-              <transformers>
-                <transformer
-                  implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
-                  <mainClass>org.openjdk.jmh.Main</mainClass>
-                </transformer>
-                <transformer
-                  implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
-              </transformers>
-              <filters>
-                <filter>
-                  <!-- Exclude signatures to avoid SecurityException -->
-                  <artifact>*:*</artifact>
-                  <excludes>
-                    <exclude>META-INF/*.SF</exclude>
-                    <exclude>META-INF/*.DSA</exclude>
-                    <exclude>META-INF/*.RSA</exclude>
-                  </excludes>
-                </filter>
-              </filters>
-            </configuration>
-          </execution>
-        </executions>
-      </plugin>
-
-      <!-- Copy runtime dependencies for benchmark classpath -->
-      <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-dependency-plugin</artifactId>
-        <version>3.6.1</version>
-        <executions>
-          <execution>
-            <id>copy-dependencies</id>
-            <phase>package</phase>
-            <goals>
-              <goal>copy-dependencies</goal>
-            </goals>
-            <configuration>
-              <outputDirectory>${project.build.directory}/dependency</outputDirectory>
-              <includeScope>runtime</includeScope>
-            </configuration>
-          </execution>
-        </executions>
-      </plugin>
-
-      <!-- Add JMH benchmark sources -->
-      <plugin>
-        <groupId>org.codehaus.mojo</groupId>
-        <artifactId>build-helper-maven-plugin</artifactId>
-        <version>3.5.0</version>
-        <executions>
-          <execution>
-            <id>add-jmh-source</id>
-            <phase>generate-sources</phase>
-            <goals>
-              <goal>add-source</goal>
-            </goals>
-            <configuration>
-              <sources>
-                <source>src/jmh/java</source>
-              </sources>
-            </configuration>
-          </execution>
-        </executions>
-      </plugin>
     </plugins>
   </build>
+
+  <profiles>
+    <!-- Benchmarks are OFF by default: `mvn -Pbench package`.
+
+         They used to be a main source root, so 1184 of the 1295 files in the published jar were
+         benchmark classes (a 6.6 MB artifact, 91% harness), and jmh-core plus its annotation
+         processor arrived as compile dependencies of every consumer. Downstream products embed
+         this jar in production; a benchmark runner and a codegen processor have no business on
+         that classpath, and consumers had started excluding them by hand.
+
+         Everything the benchmarks need lives here and nowhere else: the source root, the JMH
+         dependencies, the annotation processor, the uber-jar and its dependency staging. -->
+    <profile>
+      <id>bench</id>
+      <properties>
+        <!-- Under this profile the main jar carries the benchmark classes. Installing or
+             deploying that would hand downstream products the very artifact this profile
+             exists to keep them from getting, so make it impossible rather than a rule. -->
+        <maven.install.skip>true</maven.install.skip>
+        <maven.deploy.skip>true</maven.deploy.skip>
+      </properties>
+      <dependencies>
+        <dependency>
+          <groupId>org.openjdk.jmh</groupId>
+          <artifactId>jmh-core</artifactId>
+          <version>${jmh.version}</version>
+        </dependency>
+        <dependency>
+          <groupId>org.openjdk.jmh</groupId>
+          <artifactId>jmh-generator-annprocess</artifactId>
+          <version>${jmh.version}</version>
+        </dependency>
+      </dependencies>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-compiler-plugin</artifactId>
+            <version>${maven-compiler-plugin.version}</version>
+            <configuration>
+              <annotationProcessorPaths>
+                <path>
+                  <groupId>org.openjdk.jmh</groupId>
+                  <artifactId>jmh-generator-annprocess</artifactId>
+                  <version>${jmh.version}</version>
+                </path>
+              </annotationProcessorPaths>
+            </configuration>
+          </plugin>
+
+          <!-- Add JMH benchmark sources -->
+          <plugin>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>build-helper-maven-plugin</artifactId>
+            <version>3.5.0</version>
+            <executions>
+              <execution>
+                <id>add-jmh-source</id>
+                <phase>generate-sources</phase>
+                <goals>
+                  <goal>add-source</goal>
+                </goals>
+                <configuration>
+                  <sources>
+                    <source>src/jmh/java</source>
+                  </sources>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+
+          <!-- Copy runtime dependencies for benchmark classpath -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-dependency-plugin</artifactId>
+            <version>3.6.1</version>
+            <executions>
+              <execution>
+                <id>copy-dependencies</id>
+                <phase>package</phase>
+                <goals>
+                  <goal>copy-dependencies</goal>
+                </goals>
+                <configuration>
+                  <outputDirectory>${project.build.directory}/dependency</outputDirectory>
+                  <includeScope>runtime</includeScope>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+
+          <!-- JMH Benchmark Execution -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-shade-plugin</artifactId>
+            <version>3.5.1</version>
+            <executions>
+              <execution>
+                <phase>package</phase>
+                <goals>
+                  <goal>shade</goal>
+                </goals>
+                <configuration>
+                  <finalName>benchmarks</finalName>
+                  <createDependencyReducedPom>false</createDependencyReducedPom>
+                  <transformers>
+                    <transformer
+                      implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                      <mainClass>org.openjdk.jmh.Main</mainClass>
+                    </transformer>
+                    <transformer
+                      implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                  </transformers>
+                  <filters>
+                    <filter>
+                      <!-- Exclude signatures to avoid SecurityException -->
+                      <artifact>*:*</artifact>
+                      <excludes>
+                        <exclude>META-INF/*.SF</exclude>
+                        <exclude>META-INF/*.DSA</exclude>
+                        <exclude>META-INF/*.RSA</exclude>
+                      </excludes>
+                    </filter>
+                  </filters>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
+
 </project>

@@ -35,9 +35,6 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.Executors;
-import java.util.Queue;
-import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
@@ -77,6 +74,13 @@ public final class FsCircuit implements Circuit {
 
   // Spin count before parking (~100μs with Thread.onSpinWait)
   // Based on benchmarking: hot spin provides no benefit, cool spin of 1000 is optimal
+  /// Spin iterations an awaiter performs before falling back to park().
+  private static final int AWAIT_SPIN_COUNT = 1_000;
+
+  /// Bounded park on the slow path, so a close racing an await is observed without the
+  /// awaiter having registered itself anywhere.
+  private static final long AWAIT_PARK_NANOS = 1_000_000L;
+
   private static final int SPIN_COUNT = 1000;
 
   // Timed park interval when no work after spin phase.
@@ -123,10 +127,6 @@ public final class FsCircuit implements Circuit {
   // ─────────────────────────────────────────────────────────────────────────────
 
   @SuppressWarnings ( "unused" ) // accessed via VarHandle
-  /// Pending await barriers, so that close can release callers whose marker will never be
-  /// dispatched. A queue of latches rather than one thread slot: §5.5 requires each awaiter
-  /// to suspend independently at its own barrier position.
-  private final Queue < CountDownLatch > awaiters = new ConcurrentLinkedQueue <> ();
 
   // Set by close marker (runs on circuit thread) to signal worker exit.
   // Plain field - only accessed from circuit thread.
@@ -191,6 +191,24 @@ public final class FsCircuit implements Circuit {
   // Canary benchmark: io.humainary.substrates.jmh.PipeOps.async_emit_batch_await
   // Structural test:  FsCircuitMarkerInvariantTest
   // ─────────────────────────────────────────────────────────────────────────────
+
+  /// One awaiter's barrier: a released flag and the thread to wake if it parked.
+  ///
+  /// Deliberately not a `CountDownLatch`. The marker fires in single-digit microseconds, so
+  /// the common case must be a spin on a volatile read, not a blocking synchronizer with an
+  /// AQS node behind it — parking costs more than the barrier it is waiting for.
+  ///
+  /// Held in a `ThreadLocal` and reused, so a thread that awaits repeatedly allocates once
+  /// for its lifetime rather than once per call. Reuse is safe because a barrier is only
+  /// ever recycled after its own await has returned.
+  static final class AwaitBarrier {
+    final Thread thread;
+    volatile boolean released;
+    AwaitBarrier ( Thread thread ) { this.thread = thread; }
+  }
+
+  private static final ThreadLocal < AwaitBarrier > AWAIT_BARRIER =
+    ThreadLocal.withInitial ( () -> new AwaitBarrier ( Thread.currentThread () ) );
 
   /// Await marker — delivered through the ingress queue and routed to
   /// {@link FsCircuit#onAwaitMarker(Object)} via isMarker() identity check.
@@ -497,8 +515,7 @@ public final class FsCircuit implements Circuit {
   private void awaitImpl () {
 
     // §5.5 is positional: the barrier covers "every circuit operation accepted BEFORE the
-    // await call". Each awaiter therefore admits its OWN marker at its OWN position and
-    // waits on its OWN latch.
+    // await call". Each awaiter therefore admits its OWN marker at its OWN position.
     //
     // The previous implementation CAS'd a single awaiterThread slot and let later callers
     // piggyback on the FIRST awaiter's marker by spinning until that slot cleared. That
@@ -508,39 +525,36 @@ public final class FsCircuit implements Circuit {
     // Reproduced by AwaitBarrierTest#concurrentAwaitersEachGetTheirOwnBarrier.
     //
     // The marker RECEIVER is still the pre-allocated AwaitMarker singleton — only the
-    // payload changed, from null to this awaiter's latch. That matters: the dispatch-chain
+    // payload changed, from null to this awaiter's barrier. That matters: the dispatch-chain
     // comment above requires every call site to stay monomorphic, so the marker class
     // hierarchy must not grow a variant.
-    final CountDownLatch released = new CountDownLatch ( 1 );
+    final AwaitBarrier barrier = AWAIT_BARRIER.get ();
+    barrier.released = false;
 
-    // Registered BEFORE the marker is submitted, so a close racing this call finds it.
-    // A marker admitted at or after the close marker is never dispatched (§9.1), and its
-    // awaiter would otherwise wait on a latch nobody counts down.
-    awaiters.add ( released );
+    submitIngress ( awaitMarkerReceiver, barrier );
+    LockSupport.unpark ( worker );
 
-    if ( closed ) {
-      releaseAwaiters ();
-    } else {
-      submitIngress ( awaitMarkerReceiver, released );
-      LockSupport.unpark ( worker );
+    // Spin first, and in the common case that is the whole of it. The marker fires in
+    // single-digit microseconds, which is faster than a park/unpark round trip — and on a
+    // virtual thread, parking additionally unmounts the carrier.
+    //
+    // Nothing is registered anywhere: an earlier revision kept the barrier in a
+    // ConcurrentLinkedQueue so close() could release it, which put a node allocation, a CAS
+    // and an O(n) remove() traversal on EVERY await, to serve a case that only arises when
+    // a close races the call. The check below covers that case at zero cost to the common
+    // one, which is the right trade for a barrier that usually completes in microseconds.
+    for ( int i = 0; i < AWAIT_SPIN_COUNT; i++ ) {
+      if ( barrier.released ) return;
+      Thread.onSpinWait ();
     }
 
-    try {
-      released.await ();
-    } catch ( InterruptedException e ) {
-      Thread.currentThread ().interrupt ();
-    } finally {
-      awaiters.remove ( released );
-    }
-  }
-
-  /// Release every pending awaiter. Called from the close path, where markers admitted at
-  /// or after the close marker will never be dispatched (§9.1) — §5.5 requires await to
-  /// return immediately once the circuit is closed.
-  private void releaseAwaiters () {
-    CountDownLatch pending;
-    while ( ( pending = awaiters.poll () ) != null ) {
-      pending.countDown ();
+    // Only a genuinely slow circuit reaches here. Bounded parks rather than an indefinite
+    // one: a marker admitted at or after the close marker is never dispatched (§9.1), so
+    // its flag is never set, and §5.5 requires await to return immediately once the circuit
+    // is closed. Re-checking on each wake also covers spurious returns from park.
+    while ( !barrier.released ) {
+      if ( closed && !worker.isAlive () ) return;
+      LockSupport.parkNanos ( AWAIT_PARK_NANOS );
     }
   }
 
@@ -551,8 +565,12 @@ public final class FsCircuit implements Circuit {
    * such item's transit cascade drained within its own turn (§5.3). That is the §5.5
    * barrier exactly.
    */
-  private void onAwaitMarker ( Object latch ) {
-    ( (CountDownLatch) latch ).countDown ();
+  private void onAwaitMarker ( Object barrier ) {
+    final AwaitBarrier b = (AwaitBarrier) barrier;
+    b.released = true;
+    // Unconditional: the awaiter may be spinning (in which case this is a wasted syscall-free
+    // permit) or parked (in which case it is required). Testing which would be a race.
+    LockSupport.unpark ( b.thread );
   }
 
   /**
@@ -587,9 +605,9 @@ public final class FsCircuit implements Circuit {
     // Always wake worker on close (may be parked)
     LockSupport.unpark ( worker );
 
-    // Release every pending awaiter, not just one: §5.5 permits concurrent awaiters and
-    // requires each to suspend independently, so there is no single slot to clear.
-    releaseAwaiters ();
+    // Awaiters are not tracked: each polls `closed` on its own bounded park (see
+    // awaitImpl), so there is nothing to release here and nothing to pay for on the
+    // common path.
 
     // 2.8: stop scheduling further ticks; in-flight ticks already submitted
     // to the ingress queue may still be delivered (spec §11.5).

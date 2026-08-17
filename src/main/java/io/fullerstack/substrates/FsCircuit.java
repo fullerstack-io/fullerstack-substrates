@@ -29,8 +29,6 @@ import io.humainary.substrates.api.Substrates.Subject;
 import io.humainary.substrates.api.Substrates.Subscriber;
 import io.humainary.substrates.api.Substrates.Ticker;
 
-import java.lang.invoke.MethodHandles;
-import java.lang.invoke.VarHandle;
 import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
@@ -63,18 +61,18 @@ import java.util.function.Function;
 @Provided
 public final class FsCircuit implements Circuit {
 
-
-  static {
-    try {
-      MethodHandles.Lookup l = MethodHandles.lookup ();
-    } catch ( Exception e ) {
-      throw new ExceptionInInitializerError ( e );
-    }
-  }
-
   // Spin count before parking (~100μs with Thread.onSpinWait)
   // Based on benchmarking: hot spin provides no benefit, cool spin of 1000 is optimal
   /// Spin iterations an awaiter performs before falling back to park().
+  ///
+  /// The marker fires within ~2µs in the common case (the worker self-wakes every
+  /// PARK_NANOS, drains, fires the marker), so spinning catches the signal without paying
+  /// the ~5-15µs virtual-thread park/unpark round trip.
+  ///
+  /// Tuned by sweep, and the shape is a cliff rather than a slope: 500 falls below it
+  /// (shallow cyclic_emit_await regresses 10ns/op), 1000 catches the marker, 5000+ wastes
+  /// ~3ns/op on deep-cascade awaits whose 140µs the spin can never catch anyway. Real
+  /// awaits are rare — tests, shutdown, bridges — so the spin cost is negligible.
   private static final int AWAIT_SPIN_COUNT = 1_000;
 
   /// Bounded park on the slow path, so a close racing an await is observed without the
@@ -87,16 +85,6 @@ public final class FsCircuit implements Circuit {
   // Worker self-wakes — producers never need to unpark.
   // 1μs: on virtual threads this is just an FJP reschedule, no carrier blocking.
   private static final long PARK_NANOS = 1_000L;
-
-  // Spin iterations the awaiter performs before falling back to park().
-  // The marker fires within ~2µs in the common case (worker self-wakes every
-  // PARK_NANOS, drains, fires marker). Spinning catches the signal without
-  // paying the ~5-15µs virtual-thread park/unpark round-trip.
-  //
-  // Tuned via sweep — 500 falls below the cliff (shallow cyclic_emit_await
-  // regresses 10ns/op), 1000 catches the marker, 5000+ wastes ~3ns/op on
-  // deep-cascade awaits (140µs cascades the spin can never catch). For real
-  // awaits (rare — tests, shutdown, bridges), the spin cost is negligible.
 
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -125,8 +113,6 @@ public final class FsCircuit implements Circuit {
   // ─────────────────────────────────────────────────────────────────────────────
   // Synchronization state
   // ─────────────────────────────────────────────────────────────────────────────
-
-  @SuppressWarnings ( "unused" ) // accessed via VarHandle
 
   // Set by close marker (runs on circuit thread) to signal worker exit.
   // Plain field - only accessed from circuit thread.
@@ -508,9 +494,10 @@ public final class FsCircuit implements Circuit {
   }
 
   /**
-   * Lightweight await using direct park/unpark.
-   * First caller injects marker and parks.
-   * Subsequent callers piggyback - park until first caller's marker completes.
+   * Await: admit a marker at this caller's own barrier position, then spin for it.
+   *
+   * Every awaiter gets its own marker and its own barrier — see the note in the body for
+   * why callers must not share one.
    */
   private void awaitImpl () {
 

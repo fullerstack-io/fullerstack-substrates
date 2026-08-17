@@ -35,6 +35,9 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.Executors;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
@@ -63,12 +66,10 @@ import java.util.function.Function;
 @Provided
 public final class FsCircuit implements Circuit {
 
-  private static final VarHandle AWAITER;
 
   static {
     try {
       MethodHandles.Lookup l = MethodHandles.lookup ();
-      AWAITER = l.findVarHandle ( FsCircuit.class, "awaiterThread", Thread.class );
     } catch ( Exception e ) {
       throw new ExceptionInInitializerError ( e );
     }
@@ -92,7 +93,6 @@ public final class FsCircuit implements Circuit {
   // regresses 10ns/op), 1000 catches the marker, 5000+ wastes ~3ns/op on
   // deep-cascade awaits (140µs cascades the spin can never catch). For real
   // awaits (rare — tests, shutdown, bridges), the spin cost is negligible.
-  private static final int AWAIT_SPIN_COUNT = 1_000;
 
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -122,9 +122,11 @@ public final class FsCircuit implements Circuit {
   // Synchronization state
   // ─────────────────────────────────────────────────────────────────────────────
 
-  // awaiterThread only modified on await calls
   @SuppressWarnings ( "unused" ) // accessed via VarHandle
-  private volatile Thread awaiterThread;
+  /// Pending await barriers, so that close can release callers whose marker will never be
+  /// dispatched. A queue of latches rather than one thread slot: §5.5 requires each awaiter
+  /// to suspend independently at its own barrier position.
+  private final Queue < CountDownLatch > awaiters = new ConcurrentLinkedQueue <> ();
 
   // Set by close marker (runs on circuit thread) to signal worker exit.
   // Plain field - only accessed from circuit thread.
@@ -493,46 +495,64 @@ public final class FsCircuit implements Circuit {
    * Subsequent callers piggyback - park until first caller's marker completes.
    */
   private void awaitImpl () {
-    Thread current = Thread.currentThread ();
 
-    // Try to register as the awaiter (CAS null → current)
-    Thread existing = (Thread) AWAITER.compareAndExchange ( this, null, current );
-    if ( existing != null ) {
-      // Another thread is awaiting - piggyback: spin-wait until their marker completes.
-      // The marker fires in microseconds; spin is cheaper than a timed park here.
-      while ( AWAITER.getOpaque ( this ) == existing ) {
-        Thread.onSpinWait ();
-      }
-      return;
+    // §5.5 is positional: the barrier covers "every circuit operation accepted BEFORE the
+    // await call". Each awaiter therefore admits its OWN marker at its OWN position and
+    // waits on its OWN latch.
+    //
+    // The previous implementation CAS'd a single awaiterThread slot and let later callers
+    // piggyback on the FIRST awaiter's marker by spinning until that slot cleared. That
+    // marker was admitted before the later caller's work, so the piggybacker could be
+    // released with its own emission still queued — the barrier clause violated, and
+    // §5.5's "each suspends independently" is what made piggybacking illegal to begin with.
+    // Reproduced by AwaitBarrierTest#concurrentAwaitersEachGetTheirOwnBarrier.
+    //
+    // The marker RECEIVER is still the pre-allocated AwaitMarker singleton — only the
+    // payload changed, from null to this awaiter's latch. That matters: the dispatch-chain
+    // comment above requires every call site to stay monomorphic, so the marker class
+    // hierarchy must not grow a variant.
+    final CountDownLatch released = new CountDownLatch ( 1 );
+
+    // Registered BEFORE the marker is submitted, so a close racing this call finds it.
+    // A marker admitted at or after the close marker is never dispatched (§9.1), and its
+    // awaiter would otherwise wait on a latch nobody counts down.
+    awaiters.add ( released );
+
+    if ( closed ) {
+      releaseAwaiters ();
+    } else {
+      submitIngress ( awaitMarkerReceiver, released );
+      LockSupport.unpark ( worker );
     }
 
-    // We're the first awaiter - inject marker job (uses pre-allocated ReceptorAdapter)
-    marker ( awaitMarkerReceiver );
-
-    // Unpark worker to process marker promptly (cold path)
-    LockSupport.unpark ( worker );
-
-    // Spin briefly before parking. Marker fires in single-digit µs in the
-    // common case, faster than a park/unpark round-trip on virtual threads.
-    for ( int i = 0; i < AWAIT_SPIN_COUNT; i++ ) {
-      if ( AWAITER.getOpaque ( this ) != current ) return;
-      Thread.onSpinWait ();
+    try {
+      released.await ();
+    } catch ( InterruptedException e ) {
+      Thread.currentThread ().interrupt ();
+    } finally {
+      awaiters.remove ( released );
     }
+  }
 
-    // Park until marker wakes us (spurious wakeup safe via loop)
-    while ( AWAITER.getOpaque ( this ) == current ) {
-      LockSupport.park ();
+  /// Release every pending awaiter. Called from the close path, where markers admitted at
+  /// or after the close marker will never be dispatched (§9.1) — §5.5 requires await to
+  /// return immediately once the circuit is closed.
+  private void releaseAwaiters () {
+    CountDownLatch pending;
+    while ( ( pending = awaiters.poll () ) != null ) {
+      pending.countDown ();
     }
   }
 
   /**
-   * Marker callback - unpark the awaiting thread.
+   * Marker callback - release the awaiter whose barrier position this marker occupies.
+   *
+   * Everything admitted before this marker has, by FIFO, already been processed, and each
+   * such item's transit cascade drained within its own turn (§5.3). That is the §5.5
+   * barrier exactly.
    */
-  private void onAwaitMarker ( Object ignored ) {
-    Thread awaiter = (Thread) AWAITER.getAndSet ( this, null );
-    if ( awaiter != null ) {
-      LockSupport.unpark ( awaiter );
-    }
+  private void onAwaitMarker ( Object latch ) {
+    ( (CountDownLatch) latch ).countDown ();
   }
 
   /**
@@ -567,9 +587,9 @@ public final class FsCircuit implements Circuit {
     // Always wake worker on close (may be parked)
     LockSupport.unpark ( worker );
 
-    // Release any pending awaiters
-    Thread awaiter = (Thread) AWAITER.getAndSet ( this, null );
-    if ( awaiter != null ) LockSupport.unpark ( awaiter );
+    // Release every pending awaiter, not just one: §5.5 permits concurrent awaiters and
+    // requires each to suspend independently, so there is no single slot to clear.
+    releaseAwaiters ();
 
     // 2.8: stop scheduling further ticks; in-flight ticks already submitted
     // to the ingress queue may still be delivered (spec §11.5).

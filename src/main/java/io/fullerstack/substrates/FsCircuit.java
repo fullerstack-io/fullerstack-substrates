@@ -128,6 +128,14 @@ public final class FsCircuit implements Circuit {
   private final Consumer < Object > awaitMarkerReceiver;
   private final Consumer < Object > closeMarkerReceiver;
 
+  /// §5.8's processing-time reading for the ingress chain in progress.
+  ///
+  /// Invalidated once per ingress item by `IngressQueue.drainBatchLoop` and established lazily
+  /// by the first time-aware operator that observes it, so a whole transit cascade — however
+  /// long it takes in wall time — is one causal moment. Package-private: the ingress drain and
+  /// the worker bind are the only writers, and both run on this circuit's worker.
+  final FsOperators.Stimulus stimulus = new FsOperators.Stimulus ();
+
   // ─────────────────────────────────────────────────────────────────────────────
   // ReceptorAdapter — wraps a user Receptor in a Consumer<Object>.
   //
@@ -305,7 +313,7 @@ public final class FsCircuit implements Circuit {
    */
   @jdk.internal.vm.annotation.ForceInline
   final void submit ( Consumer < Object > receiver, Object value ) {
-    if ( Thread.currentThread () == worker ) {
+    if ( onWorker () ) {
       transit.enqueue ( receiver, value );
     } else {
       ingress.enqueue ( receiver, value );
@@ -347,11 +355,25 @@ public final class FsCircuit implements Circuit {
     marker.accept ( value );
   }
 
-  /**
-   * Returns the worker thread for thread identity checks.
-   */
-  final Thread worker () {
-    return worker;
+  /// §11.3's context comparison: is the caller running on this circuit's context?
+  ///
+  /// The specification states the idiom as "compare `Cortex.current()` against the circuit's
+  /// `current()`" (§11.3, §11.6), and names `Thread.currentThread()` as the Java projection
+  /// of a `Current`. This circuit's `Current` is interned against its worker, so the identity
+  /// below answers the same question with a reference compare instead of a per-call lookup.
+  ///
+  /// It exists so the worker `Thread` never leaves this class. It used to be handed out by a
+  /// `worker()` accessor whose own javadoc admitted it was "for thread identity checks" —
+  /// five call sites each rewrote the comparison, and every one of them held a reference
+  /// they could have parked or interrupted.
+  ///
+  /// Every site goes through here, `submit` included. `submit` is the hottest method in the
+  /// projection and carries `@ForceInline`; this is a final method on a final class reading
+  /// one field, so the JIT inlines it to the same compare. Correctness of the §5.3 routing
+  /// decision having exactly one definition is worth more than keeping a hand-copied branch,
+  /// and `PipeOps` is the measurement that says whether that was free.
+  final boolean onWorker () {
+    return Thread.currentThread () == worker;
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -359,11 +381,16 @@ public final class FsCircuit implements Circuit {
   // ─────────────────────────────────────────────────────────────────────────────
 
   private void workerLoop () {
+    // §5.8: bind this circuit's stimulus holder to its worker, once. The worker is a single
+    // virtual thread living as long as the circuit, so time-aware operators reach the holder
+    // with a ThreadLocal read and never a per-emission lookup of the circuit.
+    FsOperators.STIMULUS.set ( stimulus );
     drainLoop ();
     // §5.7: the binding lives exactly as long as the worker does. Released here
     // rather than in close(), because work admitted before the close marker is
     // still dispatched afterwards and must keep observing the circuit's Current.
     cortex.unbindCurrent ( Thread.currentThread ().threadId () );
+    FsOperators.STIMULUS.remove ();
   }
 
   private void drainLoop () {
@@ -453,7 +480,7 @@ public final class FsCircuit implements Circuit {
   /// context use when called from within the circuit's worker thread.
   /// Used by callers that need to fail-fast before any side effect runs.
   void checkExternalCaller ( String op ) {
-    if ( Thread.currentThread () == worker ) {
+    if ( onWorker () ) {
       throw new IllegalStateException (
         "Cannot call Circuit::" + op + " from within a circuit's thread" );
     }

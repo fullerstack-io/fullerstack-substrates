@@ -131,6 +131,12 @@ public final class IngressQueue {
       slots[base] = null;                                    // clear for GC (plain write)
       slots[base + 1] = null;                                // clear for GC (plain write)
 
+      // §5.8: time advances on each ingress item and NOT across the transit hops of one
+      // cascade, so this is the one invalidation point — before dispatch, and deliberately
+      // not inside `drainTransit()` below. A plain store; the reading itself is established
+      // lazily, and only if some time-aware operator actually observes it.
+      circuit.stimulus.valid = false;
+
       if ( circuit.isMarker ( r ) ) {
         circuit.fireMarker ( r, v );                       // cold: separate type profile
       } else {

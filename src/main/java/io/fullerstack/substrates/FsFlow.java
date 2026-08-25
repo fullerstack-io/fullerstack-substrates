@@ -178,8 +178,7 @@ public final class FsFlow < I, O > implements Flow < I, O > {
           System.arraycopy ( buffer, 1, buffer, 0, count - 1 );
           buffer[ count - 1 ] = v;
         }
-        lease.latch ();
-        downstream.accept ( new FsWindow <> ( buffer, 0, sizeRef[ 0 ], false, lease ) );
+        downstream.accept ( new FsWindow <> ( buffer, 0, sizeRef[ 0 ], false, lease, lease.latch () ) );
       };
     }
   }
@@ -218,7 +217,7 @@ public final class FsFlow < I, O > implements Flow < I, O > {
       // §6.4.1 temporal lease, per materialization — see FsWindow.Lease.
       final FsWindow.Lease lease = new FsWindow.Lease ();
       return v -> {
-        final long now = System.nanoTime ();
+        final long now = FsOperators.stimulus ();   // §5.8: one reading per ingress chain
         // Evict entries older than (now - durationNanos).
         int newStart = 0;
         final int len = sizeRef[ 0 ];
@@ -242,8 +241,7 @@ public final class FsFlow < I, O > implements Flow < I, O > {
           times [ capacity - 1 ] = now;
         }
         sizeRef[ 0 ] = newLen;
-        lease.latch ();
-        downstream.accept ( new FsWindow <> ( values, 0, newLen, false, lease ) );
+        downstream.accept ( new FsWindow <> ( values, 0, newLen, false, lease, lease.latch () ) );
       };
     }
   }

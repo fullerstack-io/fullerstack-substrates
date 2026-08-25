@@ -112,7 +112,7 @@ public final class FsPipe < E > implements Pipe < E > {
   public void emit ( @NotNull E emission ) {
     requireNonNull ( emission, "emission must not be null" );
     if ( circuit.closed ) return;
-    if ( Thread.currentThread () == circuit.worker () ) {
+    if ( circuit.onWorker () ) {
       circuit.submitTransit ( receiver, emission );
     } else {
       circuit.submitIngress ( receiver, emission );

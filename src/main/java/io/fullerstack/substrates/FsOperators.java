@@ -57,6 +57,47 @@ final class FsOperators {
     return new Fault ( Substrates.cortex ().subject (), operation, message );
   }
 
+  /// §5.8 stimulus time, held per circuit and confined to that circuit's worker.
+  ///
+  /// "A single ingress item (§5.3) and the entire transit cascade it triggers share one
+  /// processing-time reading. Time advances on each ingress item … but does **not** advance
+  /// across the internal transit hops of one cascade."
+  ///
+  /// Plain fields, not volatile: the holder is written by `IngressQueue.drainBatchLoop` and
+  /// read by operators, both of which run only on the owning circuit's worker thread.
+  static final class Stimulus {
+    long    value;
+    boolean valid;
+  }
+
+  /// The worker thread's stimulus holder, bound **once** when the worker starts.
+  ///
+  /// A circuit's worker is a single virtual thread that lives as long as the circuit
+  /// (`FsCircuit`), so this is set once per circuit and never per emission. Reading it here
+  /// rather than capturing the circuit at materialisation is also more correct: a chain
+  /// reports the stimulus of the circuit *currently running it*, which §16.1 #16 allows to
+  /// differ from the one it was materialised against.
+  static final ThreadLocal < Stimulus > STIMULUS = new ThreadLocal <> ();
+
+  /// §5.8's processing time for the ingress chain in progress.
+  ///
+  /// **Lazily established**, exactly as §5.8 permits: "An implementation is not required to
+  /// read the clock for ingress items that no time-aware operator observes." The clock is read
+  /// on the first time-aware observation of a chain and reused by every later one, so a transit
+  /// hop that sleeps is invisible — internal cause-effect within a cascade is co-temporal.
+  ///
+  /// Off the worker (a foreign carrier driven through `emit`, say) there is no chain to be
+  /// co-temporal with, so the clock is read directly.
+  static long stimulus () {
+    final Stimulus s = STIMULUS.get ();
+    if ( s == null ) return System.nanoTime ();
+    if ( !s.valid ) {
+      s.value = System.nanoTime ();
+      s.valid = true;
+    }
+    return s.value;
+  }
+
   /// Operator factory: takes the downstream consumer and returns a wrapping
   /// consumer. Single shared shape lets FsFiber and FsFlow store operators
   /// in a uniform `Wrap[]` and materialise via a single loop with no
@@ -422,7 +463,7 @@ final class FsOperators {
         return;
       }
       // Duplicate — consult the clock.
-      long now = System.nanoTime ();
+      long now = stimulus ();                       // §5.8: one reading per ingress chain
       if ( ! anchored ) {
         anchored    = true;
         anchorNanos = now;
@@ -454,7 +495,7 @@ final class FsOperators {
 
     @Override
     public void accept ( E v ) {
-      final long now = System.nanoTime ();
+      final long now = stimulus ();                 // §5.8: one reading per ingress chain
       if ( !anchored ) {
         // First value anchors the interval and is dropped.
         anchored = true;

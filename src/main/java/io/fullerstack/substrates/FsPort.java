@@ -98,7 +98,7 @@ public final class FsPort < E > implements Port < E > {
   private void submit ( Runnable action ) {
     if ( circuit.closed ) return;
     FsCircuit.CircuitJob job = new FsCircuit.CircuitJob ( action );
-    if ( Thread.currentThread () == circuit.worker () ) {
+    if ( circuit.onWorker () ) {
       circuit.submitTransit ( job, null );
     } else {
       circuit.submitIngress ( job, null );

@@ -2,6 +2,7 @@ package io.fullerstack.substrates;
 
 import static java.util.Objects.requireNonNull;
 
+import io.humainary.substrates.api.Substrates;
 import io.humainary.substrates.api.Substrates.Name;
 import io.humainary.substrates.api.Substrates.NotNull;
 import io.humainary.substrates.api.Substrates.Pin;
@@ -20,13 +21,13 @@ import io.humainary.substrates.api.Substrates.Subject;
 public final class FsPin < E > implements Pin < E > {
 
   private final Subject < Pin < E > > subject;
-  private final Thread                worker;
+  private final FsCircuit             circuit;
 
   private E value;
 
   public FsPin ( FsSubject < ? > parent, Name name, FsCircuit circuit, E initial ) {
     this.subject = (Subject < Pin < E > >) (Subject < ? >) new FsSubject <> ( name, parent, Pin.class );
-    this.worker  = circuit.worker ();
+    this.circuit = circuit;
     this.value   = initial;
   }
 
@@ -39,21 +40,38 @@ public final class FsPin < E > implements Pin < E > {
   @NotNull
   @Override
   public E get () {
-    guard ();
+    guard ( "get" );
     return value;
   }
 
   @Override
   public void set ( @NotNull E value ) {
     requireNonNull ( value );
-    guard ();
+    guard ( "set" );
     this.value = value;
   }
 
-  private void guard () {
-    if ( Thread.currentThread () != worker ) {
+  /// §11.6's owner-context guard.
+  ///
+  /// The spec states the idiom in terms of §11.3's `Current`: "compare `Cortex.current()`
+  /// against the pin's owning circuit's `current()`". The comparison below is that check in
+  /// its Java projection — §11.3 names `Thread.currentThread()` as the Java mechanism for a
+  /// `Current`, and this circuit's `Current` is interned against its worker — so it answers
+  /// the same question without a per-access lookup, which matters because §11.6 promises
+  /// `get`/`set` with "no queueing, no admission overhead".
+  ///
+  /// The `Current` is used where it earns its cost: on the **cold** fault path, so the error
+  /// names the offending context rather than describing it in prose (§15.3).
+  private void guard ( String operation ) {
+    if ( !circuit.onWorker () ) {
+      // IllegalStateException, NOT Fault. §11.6 calls this an "illegal-context-use error
+      // (§15.1)", but the Java binding for THIS operation is fixed by the API's own contract
+      // — `Pin.get`/`Pin.set` are declared `@throws IllegalStateException` — and
+      // `PinContractTest` asserts the type. Appendix A.2 makes the mechanism a binding
+      // detail; the category is what travels.
       throw new IllegalStateException (
-        "Pin access requires the owning circuit's worker thread" );
+        "pin access requires the owning circuit's context; called from "
+        + Substrates.cortex ().current ().subject () );
     }
   }
 }

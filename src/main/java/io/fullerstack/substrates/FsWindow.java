@@ -9,6 +9,12 @@ import java.util.function.BinaryOperator;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 
+import io.humainary.substrates.api.Substrates;
+import io.humainary.substrates.api.Substrates.Fault;
+
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
+
 import static java.util.Objects.requireNonNull;
 
 /// **FsWindow** — array-backed view over a stable emission set.
@@ -47,31 +53,77 @@ final class FsWindow < E > implements Window < E > {
   /// argument is the design here — "one branch per operator entry … entirely
   /// off the framework emission hot path".
   ///
-  /// The lease names the execution context that minted the current window. It
-  /// is re-latched on every emission rather than captured once, because the
-  /// operator array reaches `wrap` without a circuit reference and the stage
-  /// always runs on the context that will deliver the window; latching there
-  /// gets the owner without threading a circuit through materialisation.
+  /// The lease is a **(context, generation)** pair, opened afresh on every emission rather
+  /// than captured once, because the operator array reaches `wrap` without a circuit
+  /// reference and the stage always runs on the context that will deliver the window;
+  /// latching there gets the owner without threading a circuit through materialisation.
   ///
-  /// **Scope, stated rather than implied.** This detects every use that leaves
-  /// the owning execution context — another thread, another circuit, any read
-  /// after the circuit has moved on and the caller has come back for it, which
-  /// is the escape the TCK exercises. It does **not** detect a window retained
-  /// into a later callback *on the same worker*: naming that boundary needs a
-  /// per-ingress-chain counter on the circuit (what the Rust projection reads
-  /// off its `Turn`), and closing the lease around the operator instead would
-  /// fault every receptor the transit hop legitimately delivers to afterwards.
+  /// **Both halves are load-bearing, and the second one was missing.**
+  ///
+  /// The *context* catches a window that has left the worker — another thread, another
+  /// circuit, a caller that came back for it after the circuit moved on. That is the escape
+  /// the TCK exercises.
+  ///
+  /// The *generation* catches a window retained into a later callback **on the same worker**,
+  /// which a bare thread check cannot see because the worker is still the worker. This is not
+  /// a stale read: `Flow.window` rewrites one buffer in place on every emission, so the
+  /// retained view reports whatever is in that buffer *now* while presenting itself as the
+  /// window from an earlier callback. §6.4.1 withdraws the performance escape clause for this
+  /// type by name — "Implementations MUST detect and signal `Window` temporal contract
+  /// violations; undefined behavior is not an acceptable choice for this type" — and a silent
+  /// wrong answer is the worst reading of that.
+  ///
+  /// Closing the lease around the operator call instead — latch, `accept`, release — does not
+  /// work: a transit hop queues the window and the receptor runs after `accept` has returned,
+  /// so release would fault every delivery the hop legitimately makes.
   static final class Lease {
 
-    private Thread owner;
+    private static final VarHandle GENERATION;
 
-    /// Binds the lease to the context minting the current window.
-    void latch () {
-      owner = Thread.currentThread ();
+    static {
+      try {
+        GENERATION = MethodHandles.lookup ()
+          .findVarHandle ( Lease.class, "generation", long.class );
+      } catch ( ReflectiveOperationException error ) {
+        throw new ExceptionInInitializerError ( error );
+      }
     }
 
-    boolean valid () {
-      return Thread.currentThread () == owner;
+    /// The context that minted the current window.
+    private Thread owner;
+
+    /// Which mint the current window belongs to. Monotonic, and the half of the identity
+    /// that distinguishes one callback from the next on the SAME worker — the case a bare
+    /// thread check cannot see, because the worker is still the worker.
+    private long generation;
+
+    /// Opens a new generation and binds it to the minting context.
+    ///
+    /// Returns the generation the caller must stamp on the window it is about to emit.
+    /// `owner` is written first and published by the RELEASE store below, so a reader that
+    /// sees this generation also sees this owner. Release rather than volatile because this
+    /// runs on the emission path once per window, and on x86 a release store is a plain
+    /// store while a volatile store is a locked instruction.
+    long latch () {
+      final long next = generation + 1;
+      owner = Thread.currentThread ();
+      GENERATION.setRelease ( this, next );
+      return next;
+    }
+
+    /// §6.4.1: is `stamp`'s window still the one this lease describes?
+    ///
+    /// Two questions, and both are needed. The generation catches a window retained into a
+    /// LATER callback — the buffer has been rewritten under it, so the values it would return
+    /// are not the ones it was handed. The owner catches a window that has left the context
+    /// entirely, which the generation alone cannot see while the circuit is idle and the
+    /// generation has not moved.
+    ///
+    /// The acquire load orders the `owner` read after it, which is what makes the pair sound
+    /// from a thread that never latched.
+    boolean valid ( long stamp ) {
+      return (long) GENERATION.getAcquire ( this ) == stamp
+             && owner == Thread.currentThread ();
     }
 
   }
@@ -82,32 +134,34 @@ final class FsWindow < E > implements Window < E > {
   private final boolean  reversed;
   private final Lease    lease;
 
-  FsWindow ( Object[] buffer, int start, int length, boolean reversed, Lease lease ) {
-    this.buffer   = buffer;
-    this.start    = start;
-    this.length   = length;
-    this.reversed = reversed;
-    this.lease    = lease;
+  /// The generation this window was minted in. A derived view inherits its root's, so a
+  /// whole family of views expires together with the callback that produced the root.
+  private final long     generation;
+
+  FsWindow ( Object[] buffer, int start, int length, boolean reversed, Lease lease, long generation ) {
+    this.buffer     = buffer;
+    this.start      = start;
+    this.length     = length;
+    this.reversed   = reversed;
+    this.lease      = lease;
+    this.generation = generation;
   }
 
-  /// Convenience form that mints a lease bound to the calling context. Used
-  /// where a window is built outside an operator materialisation.
-  FsWindow ( Object[] buffer, int start, int length, boolean reversed ) {
-    this ( buffer, start, length, reversed, own () );
-  }
-
-  private static Lease own () {
-    final Lease lease = new Lease ();
-    lease.latch ();
-    return lease;
+  /// A restriction of this window: same buffer, same lease, same generation. Sharing the
+  /// stamp is the point — a view must not outlive the callback its root belongs to.
+  private FsWindow < E > view ( int start, int length, boolean reversed ) {
+    return new FsWindow <> ( buffer, start, length, reversed, lease, generation );
   }
 
   /// §6.4.1: every operator entry — on the root window and on every derived
   /// view alike — signals when the lease no longer holds.
   private void requireLease ( String operation ) {
-    if ( !lease.valid () ) {
-      throw FsOperators.fault ( operation,
-        "window used outside the circuit context that produced it" );
+    if ( !lease.valid ( generation ) ) {
+      // §15.3: name the context that made the illegal call rather than describing it. The
+      // `Current` lookup is affordable here and nowhere else — this path has already failed.
+      throw new Fault ( Substrates.cortex ().current ().subject (), operation,
+        "window used outside the callback that produced it; §6.4 makes a window "
+        + "callback-scoped and callers needing values beyond it MUST copy them" );
     }
   }
 
@@ -230,9 +284,9 @@ final class FsWindow < E > implements Window < E > {
     if ( reversed ) {
       // Reversed encounter visits buffer[start+length-1 .. start]; the first
       // `count` of that is buffer[start+length-count .. start+length-1].
-      return new FsWindow <> ( buffer, start + length - count, count, true, lease );
+      return view ( start + length - count, count, true );
     }
-    return new FsWindow <> ( buffer, start, count, false, lease );
+    return view ( start, count, false );
   }
 
   @NotNull
@@ -244,9 +298,9 @@ final class FsWindow < E > implements Window < E > {
     // Last `count` elements of encounter order.
     if ( reversed ) {
       // Last `count` of reversed = buffer[start .. start+count-1].
-      return new FsWindow <> ( buffer, start, count, true, lease );
+      return view ( start, count, true );
     }
-    return new FsWindow <> ( buffer, start + length - count, count, false, lease );
+    return view ( start + length - count, count, false );
   }
 
   @NotNull
@@ -255,13 +309,13 @@ final class FsWindow < E > implements Window < E > {
     requireLease ( "skip" );
     if ( count < 0 ) throw new IllegalArgumentException ( "count must be >= 0" );
     if ( count == 0 ) return this;
-    if ( count >= length ) return new FsWindow <> ( buffer, start, 0, reversed, lease );
+    if ( count >= length ) return view ( start, 0, reversed );
     // Drop first `count` of encounter order.
     if ( reversed ) {
       // Reversed: dropping first `count` = dropping last `count` of buffer.
-      return new FsWindow <> ( buffer, start, length - count, true, lease );
+      return view ( start, length - count, true );
     }
-    return new FsWindow <> ( buffer, start + count, length - count, false, lease );
+    return view ( start + count, length - count, false );
   }
 
   @NotNull
@@ -270,13 +324,13 @@ final class FsWindow < E > implements Window < E > {
     requireLease ( "trim" );
     if ( count < 0 ) throw new IllegalArgumentException ( "count must be >= 0" );
     if ( count == 0 ) return this;
-    if ( count >= length ) return new FsWindow <> ( buffer, start, 0, reversed, lease );
+    if ( count >= length ) return view ( start, 0, reversed );
     // Drop last `count` of encounter order.
     if ( reversed ) {
       // Reversed: dropping last `count` = dropping first `count` of buffer.
-      return new FsWindow <> ( buffer, start + count, length - count, true, lease );
+      return view ( start + count, length - count, true );
     }
-    return new FsWindow <> ( buffer, start, length - count, false, lease );
+    return view ( start, length - count, false );
   }
 
   @NotNull
@@ -285,7 +339,7 @@ final class FsWindow < E > implements Window < E > {
     requireLease ( "slice" );
     if ( offset < 0 ) throw new IllegalArgumentException ( "offset must be >= 0" );
     if ( count  < 0 ) throw new IllegalArgumentException ( "count must be >= 0" );
-    if ( offset >= length ) return new FsWindow <> ( buffer, start, 0, reversed, lease );
+    if ( offset >= length ) return view ( start, 0, reversed );
     final int effective = Math.min ( count, length - offset );
     if ( offset == 0 && effective == length ) return this;
     // Take `effective` values starting at encounter-order index `offset`.
@@ -294,15 +348,15 @@ final class FsWindow < E > implements Window < E > {
       // The slice's last element (logical offset + effective - 1) is
       // buffer[start + length - 1 - (offset + effective - 1)] = buffer[start + length - offset - effective].
       // So physical range = [start + length - offset - effective .. start + length - offset - 1]
-      return new FsWindow <> ( buffer, start + length - offset - effective, effective, true, lease );
+      return view ( start + length - offset - effective, effective, true );
     }
-    return new FsWindow <> ( buffer, start + offset, effective, false, lease );
+    return view ( start + offset, effective, false );
   }
 
   @NotNull
   @Override
   public Window < E > reverse () {
     requireLease ( "reverse" );
-    return new FsWindow <> ( buffer, start, length, !reversed, lease );
+    return view ( start, length, !reversed );
   }
 }

@@ -312,7 +312,7 @@ public final class FsCircuit implements Circuit {
    */
   @jdk.internal.vm.annotation.ForceInline
   final void submit ( Consumer < Object > receiver, Object value ) {
-    if ( onWorker () ) {
+    if ( cortex.current () == current () ) {
       transit.enqueue ( receiver, value );
     } else {
       ingress.enqueue ( receiver, value );
@@ -354,42 +354,6 @@ public final class FsCircuit implements Circuit {
     marker.accept ( value );
   }
 
-  /// §11.3's context comparison: is the caller running on this circuit's context?
-  ///
-  /// The specification states the idiom as "compare `Cortex.current()` against the circuit's
-  /// `current()`" (§11.3, §11.6), and names `Thread.currentThread()` as the Java projection
-  /// of a `Current`. This circuit's `Current` is interned against its worker, so the identity
-  /// below answers the same question with a reference compare instead of a per-call lookup.
-  ///
-  /// It exists so the worker `Thread` never leaves this class. It used to be handed out by a
-  /// `worker()` accessor whose own javadoc admitted it was "for thread identity checks" —
-  /// five call sites each rewrote the comparison, and every one of them held a reference
-  /// they could have parked or interrupted.
-  ///
-  /// **Why this is the thread and not `cortex.current() == current()`.** That literal form is
-  /// what §11.3 writes, and it was tried here. The two are the same predicate: §5.7 requires
-  /// this circuit's `Current` to BE its worker's, so they agree by construction. Measured, the
-  /// literal form adds a `ThreadLocal` read to every emission — `CortexOps.current` is
-  /// 2.775 +/- 0.513 ns/op against a `PipeOps.async_emit_batch` of roughly 24 ns/op, so about
-  /// a tenth of the emission path for no semantic difference. (The direct A/B on `PipeOps` was
-  /// 26.2 +/- 7.2 against 23.5 +/- 5.4 — overlapping, so the arithmetic above is the honest
-  /// evidence and that pair is not.) §11.3 settles it: the mechanism "is not specified; only
-  /// the identity and temporal guarantees are REQUIRED", and it names `Thread.currentThread()`
-  /// as the Java one.
-  ///
-  /// The thread form is also the more robust of the two: it answers correctly even before the
-  /// worker has bound its `Current`, a window the literal form would report as "not on the
-  /// circuit". Nothing reaches it today — the bind is `workerLoop`'s first statement — but the
-  /// asymmetry is worth knowing.
-  ///
-  /// Every site goes through here, `submit` included. `submit` is the hottest method in the
-  /// projection and carries `@ForceInline`; this is a final method on a final class reading
-  /// one field, so the JIT inlines it to the same compare. Correctness of the §5.3 routing
-  /// decision having exactly one definition is worth more than keeping a hand-copied branch,
-  /// and `PipeOps` is the measurement that says whether that was free.
-  final boolean onWorker () {
-    return Thread.currentThread () == worker;
-  }
 
   // ─────────────────────────────────────────────────────────────────────────────
   // Worker Loop - FIFO depth-first processing with spin-before-park
@@ -500,7 +464,7 @@ public final class FsCircuit implements Circuit {
   /// context use when called from within the circuit's worker thread.
   /// Used by callers that need to fail-fast before any side effect runs.
   void checkExternalCaller ( String op ) {
-    if ( onWorker () ) {
+    if ( cortex.current () == current () ) {
       throw new IllegalStateException (
         "Cannot call Circuit::" + op + " from within a circuit's thread" );
     }

@@ -1,5 +1,6 @@
 package io.fullerstack.substrates;
 
+import static io.humainary.substrates.api.Substrates.cortex;
 import static java.util.Objects.requireNonNull;
 
 import io.humainary.substrates.api.Substrates;
@@ -63,7 +64,7 @@ public final class FsPin < E > implements Pin < E > {
   /// The `Current` is used where it earns its cost: on the **cold** fault path, so the error
   /// names the offending context rather than describing it in prose (§15.3).
   private void guard ( String operation ) {
-    if ( !circuit.onWorker () ) {
+    if ( cortex ().current () != circuit.current () ) {
       // IllegalStateException, NOT Fault. §11.6 calls this an "illegal-context-use error
       // (§15.1)", but the Java binding for THIS operation is fixed by the API's own contract
       // — `Pin.get`/`Pin.set` are declared `@throws IllegalStateException` — and

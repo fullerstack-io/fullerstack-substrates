@@ -1,5 +1,6 @@
 package io.fullerstack.substrates;
 
+import static io.humainary.substrates.api.Substrates.cortex;
 import static java.util.Objects.requireNonNull;
 
 import io.humainary.substrates.api.Substrates.Fault;
@@ -98,7 +99,7 @@ public final class FsPort < E > implements Port < E > {
   private void submit ( Runnable action ) {
     if ( circuit.closed ) return;
     FsCircuit.CircuitJob job = new FsCircuit.CircuitJob ( action );
-    if ( circuit.onWorker () ) {
+    if ( cortex ().current () == circuit.current () ) {
       circuit.submitTransit ( job, null );
     } else {
       circuit.submitIngress ( job, null );

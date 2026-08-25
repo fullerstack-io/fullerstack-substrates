@@ -8,6 +8,7 @@ import io.humainary.substrates.api.Substrates.Subject;
 
 import java.util.function.Consumer;
 
+import static io.humainary.substrates.api.Substrates.cortex;
 import static java.util.Objects.requireNonNull;
 
 /// Pipe — the emission carrier.
@@ -112,7 +113,7 @@ public final class FsPipe < E > implements Pipe < E > {
   public void emit ( @NotNull E emission ) {
     requireNonNull ( emission, "emission must not be null" );
     if ( circuit.closed ) return;
-    if ( circuit.onWorker () ) {
+    if ( cortex ().current () == circuit.current () ) {
       circuit.submitTransit ( receiver, emission );
     } else {
       circuit.submitIngress ( receiver, emission );

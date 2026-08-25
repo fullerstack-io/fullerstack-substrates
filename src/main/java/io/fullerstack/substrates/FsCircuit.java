@@ -273,7 +273,6 @@ public final class FsCircuit implements Circuit {
       .name ( "circuit-" + subject.name () )
       .unstarted ( this::workerLoop );
     this.worker = w;
-    cortex.bindCurrent ( w.threadId (), (FsCurrent) current () );
     w.start ();
   }
 
@@ -381,6 +380,11 @@ public final class FsCircuit implements Circuit {
   // ─────────────────────────────────────────────────────────────────────────────
 
   private void workerLoop () {
+    // §11.3/§5.7: this circuit's Current IS its worker's Current, so that
+    // `cortex.current() == circuit.current()` is the guard the spec documents. Minting a
+    // separate per-thread Current here would make that comparison always report "not on the
+    // circuit" — the exact failure the guard exists to prevent.
+    cortex.bindCurrent ( (FsCurrent) current () );
     // §5.8: bind this circuit's stimulus holder to its worker, once. The worker is a single
     // virtual thread living as long as the circuit, so time-aware operators reach the holder
     // with a ThreadLocal read and never a per-emission lookup of the circuit.
@@ -389,7 +393,7 @@ public final class FsCircuit implements Circuit {
     // §5.7: the binding lives exactly as long as the worker does. Released here
     // rather than in close(), because work admitted before the close marker is
     // still dispatched afterwards and must keep observing the circuit's Current.
-    cortex.unbindCurrent ( Thread.currentThread ().threadId () );
+    cortex.unbindCurrent ();
     FsOperators.STIMULUS.remove ();
   }
 

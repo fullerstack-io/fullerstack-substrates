@@ -34,9 +34,20 @@ final class FsCortex implements Cortex {
 
   private final Subject < Cortex > subject;
 
-  /// Per-thread Current cache using Thread.threadId() as key.
-  /// Faster than ThreadLocal (~5-8ns vs ~10-15ns).
-  private final ConcurrentHashMap < Long, FsCurrent > currentCache = new ConcurrentHashMap <> ();
+  /// §11.3's per-context Current — "each execution context has exactly one current, interned
+  /// for that context's lifetime".
+  ///
+  /// A `ThreadLocal`, and the word that matters is **lifetime**. This was a
+  /// `ConcurrentHashMap<Long, FsCurrent>` keyed by `Thread.threadId()`, justified by a comment
+  /// claiming it beat a ThreadLocal by a few nanoseconds. It also never evicted: a thread id is
+  /// not a liveness signal, so every thread that ever asked for a Current left an `FsCurrent`
+  /// AND an interned `thread.<name>` node behind it, permanently. The code below deliberately
+  /// names virtual threads `vt-<id>`, which is precisely the workload where thread ids are
+  /// unbounded — one leaked entry per request, for the life of the process.
+  ///
+  /// A ThreadLocal's entry dies with its thread, which is the interning lifetime §11.3 asks
+  /// for rather than an approximation of it.
+  private final ThreadLocal < FsCurrent > current = new ThreadLocal <> ();
 
   FsCortex () {
     this.subject = new FsSubject <> ( FsName.intern ( "cortex" ), Cortex.class );
@@ -53,31 +64,33 @@ final class FsCortex implements Cortex {
   /// *same* Current on the worker — minting a separate per-thread Current there
   /// makes the documented guard always report "not on the circuit", which is the
   /// exact failure the guard exists to prevent.
-  void bindCurrent ( long threadId, FsCurrent current ) {
-    currentCache.put ( threadId, current );
+  /// Called by a circuit's worker on entry to its own loop. A ThreadLocal can only be set by
+  /// the thread it belongs to, which is why this is no longer done by the constructing thread
+  /// — and nothing can observe an unbound worker, because the worker's only body is that loop.
+  void bindCurrent ( FsCurrent current ) {
+    this.current.set ( current );
   }
 
   /// Releases the worker-thread binding once the worker has exited.
-  void unbindCurrent ( long threadId ) {
-    currentCache.remove ( threadId );
+  void unbindCurrent () {
+    current.remove ();
   }
 
   /// Gets or creates the Current for the current thread.
   private FsCurrent getOrCreateCurrent () {
-    long tid = Thread.currentThread ().threadId ();
-    FsCurrent cached = currentCache.get ( tid );
+    final FsCurrent cached = current.get ();
     if ( cached != null ) return cached;
-    return currentCache.computeIfAbsent ( tid, k -> {
-      Thread t = Thread.currentThread ();
-      String threadName = t.getName ();
-      // Handle empty thread names (common with virtual threads)
-      if ( threadName == null || threadName.isEmpty () ) {
-        threadName = "vt-" + t.threadId ();
-      }
-      FsSubject < Current > currentSubject = new FsSubject <> ( FsName.intern ( "thread." + threadName ),
-        (FsSubject < ? >) subject, Current.class );
-      return new FsCurrent ( currentSubject );
-    } );
+    final Thread t = Thread.currentThread ();
+    String threadName = t.getName ();
+    // Handle empty thread names (common with virtual threads)
+    if ( threadName == null || threadName.isEmpty () ) {
+      threadName = "vt-" + t.threadId ();
+    }
+    final FsSubject < Current > currentSubject = new FsSubject <> ( FsName.intern ( "thread." + threadName ),
+      (FsSubject < ? >) subject, Current.class );
+    final FsCurrent minted = new FsCurrent ( currentSubject );
+    current.set ( minted );
+    return minted;
   }
 
   @Override

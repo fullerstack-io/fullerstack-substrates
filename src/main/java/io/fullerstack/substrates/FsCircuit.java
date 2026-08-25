@@ -366,6 +366,22 @@ public final class FsCircuit implements Circuit {
   /// five call sites each rewrote the comparison, and every one of them held a reference
   /// they could have parked or interrupted.
   ///
+  /// **Why this is the thread and not `cortex.current() == current()`.** That literal form is
+  /// what §11.3 writes, and it was tried here. The two are the same predicate: §5.7 requires
+  /// this circuit's `Current` to BE its worker's, so they agree by construction. Measured, the
+  /// literal form adds a `ThreadLocal` read to every emission — `CortexOps.current` is
+  /// 2.775 +/- 0.513 ns/op against a `PipeOps.async_emit_batch` of roughly 24 ns/op, so about
+  /// a tenth of the emission path for no semantic difference. (The direct A/B on `PipeOps` was
+  /// 26.2 +/- 7.2 against 23.5 +/- 5.4 — overlapping, so the arithmetic above is the honest
+  /// evidence and that pair is not.) §11.3 settles it: the mechanism "is not specified; only
+  /// the identity and temporal guarantees are REQUIRED", and it names `Thread.currentThread()`
+  /// as the Java one.
+  ///
+  /// The thread form is also the more robust of the two: it answers correctly even before the
+  /// worker has bound its `Current`, a window the literal form would report as "not on the
+  /// circuit". Nothing reaches it today — the bind is `workerLoop`'s first statement — but the
+  /// asymmetry is worth knowing.
+  ///
   /// Every site goes through here, `submit` included. `submit` is the hottest method in the
   /// projection and carries `@ForceInline`; this is a final method on a final class reading
   /// one field, so the JIT inlines it to the same compare. Correctness of the §5.3 routing

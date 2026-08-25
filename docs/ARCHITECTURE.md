@@ -62,7 +62,8 @@ FsCortexProvider (SPI entry point)
               │             a lazy single-thread daemon ScheduledExecutorService shared
               │             across all tickers on the circuit, shut down on circuit close)
               ├── FsWindow (2.6 — strided view over a rolling buffer; restriction ops share buffer)
-              └── FsReservoir (bounded buffered emission capture — 2.9 ArrayDeque with eviction)
+              └── FsBasin (3.0 — bounded buffered emission capture; replaced FsReservoir,
+                            which 3.0 removed along with Tap/Source.tap)
 
 FsName (hierarchical dot-notation names with interning)
 FsSubject (identity: Id + Name + State + Type)
@@ -429,7 +430,13 @@ public void await() {
 }
 
 void checkExternalCaller(String op) {
-  if (Thread.currentThread() == worker)
+  // §11.3's own idiom. The spec names comparing `Cortex.current()` against the
+  // circuit's `current()` as the specified way to detect circuit-context re-entrancy,
+  // and §5.7 makes this circuit's Current *be* its worker's, so the two agree by
+  // construction. Every context decision in the provider is written this way —
+  // FsPipe's §5.3 routing, FsPort, FsSink's §11.1 attribution, FsPin's §11.6 guard —
+  // and the worker Thread is never consulted for identity.
+  if (cortex.current() == current())
     throw new IllegalStateException("Cannot call Circuit::" + op + " from within a circuit's thread");
 }
 
@@ -467,6 +474,84 @@ FIFO ordering guarantees all prior emissions complete before the marker executes
 | Concurrency | Locks needed | Lock-free (single-threaded) |
 
 ---
+
+## Context, Time and Temporal Validity
+
+Three mechanisms answer questions an operator or a caller cannot answer locally. They are grouped
+here because they share one root cause: **an operator reaches `FsOperators.Wrap.wrap(Consumer)`
+with no reference to the circuit driving it.** The chain it builds is nested `Consumer.accept(E)`
+calls, and `accept` takes one parameter — the value.
+
+### Which context am I? (§11.3)
+
+`cortex.current() == circuit.current()`, written at every site that makes a context decision:
+`FsPipe`'s §5.3 ingress-versus-transit routing, `FsPort`, `FsSink`'s §11.1 capture attribution,
+`FsPin`'s §11.6 owner guard, and `FsCircuit`'s `submit` and `checkExternalCaller`.
+
+§11.3 names that comparison as the specified idiom, and §5.7 requires this circuit's `Current` to
+**be** its worker's Current — otherwise the guard would always answer "not on the circuit", which
+is the failure it exists to catch. The worker binds it on entry to `workerLoop`.
+
+A raw `Thread.currentThread() == worker` answers the same question — §11.3 names
+`Thread.currentThread()` as Current's Java projection — and the provider used to do exactly that
+behind an `onWorker()` helper. It was replaced because the idiom costs nothing measurable
+(`async_emit_admission_batch` did not regress) and because it removes a package-private accessor
+that handed the worker `Thread` to five call sites, each of which could have parked or interrupted
+it.
+
+`Current` is a `ThreadLocal`. It was a `ConcurrentHashMap` keyed by `Thread.threadId()`, which
+never evicted — a thread id is not a liveness signal, so every thread that ever asked for a Current
+leaked one plus an interned `thread.<name>` node. Virtual threads made that unbounded. §11.3 asks
+for interning "for that context's lifetime"; a ThreadLocal entry dies with its thread, which is
+that lifetime rather than an approximation of it.
+
+### What time is it? (§5.8)
+
+§5.8: *"A single ingress item and the entire transit cascade it triggers share one processing-time
+reading … it does **not** advance across the internal transit hops of one cascade."* A whole
+cascade is one causal moment, so a transit hop that blocks for 25 ms must be invisible to a 5 ms
+`window(Duration, capacity)`.
+
+`FsCircuit.stimulus` is a two-field holder — value and validity — invalidated by a plain boolean
+store once per ingress item in `IngressQueue.drainBatchLoop`, **before dispatch and deliberately
+not inside `drainTransit()`**. The reading is established by the first time-aware operator that
+asks, which is §5.8's own *"lazily established"* licence: an implementation need not read the clock
+for ingress items no time-aware operator observes.
+
+The three readers — `WindowTime`, `SteadyTime`, `EveryTime` — reach the holder through a
+`ThreadLocal` the worker binds once at thread start. **That is the weak part of this design**: where
+no binding exists the accessor falls back to a per-call clock read rather than failing, so the
+non-conformance cannot announce itself. See [Conformance](CONFORMANCE.md).
+
+### Is this window still mine? (§6.4.1)
+
+`Flow.window` allocates **one** buffer per materialisation and rewrites it in place on every
+emission; the `Window` handed downstream is a strided view over that live storage, not a snapshot.
+That is what the spec sanctions — §6.2.3 puts the obligation on the caller (*"MUST NOT be retained
+… callers that need values beyond the callback MUST copy them"*) and §6.4.1 then requires the
+implementation to **detect** violations: *"undefined behavior is not an acceptable choice for this
+type."*
+
+`FsWindow.Lease` is that detector, and it is a **(context, generation)** pair. Both halves are
+load-bearing:
+
+- the **context** catches a window that left the worker — removing it fails
+  `window_afterCallbackReturn_throwsFault` and `window_allOperationsAfterCallbackReturn_throwFault`,
+  measured;
+- the **generation** catches a window retained into a later callback **on the same worker**, which
+  a bare context check cannot see because the worker is still the worker.
+
+That second case is not a stale read. The buffer has been rewritten, so the retained view reports
+whatever is in it *now* while presenting itself as the window from an earlier callback — a silent
+wrong answer, which is the worst reading of §6.4.1.
+
+The generation is published with a release store and read with an acquire load rather than being
+`volatile`: `latch()` runs on the emission path, and on x86 a release store is a plain store while
+a volatile store is a locked instruction.
+
+Closing the lease around the operator call instead — latch, `accept`, release — does not work: a
+transit hop queues the window and the receptor runs after `accept` has returned, so release would
+fault every delivery the hop legitimately makes.
 
 ## Name Interning
 
@@ -574,17 +659,33 @@ This avoids locking during subscription changes — the spec's "eventual consist
 
 `Circuit.pulse()` (Substrates 2.4) returns an `Optional<Pulse>` snapshot of a no-op probe's round-trip through the ingress queue, exposing four timestamps (start / enqueued / dequeued / stop) for supervisory observers. See `FsCircuit.pulse()` and the `PulseProbe` inner class — the spec-level diagnostic surface. We previously carried a `CircuitStats` record with internal queue/drain counters; that has been removed since `Pulse` provides representative timing without polluting the per-emission hot path with counter writes.
 
-The `FsCircuitMarkerInvariantTest` structural tests assert that `AwaitMarker`, `CloseMarker`, `CircuitJob`, and `ReceptorAdapter` remain distinct concrete classes — collapsing any of these into a shared base reintroduces a bimorphic call-site profile on `r.accept(v)` in the drain loop and regresses `PipeOps.async_emit_batch_await` from ~22 ns to ~30+ ns.
+The marker classes `AwaitMarker`, `CloseMarker`, `CircuitJob`, and `ReceptorAdapter` must remain distinct concrete classes — collapsing any of these into a shared base reintroduces a bimorphic call-site profile on `r.accept(v)` in the drain loop. This used to be guarded by `FsCircuitMarkerInvariantTest`, which was deleted with the in-house suite; **no TCK covers it**, so the invariant is now documentation only. See [Conformance](CONFORMANCE.md) for the rest of what that trade gave up.
 
 ## Performance
 
-See [Benchmark Comparison](BENCHMARK-COMPARISON.md) for full JMH results across 14 groups. Those cross-platform numbers were collected with mismatched hardware and warmup parameters and are due for re-measurement on a quiet host.
+Measurement is [perfkit-java](https://github.com/humainary-io/perfkit-java), run against this
+provider by Maven coordinate — 207 benchmark methods across 32 classes, covering Substrates and
+Serventis. This project keeps no benchmarks and publishes no standing figures: numbers move with
+the host, and the suite that used to live here contained rows that measured nothing at all.
 
-Most-recent figure (JDK 26, GitHub Codespaces 2 vCPU, 10-iteration warmup):
+```bash
+./scripts/benchmark.sh decision core      # 3 forks, 8 warmup + 10 measurement iterations
+./scripts/benchmark.sh allocation core    # bytes per op, and the allocation sites
+```
 
-| Operation | ns/op | What it measures |
-|---|---:|---|
-| `cyclic_emit_deep_await_batch` | ~12.9 | Per-cycle cost of a deep cascade through cyclic pipe networks |
+Read a result against perfkit's own criteria (its `BENCHMARKS.md`): a run is **invalid** below 3
+fork series, with missing metrics, or above ~10% confidence error. Publish scores with error bars.
+The paired `_control_` rows are diagnostic and are **never subtracted** from a target score.
+
+Two properties worth knowing before optimising anything here:
+
+- **The emission path allocates nothing.** Measured at ~0 B/op — the recorded 0.003–0.016 B/op is
+  noise, since one Java object would be ≥16 B. Whatever emission costs, it is not garbage, so GC
+  tuning is wasted effort.
+- **Circuit lifecycle is deliberately unmeasured**, upstream included. perfkit excludes it because
+  creation is dominated by virtual-thread startup and scheduler effects the harness cannot
+  stabilise, and lifecycle costs sit orders of magnitude above steady-state. That is why circuits
+  are designed to be long-lived.
 
 ## References
 

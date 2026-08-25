@@ -1,88 +1,43 @@
 #!/bin/bash
 #
-# Benchmark runner for Fullerstack Substrates
+# Benchmark runner for Fullerstack Substrates.
 #
-# Builds the shaded JMH jar and runs benchmarks directly.
+# This project has no benchmarks of its own. Measurement is Humainary's
+# perfkit-java, run against this provider by Maven coordinate — 207 benchmark
+# methods across 32 classes, covering both Substrates and Serventis.
 #
-# Usage:
-#   ./scripts/benchmark.sh                    # Run ALL benchmarks
-#   ./scripts/benchmark.sh PipeOps            # Run specific benchmark group
-#   ./scripts/benchmark.sh "Pipe|Circuit"     # Regex pattern for multiple groups
-#   ./scripts/benchmark.sh -l                 # List available benchmarks
+#   ./scripts/benchmark.sh                     # quick smoke run, core suite
+#   ./scripts/benchmark.sh decision core       # actionable: 3 forks, 8+10 iterations
+#   ./scripts/benchmark.sh decision all        # the full inventory (~3 h)
+#   ./scripts/benchmark.sh allocation core     # bytes per op, and the sites
+#   ./scripts/benchmark.sh run 'PipeOps.async_emit_batch'
+#   ./scripts/benchmark.sh list
 #
-# Available Benchmark Groups (14):
-#   CircuitOps, ConduitOps, CortexOps, CyclicOps, FlowOps, IdOps,
-#   NameOps, PipeOps, ReservoirOps, ScopeOps, StateOps, SubjectOps,
-#   SubscriberOps, TapOps
+# Read a result against perfkit's own criteria (BENCHMARKS.md): a run is invalid
+# with fewer than 3 fork series, missing metrics, or 99.9% confidence error above
+# ~10% of the score. Always quote the error bars. The paired `_control_` rows are
+# diagnostic — they must stay stable, and are NEVER subtracted from a target.
 #
+set -uo pipefail
 
-set -e
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+FS="$ROOT/fullerstack-substrates"
+PK="$ROOT/perfkit-java"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-SUBSTRATES_DIR="${PROJECT_ROOT}"
+[ -d "$PK" ] || { echo "!! perfkit-java not cloned — see the README bootstrap"; exit 1; }
 
-# Setup Java 26
-echo "=== Setting up Java 26 ==="
-if [[ -f /usr/local/sdkman/bin/sdkman-init.sh ]]; then
-    source /usr/local/sdkman/bin/sdkman-init.sh
-    sdk use java 26.ea.35-open
-elif [[ -f ~/.sdkman/bin/sdkman-init.sh ]]; then
-    source ~/.sdkman/bin/sdkman-init.sh
-    sdk use java 26.ea.35-open
-else
-    echo "ERROR: SDKMAN not found. Please install Java 26."
-    exit 1
+export SPI_GROUP=io.fullerstack
+export SPI_ARTIFACT=fullerstack-substrates
+export SPI_VERSION="$(sed -n 's|^  <version>\(.*\)</version>|\1|p' "$FS/pom.xml" | head -1)"
+
+echo "==> installing $SPI_GROUP:$SPI_ARTIFACT:$SPI_VERSION"
+( cd "$FS" && mvn -q clean install -DskipTests ) || exit 1
+
+# perfkit refuses a jar older than the provider it was built against, so rebuild.
+echo "==> building perfkit against the provider"
+( cd "$PK" && ./jmh.sh build ) || exit 1
+
+if (( $# == 0 )); then
+  exec "$PK/jmh.sh" run core
 fi
-
-# Build shaded benchmark jar
-echo ""
-echo "=== Building benchmark jar ==="
-# `package`, not `install`: under -Pbench the main jar also carries the benchmark classes,
-# and installing that into ~/.m2 would hand downstream products a 6.6 MB jar with a JMH
-# harness in it. The profile also hard-disables install/deploy, so this is belt and braces.
-mvn -f "${SUBSTRATES_DIR}/pom.xml" clean package -DskipTests -Deditorconfig.skip=true -Pbench -q
-
-BENCHMARK_JAR="${SUBSTRATES_DIR}/target/benchmarks.jar"
-if [[ ! -f "${BENCHMARK_JAR}" ]]; then
-    echo "ERROR: Benchmark jar not found at ${BENCHMARK_JAR}"
-    exit 1
-fi
-
-# Default JMH options
-JMH_OPTS="-f 1 -wi 3 -i 5 -w 2s -r 2s -tu ns -bm avgt"
-
-# Handle arguments
-if [[ "$1" == "-l" ]]; then
-    echo ""
-    echo "=== Available Benchmarks ==="
-    java --enable-preview \
-        --add-exports java.base/jdk.internal.vm.annotation=ALL-UNNAMED \
-        -XX:-RestrictContended \
-        -jar "${BENCHMARK_JAR}" -l
-    exit 0
-fi
-
-FILTER=""
-if [[ -n "$1" ]] && [[ "$1" != -* ]]; then
-    FILTER="$1"
-    shift
-fi
-
-# Override defaults with any remaining args
-if [[ $# -gt 0 ]]; then
-    JMH_OPTS="$@"
-fi
-
-echo ""
-echo "=== Running Benchmarks ==="
-echo "  Filter: ${FILTER:-ALL}"
-echo "  Options: ${JMH_OPTS}"
-echo ""
-
-java --enable-preview \
-    --add-exports java.base/jdk.internal.vm.annotation=ALL-UNNAMED \
-    -XX:-RestrictContended \
-    -jar "${BENCHMARK_JAR}" \
-    ${FILTER:+"$FILTER"} \
-    ${JMH_OPTS}
+exec "$PK/jmh.sh" "$@"

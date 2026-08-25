@@ -4,41 +4,62 @@ SPI provider implementation of the [Humainary Substrates API](https://github.com
 
 | | |
 |---|---|
-| **Version** | 2.9.0 |
-| **API** | Substrates 2.9.0 + Serventis 2.9.0 |
+| **Version** | 3.0.0-SNAPSHOT |
+| **API** | Substrates 3.0.2 + Serventis 3.0.2 |
 | **Java** | 26 (Virtual Threads + Preview) |
-| **Tests** | 587 (passing on the 2.9 API surface — adds `FsPin` and `FsPort` implementations, bounded `FsReservoir` with eviction, removes the no-arg `cell()` factory) |
-| **Benchmarks** | 14 JMH groups, 185+ benchmarks |
+| **Conformance** | Substrates TCK **960/960** · Serventis TCK **1227/1227** |
+| **Benchmarks** | [perfkit-java](https://github.com/humainary-io/perfkit-java) — 207 methods, 32 classes |
+
+## Conformance is external
+
+This project has **no tests and no benchmarks of its own**. Both are Humainary's, run
+against this provider by Maven coordinate exactly as they would be against any other.
+
+That is a deliberate change from earlier versions, and it was worth making. The in-house
+suite was 657 tests, all green — while the upstream TCK failed 68 and errored 3. Not a
+contradiction, but the mechanism: tests written by the same process, from the same reading,
+at the same time as the code measure self-consistency rather than conformance. Several
+asserted the bugs outright.
+
+```bash
+./scripts/tck.sh                 # both TCKs against this provider
+./scripts/tck.sh substrates      # one suite
+./scripts/benchmark.sh decision core
+```
 
 ## Prerequisites
 
 1. **Java 26** via [SDKMAN](https://sdkman.io/):
    ```bash
-   sdk install java 26.ea.35-open
-   sdk use java 26.ea.35-open
+   sdk install java 26.ea.35-open && sdk use java 26.ea.35-open
    ```
 
-2. **Humainary APIs** (not yet on Maven Central):
+2. **The Humainary repositories** (not on Maven Central). The APIs are required to build;
+   the TCKs and perfkit are required to verify:
    ```bash
-   git clone https://github.com/humainary-io/substrates-api-java.git
-   cd substrates-api-java && mvn clean install -DskipTests && cd ..
-
-   git clone https://github.com/humainary-io/serventis-api-java.git
-   cd serventis-api-java && mvn clean install -DskipTests && cd ..
+   for r in substrates-api-java serventis-api-java specs-api-java \
+            substrates-api-java-tck serventis-api-java-tck perfkit-java; do
+     git clone https://github.com/humainary-io/$r.git
+   done
+   for r in specs-api-java substrates-api-java serventis-api-java; do
+     ( cd $r && mvn clean install -DskipTests )
+   done
    ```
+   `specs-api-java` installs first: as of 3.0.2 the APIs depend on it for the
+   `@SpecDoc` / `@SpecRef` traceability annotations.
 
-## Build & Test
+## Build
 
 ```bash
-mvn clean install        # Build + run all 587 tests
-mvn test                 # Tests only
+mvn clean install        # builds; there are no tests to run
+./scripts/tck.sh         # conformance
 ```
 
 ## Usage
 
-The artifact is published to [GitHub Packages](https://github.com/fullerstack-io/fullerstack-humainary/packages). GitHub Packages requires authentication even for public packages, so consumers need both a repository declaration **and** credentials.
+The artifact is published to [GitHub Packages](https://github.com/fullerstack-io/fullerstack-humainary/packages), which requires authentication even for public packages — so consumers need a repository declaration **and** credentials.
 
-**1. Add the repository and dependency to your `pom.xml`:**
+**1. Repository and dependency:**
 
 ```xml
 <repositories>
@@ -46,7 +67,7 @@ The artifact is published to [GitHub Packages](https://github.com/fullerstack-io
     <id>github-fullerstack</id>
     <url>https://maven.pkg.github.com/fullerstack-io/fullerstack-humainary</url>
     <releases><enabled>true</enabled></releases>
-    <snapshots><enabled>false</enabled></snapshots>
+    <snapshots><enabled>true</enabled></snapshots>
   </repository>
 </repositories>
 
@@ -54,12 +75,12 @@ The artifact is published to [GitHub Packages](https://github.com/fullerstack-io
   <dependency>
     <groupId>io.fullerstack</groupId>
     <artifactId>fullerstack-substrates</artifactId>
-    <version>2.9.0</version>
+    <version>3.0.0-SNAPSHOT</version>
   </dependency>
 </dependencies>
 ```
 
-**2. Configure credentials in `~/.m2/settings.xml`:**
+**2. Credentials in `~/.m2/settings.xml`:**
 
 ```xml
 <settings>
@@ -73,9 +94,9 @@ The artifact is published to [GitHub Packages](https://github.com/fullerstack-io
 </settings>
 ```
 
-The token must be a [personal access token](https://github.com/settings/tokens) with the `read:packages` scope. Export it as `GITHUB_TOKEN` in your shell (or paste it directly into `settings.xml`, but environment variable is safer).
+A [personal access token](https://github.com/settings/tokens) with `read:packages`, exported as `GITHUB_TOKEN`.
 
-**3. The provider loads automatically.** `FsCortexProvider` is discovered via `ServiceLoader` — no configuration code needed. Just call `Substrates.cortex()`:
+**3. The provider loads itself.** `FsCortexProvider` is discovered via `ServiceLoader`:
 
 ```java
 import static io.humainary.substrates.api.Substrates.*;
@@ -99,43 +120,47 @@ circuit.close();
 
 Each circuit runs on a single virtual thread with two internal queues:
 
-- **IngressQueue** — wait-free MPSC for external emissions, backed by a 128-slot `QChunk` (~13ns per emit)
-- **TransitQueueRing** — single-threaded power-of-2 ring for cascading emissions (priority over ingress)
+- **IngressQueue** — wait-free MPSC for external emissions, backed by a 128-slot `QChunk`
+- **TransitQueueRing** — single-threaded power-of-2 ring for cascading emissions, drained to
+  exhaustion before the next ingress item
 
-Transit queue priority ensures **causal completion** — all cascading effects resolve atomically before the next external emission is processed. This eliminates race conditions without locks.
+That priority is what §5.3 calls **causal completion**: every cascading effect of one
+emission resolves before the next external emission is admitted, without locks.
 
-See [Architecture](docs/ARCHITECTURE.md) for VarHandle memory ordering, `@Contended` false-sharing prevention, and the QChunk interleaved array layout.
+See [Architecture](docs/ARCHITECTURE.md) for VarHandle memory ordering, false-sharing
+prevention, the QChunk layout, and the §5.8 stimulus-time and §6.4.1 Window-lease designs.
 
-## Benchmarks
+## Measurement
+
+Run through perfkit rather than quoting numbers here — figures move with the host, and this
+project's own history includes benchmark rows that measured nothing at all.
 
 ```bash
-./scripts/benchmark.sh              # All 14 groups
-./scripts/benchmark.sh PipeOps      # Specific group
-./scripts/benchmark.sh -l           # List available
+./scripts/benchmark.sh decision core     # actionable
+./scripts/benchmark.sh allocation core   # bytes/op and allocation sites
 ```
 
-Selected results (ns/op, JDK 26, GitHub Codespaces 2 vCPU). Cross-platform numbers in [Benchmark Comparison](docs/BENCHMARK-COMPARISON.md) are due for re-measurement on a quiet host; the figure below is from a recent run with a 10-iteration warmup:
-
-| Benchmark | ns/op | What it measures |
-|-----------|------:|------------------|
-| `cyclic_emit_deep_await_batch` | ~12.9 | Per-cycle cost of a deep cascade through cyclic pipe networks |
+Read results against perfkit's criteria in its `BENCHMARKS.md`: a run is **invalid** below
+3 fork series or above ~10% confidence error, scores are always published with error bars,
+and paired `_control_` rows are diagnostic — never subtracted from a target.
 
 ## Documentation
 
 | Document | What it covers |
 |----------|---------------|
 | [Developer Guide](docs/DEVELOPER-GUIDE.md) | Usage patterns, best practices, Serventis integration |
-| [Architecture](docs/ARCHITECTURE.md) | Implementation decisions, queue internals, async model, thread safety, performance |
-| [Benchmark Comparison](docs/BENCHMARK-COMPARISON.md) | Cross-platform JMH results vs Humainary baseline |
-| [2.9 Migration](docs/2.9-MIGRATION.md) | Upgrade notes from 2.8 to 2.9 (Pin/Port, bounded Reservoir, no-arg cell removal) |
+| [Architecture](docs/ARCHITECTURE.md) | Implementation decisions, queue internals, async model, thread safety |
+| [Conformance](docs/CONFORMANCE.md) | How the TCKs are run, what is measured, and open questions against the spec |
+| [2.9 Migration](docs/2.9-MIGRATION.md) | Historical — upgrade notes from 2.8 to 2.9 |
 
 ### External References
 
 | Resource | Description |
 |----------|-------------|
-| [Substrates Specification](https://github.com/humainary-io/substrates-api-spec) | Formal spec + design rationale |
-| [Substrates API](https://github.com/humainary-io/substrates-api-java) | API interfaces |
-| [Serventis API](https://github.com/humainary-io/serventis-api-java) | Semiotic observability instruments |
+| [Substrates Specification](https://github.com/humainary-io/substrates-api-spec) | Formal spec + rationale |
+| [Substrates API](https://github.com/humainary-io/substrates-api-java) · [TCK](https://github.com/humainary-io/substrates-api-java-tck) | API and its conformance suite |
+| [Serventis API](https://github.com/humainary-io/serventis-api-java) · [TCK](https://github.com/humainary-io/serventis-api-java-tck) | Semiotic observability instruments |
+| [perfkit-java](https://github.com/humainary-io/perfkit-java) | The JMH suite for providers |
 
 ## License
 

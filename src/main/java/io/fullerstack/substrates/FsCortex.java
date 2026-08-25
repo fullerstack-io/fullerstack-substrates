@@ -42,6 +42,26 @@ final class FsCortex implements Cortex {
     this.subject = new FsSubject <> ( FsName.intern ( "cortex" ), Cortex.class );
   }
 
+  /// §5.7: publishes a circuit's own [Current] as the Current of its worker
+  /// thread, for the whole life of that thread.
+  ///
+  /// "`Circuit.current()` MUST return a stable Current for the lifetime of the
+  /// circuit. Comparing `Circuit.current()` with `Cortex.current()` lets callers
+  /// detect whether they are currently executing on that circuit context without
+  /// invoking an operation that is illegal from the circuit context, such as
+  /// `await` or `pulse`." That comparison is only usable if the two are the
+  /// *same* Current on the worker — minting a separate per-thread Current there
+  /// makes the documented guard always report "not on the circuit", which is the
+  /// exact failure the guard exists to prevent.
+  void bindCurrent ( long threadId, FsCurrent current ) {
+    currentCache.put ( threadId, current );
+  }
+
+  /// Releases the worker-thread binding once the worker has exited.
+  void unbindCurrent ( long threadId ) {
+    currentCache.remove ( threadId );
+  }
+
   /// Gets or creates the Current for the current thread.
   private FsCurrent getOrCreateCurrent () {
     long tid = Thread.currentThread ().threadId ();
@@ -78,7 +98,7 @@ final class FsCortex implements Cortex {
   public Circuit circuit ( @NotNull Name name ) {
     requireNonNull ( name, "name must not be null" );
     FsSubject < Circuit > circuitSubject = new FsSubject <> ( name, (FsSubject < ? >) subject, Circuit.class );
-    return new FsCircuit ( circuitSubject );
+    return new FsCircuit ( this, circuitSubject );
   }
 
   @Override

@@ -57,30 +57,53 @@ public final class FsSubscriber < E > implements Subscriber < E > {
     }
   }
 
-  synchronized void trackSubscription ( Subscription subscription ) {
-    if ( closed ) {
-      subscription.close ();
-      return;
+  void trackSubscription ( FsSubscription subscription ) {
+    boolean alreadyClosed;
+    synchronized ( this ) {
+      alreadyClosed = closed;
+      if ( !alreadyClosed ) {
+        if ( subscriptions == null ) {
+          subscriptions = new ArrayList <> ();
+        }
+        subscriptions.add ( subscription );
+        if ( awaitCircuit == null ) {
+          awaitCircuit = subscription.awaitCircuit ();
+        }
+      }
     }
-    if ( subscriptions == null ) {
-      subscriptions = new ArrayList <> ();
-    }
-    subscriptions.add ( subscription );
-    if ( awaitCircuit == null && subscription instanceof FsSubscription fs ) {
-      awaitCircuit = fs.awaitCircuit ();
-    }
+    // Outside the monitor: terminating a subscription reaches back into the
+    // source to retire the registration, and §15.4 #2 forbids holding a lock
+    // across that.
+    if ( alreadyClosed ) subscription.terminate ();
   }
 
+  /// Untracks a subscription that terminated by one of the other two routes
+  /// (explicit close, or source close), so a long-lived subscriber does not
+  /// accumulate dead handles.
+  synchronized void untrackSubscription ( FsSubscription subscription ) {
+    if ( subscriptions != null ) subscriptions.remove ( subscription );
+  }
+
+  /// §16.3: "closing a subscriber cancels all subscriptions derived from it."
   @Idempotent
   @Override
-  public synchronized void close () {
-    if ( closed ) return;
-    closed = true;
-    if ( subscriptions != null ) {
-      for ( Subscription s : subscriptions ) {
-        s.close ();
-      }
+  public void close () {
+    List < Subscription > live;
+    synchronized ( this ) {
+      if ( closed ) return;
+      closed = true;
+      live = subscriptions;
       subscriptions = null;
+    }
+    if ( live == null ) return;
+    // Each termination is independent: one that fails must not strand its
+    // siblings (§15.4 #2).
+    for ( Subscription s : live ) {
+      try {
+        s.close ();
+      } catch ( Throwable ignored ) {
+        // §15.4 — suppressed; remaining subscriptions still terminate.
+      }
     }
   }
 

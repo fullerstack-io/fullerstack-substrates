@@ -57,6 +57,10 @@ public final class FsBank < E > implements Bank < Conduit < E > > {
   @NotNull
   public Conduit < E > get ( @NotNull Name name ) {
     Objects.requireNonNull ( name, "name" );
+    // §9.1 / §15.3: `get` is open-required, and once the owning circuit has
+    // accepted close there is nothing left to materialise a conduit onto — the
+    // closed resource is the circuit, so the fault carries the circuit's subject.
+    circuit.requireOpen ( "get" );
     if ( closed ) {
       throw new Fault ( subject, "get", "bank is closed" );
     }

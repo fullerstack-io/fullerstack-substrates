@@ -8,6 +8,8 @@ import io.humainary.substrates.api.Substrates.Provided;
 import java.util.HashMap;
 import java.util.function.Function;
 
+import static java.util.Objects.requireNonNull;
+
 /// A derived pool that applies a transformation function to each result from
 /// an underlying pool, per Substrates 2.4 §10.1:
 ///
@@ -64,6 +66,10 @@ final class FsDerivedPool < T, S > implements Pool < T > {
   @NotNull
   @Override
   public synchronized T get ( @NotNull Name name ) {
+    // §15.2 absence violation: a required argument is never optional. Checked
+    // before the inline-entry compare, which would otherwise read `null ==
+    // firstName` as a cache hit on a freshly constructed pool and hand back null.
+    requireNonNull ( name, "name must not be null" );
     // SINGLE — fast match on the inline entry. Names are interned so `==` is
     // the canonical comparison.
     if ( name == firstName ) return unwrap ( firstValue, name );

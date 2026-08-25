@@ -104,6 +104,13 @@ public final class FsFiber < E > implements Fiber < E > {
   @Override
   public Pipe < E > pipe ( @NotNull Cell < ? super E > cell ) {
     Objects.requireNonNull ( cell, "cell must not be null" );
+    // §15.1 provider mismatch is checked on the Cell itself, not on the pipe it
+    // hands back: a foreign Cell returns whatever it likes from `pipe()`, and an
+    // NPE on that value would misreport a provider mismatch as an absence
+    // violation (§15.2).
+    if ( FsOperators.foreign ( cell ) ) {
+      throw FsOperators.fault ( "pipe", "cell is not from this runtime provider" );
+    }
     return pipe ( cell.pipe () );
   }
 
@@ -114,6 +121,14 @@ public final class FsFiber < E > implements Fiber < E > {
   @SuppressWarnings ( "unchecked" )
   public Pipe < E > pipe ( @NotNull Pipe < ? super E > target ) {
     Objects.requireNonNull ( target, "target must not be null" );
+    // §15.1 provider mismatch, MUST detect — checked ahead of the empty-fiber
+    // elision below so an identity fiber cannot smuggle a foreign target
+    // through untouched. This replaces the former inline-emit branch, which
+    // ran the whole operator chain on the caller's thread and so also broke
+    // circuit confinement (§16.1#1).
+    if ( FsOperators.foreign ( target ) ) {
+      throw FsOperators.fault ( "pipe", "target pipe is not from this runtime provider" );
+    }
     // Empty fiber elision — no operators means nothing to do. Returning
     // target directly skips the transit hop that wraps a no-op chain.
     if ( count == 0 ) return (Pipe < E >) target;
@@ -124,15 +139,21 @@ public final class FsFiber < E > implements Fiber < E > {
       if ( targetReceiver instanceof FsChannel < ? > channel ) {
         chain = materialise ( v -> {
           Consumer < Object > d = channel.cascadeDispatch;
-          c.submitTransit ( d != null ? d : channel, v );
+          c.submit ( d != null ? d : channel, v );
         } );
       } else {
-        chain = materialise ( v -> c.submitTransit ( targetReceiver, v ) );
+        chain = materialise ( v -> c.submit ( targetReceiver, v ) );
       }
-      return new FsPipe <> ( (Consumer < Object >) (Consumer < ? >) chain, c );
+      // §4.3: a materialized pipe's enclosure is the pipe it feeds, one level
+      // deeper, so chained attachments form a fully-qualified nested path.
+      return new FsPipe <> ( (Consumer < Object >) (Consumer < ? >) chain, c,
+        null, (FsSubject < ? >) target.subject () );
     }
-    // Foreign Pipe: no access to its internals, use emit().
+    // This provider's own non-FsPipe carriers (an FsSink channel pipe, say)
+    // expose no receiver to submit to, so the chain is driven through emit().
     chain = materialise ( target::emit );
+    final Subject < Pipe < E > > nested = (Subject < Pipe < E > >) (Subject < ? >)
+      new FsSubject <> ( null, (FsSubject < ? >) target.subject (), Pipe.class );
     return new Pipe <> () {
       @Override
       public void emit ( @NotNull E emission ) {
@@ -140,7 +161,7 @@ public final class FsFiber < E > implements Fiber < E > {
       }
       @Override
       public Subject < Pipe < E > > subject () {
-        return (Subject < Pipe < E > >) (Subject < ? >) target.subject ();
+        return nested;
       }
     };
   }
@@ -291,6 +312,11 @@ public final class FsFiber < E > implements Fiber < E > {
     Objects.requireNonNull ( comparator );
     Objects.requireNonNull ( lower );
     Objects.requireNonNull ( upper );
+    // §6.2.4 plus the API contract: `@throws IllegalArgumentException if
+    // comparator.compare(lower, upper) > 0`. The natural-order overload is a
+    // default method delegating here, so this covers both forms.
+    if ( comparator.compare ( lower, upper ) > 0 )
+      throw new IllegalArgumentException ( "lower must not be greater than upper" );
     return append ( d -> new FsOperators.Guard <> (
       v -> comparator.compare ( v, lower ) >= 0 && comparator.compare ( v, upper ) <= 0, d ) );
   }
@@ -408,7 +434,8 @@ public final class FsFiber < E > implements Fiber < E > {
   public Fiber < E > fiber ( @NotNull Fiber < E > next ) {
     Objects.requireNonNull ( next );
     if ( !( next instanceof FsFiber < E > nextFiber ) ) {
-      throw new IllegalArgumentException ( "next fiber must be an FsFiber instance" );
+      // §15.1 provider mismatch, MUST detect; Appendix A.2 binds it to Fault.
+      throw FsOperators.fault ( "fiber", "next fiber is not from this runtime provider" );
     }
     if ( nextFiber.count == 0 ) return this;
     Wrap < ? >[] merged = new Wrap < ? >[count + nextFiber.count];
@@ -440,7 +467,9 @@ public final class FsFiber < E > implements Fiber < E > {
   @Override
   public Fiber < E > pulse ( @NotNull Predicate < ? super E > predicate ) {
     Objects.requireNonNull ( predicate );
-    return append ( d -> new FsOperators.Guard <> ( predicate, d ) );
+    // §6.2.3 (Pulse) is a rising-edge detector that re-arms on false, not the
+    // stateless level detector a Guard would give.
+    return append ( d -> new FsOperators.Pulse <> ( predicate, d ) );
   }
 
   @NotNull
@@ -524,7 +553,8 @@ public final class FsFiber < E > implements Fiber < E > {
     Objects.requireNonNull ( predicate );
     Objects.requireNonNull ( fiber );
     if ( !( fiber instanceof FsFiber < E > sub ) ) {
-      throw new IllegalArgumentException ( "fiber must be an FsFiber instance" );
+      // §15.1 provider mismatch, MUST detect; Appendix A.2 binds it to Fault.
+      throw FsOperators.fault ( "when", "fiber is not from this runtime provider" );
     }
     // Empty sub-fiber → matched path is identity (= downstream) → both branches
     // pass-through unchanged → this stage is a no-op.

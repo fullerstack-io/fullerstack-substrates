@@ -1,9 +1,11 @@
 package io.fullerstack.substrates;
 
+import io.fullerstack.substrates.FsCircuit.ReceptorAdapter;
 import io.humainary.substrates.api.Substrates.Cell;
 import io.humainary.substrates.api.Substrates.Name;
 import io.humainary.substrates.api.Substrates.NotNull;
 import io.humainary.substrates.api.Substrates.Pipe;
+import io.humainary.substrates.api.Substrates.Receptor;
 import io.humainary.substrates.api.Substrates.Subject;
 
 /// **FsCell** — circuit-owned state cell with safe publication.
@@ -14,12 +16,21 @@ import io.humainary.substrates.api.Substrates.Subject;
 ///
 /// ## Implementation
 ///
-/// The cell's pipe is a direct **receptor pipe** (`circuit.pipe(Receptor)`)
-/// whose receptor simply writes to the volatile slot. No conduit / channel /
-/// subscriber machinery is needed — Cell's contract is "the latest emit
-/// becomes the value." Any thread can `cell.pipe().emit(v)` and any thread
-/// can `cell.get()`; the receptor runs on the circuit thread so the slot
-/// is always updated under deterministic ordering.
+/// The cell's pipe is a direct **receptor pipe** whose receptor simply writes
+/// to the volatile slot. No conduit / channel / subscriber machinery is needed
+/// — Cell's contract is "the latest emit becomes the value." Any thread can
+/// `cell.pipe().emit(v)` and any thread can `cell.get()`; the receptor runs on
+/// the circuit thread so the slot is always updated under deterministic
+/// ordering.
+///
+/// The pipe is built here rather than through `circuit.pipe(Receptor)` for one
+/// reason: §4.3 makes a pipe's enclosure "the subject of the source that owns
+/// it", and the source that owns this one is the **cell**, not the circuit.
+/// Routing it through the circuit factory parented it to the circuit and lost
+/// the cell level of the path. The receiver is still a
+/// [ReceptorAdapter], so the drain loop's `accept` call site keeps the single
+/// concrete type its monomorphism depends on (see the marker-class note in
+/// [FsCircuit]).
 @SuppressWarnings ( "unchecked" )
 public final class FsCell < E > implements Cell < E > {
 
@@ -29,11 +40,19 @@ public final class FsCell < E > implements Cell < E > {
   private volatile E value;
 
   public FsCell ( FsSubject < ? > parent, Name name, FsCircuit circuit, E initial ) {
-    this.subject = (Subject < Cell < E > >) (Subject < ? >) new FsSubject <> ( name, parent, Cell.class );
-    this.value   = initial;
-    this.pipe    = circuit.pipe ( (E emission) -> {
+
+    final FsSubject < ? > cellSubject =
+      new FsSubject <> ( name, parent, Cell.class );
+
+    final Receptor < E > update = emission -> {
       if ( emission != null ) value = emission;
-    } );
+    };
+
+    this.subject = (Subject < Cell < E > >) (Subject < ? >) cellSubject;
+    this.value   = initial;
+    // §4.3: the update capability's enclosure is the cell's own subject.
+    this.pipe    = new FsPipe <> ( new ReceptorAdapter < E > ( update ), circuit, null, cellSubject );
+
   }
 
   @NotNull

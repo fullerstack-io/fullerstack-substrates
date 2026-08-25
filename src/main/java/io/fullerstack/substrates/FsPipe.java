@@ -50,19 +50,44 @@ public final class FsPipe < E > implements Pipe < E > {
     this.subject = (Subject < Pipe < E > >) (Subject < ? >) new FsSubject <> ( name, parent, Pipe.class );
   }
 
+  /// §4.3: "A pipe's enclosure is the subject of the source that owns it —
+  /// typically a conduit, but any Source subtype. The source's enclosure is in
+  /// turn the circuit's subject … This produces a fully-qualified path for every
+  /// component."
+  ///
+  /// A conduit pipe carries the channel's subject, which the conduit already
+  /// minted under itself. Every other anonymous pipe is minted directly by a
+  /// circuit — `circuit.pipe()`, `pipe(Receptor)`, the cross-circuit forwarder
+  /// of `pipe(Pipe)`, the fan-out of `pipe(List)` — so the circuit's subject is
+  /// the owning source, and the omitted name inherits from it (§16.3: the
+  /// unnamed form uses the owning circuit's name). Previously this branch built
+  /// `FsSubject(null, null, Pipe.class)`, an orphan with no enclosure whose
+  /// `name()` dereferenced a null parent.
+  ///
+  /// Minted under the monitor rather than racily: §4.2/§4.3 make the identifier
+  /// a per-instance identity, so two concurrent callers must not walk away with
+  /// two subjects carrying two ids for one pipe.
   @Override
   public Subject < Pipe < E > > subject () {
     Subject < Pipe < E > > s = subject;
     if ( s == null ) {
-      // Derive subject from receiver if it's a channel
-      @SuppressWarnings ( "unchecked" )
-      Subject < Pipe < E > > derived = ( receiver instanceof FsChannel < ? > ch )
-        ? (Subject < Pipe < E > >) (Subject < ? >) ch.subject ()
-        : new FsSubject <> ( null, null, Pipe.class );
-      s = derived;
-      subject = s;
+      synchronized ( this ) {
+        s = subject;
+        if ( s == null ) {
+          s = derive ();
+          subject = s;
+        }
+      }
     }
     return s;
+  }
+
+  @SuppressWarnings ( "unchecked" )
+  private Subject < Pipe < E > > derive () {
+    return ( receiver instanceof FsChannel < ? > ch )
+      ? (Subject < Pipe < E > >) (Subject < ? >) ch.subject ()
+      : (Subject < Pipe < E > >) (Subject < ? >)
+        new FsSubject <> ( null, (FsSubject < ? >) circuit.subject (), Pipe.class );
   }
 
   Consumer < Object > receiver () {

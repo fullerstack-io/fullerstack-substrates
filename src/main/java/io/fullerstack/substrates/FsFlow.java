@@ -166,6 +166,8 @@ public final class FsFlow < I, O > implements Flow < I, O > {
     public Consumer < Object > wrap ( Consumer < Object > downstream ) {
       final Object[] buffer = new Object[ count ];
       final int[]    sizeRef = { 0 };   // current valid length
+      // §6.4.1 temporal lease, per materialization — see FsWindow.Lease.
+      final FsWindow.Lease lease = new FsWindow.Lease ();
       return v -> {
         int len = sizeRef[ 0 ];
         if ( len < count ) {
@@ -176,7 +178,8 @@ public final class FsFlow < I, O > implements Flow < I, O > {
           System.arraycopy ( buffer, 1, buffer, 0, count - 1 );
           buffer[ count - 1 ] = v;
         }
-        downstream.accept ( new FsWindow <> ( buffer, 0, sizeRef[ 0 ], false ) );
+        lease.latch ();
+        downstream.accept ( new FsWindow <> ( buffer, 0, sizeRef[ 0 ], false, lease ) );
       };
     }
   }
@@ -194,7 +197,15 @@ public final class FsFlow < I, O > implements Flow < I, O > {
         throw new IllegalArgumentException ( "duration must be > 0" );
       }
       if ( capacity <= 0 ) throw new IllegalArgumentException ( "capacity must be > 0" );
-      this.durationNanos = duration.toNanos ();
+      // API contract on Flow#window(Duration,int): `@throws
+      // IllegalArgumentException if duration is zero, negative, or cannot be
+      // represented in nanoseconds`. Duration.toNanos raises ArithmeticException
+      // on overflow, which is neither of §15.1's declared error shapes.
+      try {
+        this.durationNanos = duration.toNanos ();
+      } catch ( ArithmeticException overflow ) {
+        throw new IllegalArgumentException ( "duration cannot be represented in nanoseconds", overflow );
+      }
       this.capacity      = capacity;
     }
 
@@ -204,6 +215,8 @@ public final class FsFlow < I, O > implements Flow < I, O > {
       final long[]   times  = new long[ capacity ];
       // tracked as a contiguous [0..length) range
       final int[]    sizeRef = { 0 };
+      // §6.4.1 temporal lease, per materialization — see FsWindow.Lease.
+      final FsWindow.Lease lease = new FsWindow.Lease ();
       return v -> {
         final long now = System.nanoTime ();
         // Evict entries older than (now - durationNanos).
@@ -229,7 +242,8 @@ public final class FsFlow < I, O > implements Flow < I, O > {
           times [ capacity - 1 ] = now;
         }
         sizeRef[ 0 ] = newLen;
-        downstream.accept ( new FsWindow <> ( values, 0, newLen, false ) );
+        lease.latch ();
+        downstream.accept ( new FsWindow <> ( values, 0, newLen, false, lease ) );
       };
     }
   }
@@ -344,7 +358,9 @@ public final class FsFlow < I, O > implements Flow < I, O > {
       Fiber < ? > f = factories[i].factory.apply ( targetSubject );
       Objects.requireNonNull ( f, "fiber factory must not return null" );
       if ( !( f instanceof FsFiber < ? > fsFiber ) ) {
-        throw new IllegalArgumentException ( "fiber factory must produce an FsFiber instance" );
+        // §15.1 provider mismatch — a factory result is a composition argument
+        // like any other.
+        throw FsOperators.fault ( "fiber", "fiber factory produced a value from another provider" );
       }
       Wrap < ? >[] ops = fsFiber.operators ();
       int fc = fsFiber.operatorCount ();
@@ -361,7 +377,9 @@ public final class FsFlow < I, O > implements Flow < I, O > {
       Flow < ?, ? > f = flowFactories[i].factory.apply ( targetSubject );
       Objects.requireNonNull ( f, "flow factory must not return null" );
       if ( !( f instanceof FsFlow < ?, ? > fsFlow ) ) {
-        throw new IllegalArgumentException ( "flow factory must produce an FsFlow instance" );
+        // §15.1 provider mismatch — a factory result is a composition argument
+        // like any other.
+        throw FsOperators.fault ( "flow", "flow factory produced a value from another provider" );
       }
       // Recursive resolve: if the inner flow has its own factories, resolve
       // them too; otherwise use its operators directly.
@@ -418,7 +436,8 @@ public final class FsFlow < I, O > implements Flow < I, O > {
   public Flow < I, O > fiber ( @NotNull Fiber < O > fiber ) {
     Objects.requireNonNull ( fiber );
     if ( !( fiber instanceof FsFiber < ? > fsFiber ) ) {
-      throw new IllegalArgumentException ( "fiber must be an FsFiber instance" );
+      // §15.1 provider mismatch, MUST detect; Appendix A.2 binds it to Fault.
+      throw FsOperators.fault ( "fiber", "fiber is not from this runtime provider" );
     }
     int fc = fsFiber.operatorCount ();
     if ( fc == 0 ) return this;
@@ -455,7 +474,8 @@ public final class FsFlow < I, O > implements Flow < I, O > {
   public < P > Flow < I, P > flow ( @NotNull Flow < ? super O, ? extends P > next ) {
     Objects.requireNonNull ( next );
     if ( !( next instanceof FsFlow < ?, ? > nextFlow ) ) {
-      throw new IllegalArgumentException ( "next flow must be an FsFlow instance" );
+      // §15.1 provider mismatch, MUST detect; Appendix A.2 binds it to Fault.
+      throw FsOperators.fault ( "flow", "next flow is not from this runtime provider" );
     }
     if ( nextFlow.count == 0 && nextFlow.factories == null && nextFlow.flowFactories == null ) {
       return (Flow < I, P >) (Flow < ?, ? >) this;
@@ -525,6 +545,13 @@ public final class FsFlow < I, O > implements Flow < I, O > {
   @SuppressWarnings ( "unchecked" )
   public Pipe < I > pipe ( @NotNull Pipe < ? super O > target ) {
     Objects.requireNonNull ( target );
+    // §15.1 provider mismatch, MUST detect — ahead of the identity-flow elision
+    // below, so an identity flow cannot smuggle a foreign target through, and
+    // in place of the former inline-emit branch, which ran the whole operator
+    // chain on the caller's thread (§16.1#1).
+    if ( FsOperators.foreign ( target ) ) {
+      throw FsOperators.fault ( "pipe", "target pipe is not from this runtime provider" );
+    }
     // Empty flow elision — no operators AND no pending factories means I == O.
     if ( count == 0 && factories == null && flowFactories == null ) return (Pipe < I >) (Pipe < ? >) target;
 
@@ -550,15 +577,21 @@ public final class FsFlow < I, O > implements Flow < I, O > {
         // version check. Falls back to channel before first rebuild.
         chain = materialiseFrom ( effective, effectiveCount, (Consumer < O >) v -> {
           Consumer < Object > d = channel.cascadeDispatch;
-          c.submitTransit ( d != null ? d : channel, v );
+          c.submit ( d != null ? d : channel, v );
         } );
       } else {
-        chain = materialiseFrom ( effective, effectiveCount, (Consumer < O >) v -> c.submitTransit ( targetReceiver, v ) );
+        chain = materialiseFrom ( effective, effectiveCount, (Consumer < O >) v -> c.submit ( targetReceiver, v ) );
       }
-      return new FsPipe <> ( (Consumer < Object >) (Consumer < ? >) chain, c );
+      // §4.3: a materialized pipe's enclosure is the pipe it feeds, one level
+      // deeper, so chained attachments form a fully-qualified nested path.
+      return new FsPipe <> ( (Consumer < Object >) (Consumer < ? >) chain, c,
+        null, (FsSubject < ? >) target.subject () );
     }
-    // Foreign Pipe — fall through to wrapped emit
+    // This provider's own non-FsPipe carriers (an FsSink channel pipe, say)
+    // expose no receiver to submit to, so the chain is driven through emit().
     chain = materialiseFrom ( effective, effectiveCount, target::emit );
+    final Subject < Pipe < I > > nested = (Subject < Pipe < I > >) (Subject < ? >)
+      new FsSubject <> ( null, (FsSubject < ? >) target.subject (), Pipe.class );
     return new Pipe <> () {
       @Override
       public void emit ( @NotNull I emission ) {
@@ -566,9 +599,7 @@ public final class FsFlow < I, O > implements Flow < I, O > {
       }
       @Override
       public Subject < Pipe < I > > subject () {
-        @SuppressWarnings ( "unchecked" )
-        var s = (Subject < Pipe < I > >) (Subject < ? >) target.subject ();
-        return s;
+        return nested;
       }
     };
   }
@@ -578,6 +609,11 @@ public final class FsFlow < I, O > implements Flow < I, O > {
   @Override
   public Pipe < I > pipe ( @NotNull Cell < ? super O > cell ) {
     Objects.requireNonNull ( cell, "cell must not be null" );
+    // §15.1 provider mismatch is checked on the Cell itself — see the twin
+    // comment on FsFiber#pipe(Cell).
+    if ( FsOperators.foreign ( cell ) ) {
+      throw FsOperators.fault ( "pipe", "cell is not from this runtime provider" );
+    }
     return pipe ( cell.pipe () );
   }
 

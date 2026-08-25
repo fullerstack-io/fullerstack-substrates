@@ -2,6 +2,7 @@ package io.fullerstack.substrates;
 
 import io.humainary.substrates.api.Substrates.Circuit;
 import io.humainary.substrates.api.Substrates.Extent;
+import io.humainary.substrates.api.Substrates.Fault;
 import io.humainary.substrates.api.Substrates.Id;
 import io.humainary.substrates.api.Substrates.Identity;
 import io.humainary.substrates.api.Substrates.Name;
@@ -16,7 +17,15 @@ import java.util.concurrent.atomic.AtomicLong;
 import static java.util.Objects.requireNonNull;
 
 /// The identity of a substrate.
-/// Supports null name for anonymous subjects - delegates to parent's name.
+///
+/// An omitted (`null`) name inherits the enclosure's name, which is what §11.2
+/// (Cell), §11.5 (Port) and §11.6 (Pin) mean by "when no name is supplied, the
+/// implementation uses the owning circuit's name". That inheritance is resolved
+/// **eagerly at construction**, not on every read: §16.3 declares
+/// `Subject.name(): Name` with no absence, so the accessor has to be total, and
+/// resolving it lazily made it partial — an unnamed subject with no enclosure
+/// dereferenced a null parent and threw. The Rust projection
+/// (`identity/subject.rs`) reaches the same conclusion for the same reason.
 @Identity
 @Provided
 @SuppressWarnings ( {"unchecked"} )
@@ -26,15 +35,39 @@ public final class FsSubject < S extends Substrate < S > > implements Subject < 
   /// ~300ns).
   private static final AtomicLong ID_COUNTER = new AtomicLong ();
 
-  /// Simple Id wrapper with non-recursive toString().
-  private record FsId( long value ) implements Id {
+  /// §16.3: a subject with neither a name nor an enclosure to inherit one from
+  /// still owes a valid non-empty name. "That default name need not be unique;
+  /// uniqueness is provided by the subject identifier (§4.2)."
+  private static final Name DEFAULT_NAME = FsName.intern ( "substrates" );
+
+  /// Identifier token (§4.2, §4.3).
+  ///
+  /// A final class, **not** a record: §4.2 makes identifier comparison canonical
+  /// identity (§1.2), and the API annotates `Id` `@Identity` — "a type whose
+  /// instances can be compared by (object) reference for equality". A record
+  /// derives value-based `equals`/`hashCode` from `value`, which leaves
+  /// `hashCode()` unequal to the reference hash and so is not identity-based.
+  /// Inheriting `Object`'s pair is exactly the required semantics.
+  private static final class FsId implements Id {
+
+    private final long value;
+
+    FsId ( long value ) {
+      this.value = value;
+    }
+
+    long value () {
+      return value;
+    }
+
     @Override
     public String toString () {
       return String.valueOf ( value );
     }
+
   }
 
-  private final Name            name; // null for anonymous subjects
+  private final Name            name; // resolved at construction — never null
   private final FsSubject < ? > parent;
   private final Class < ? >     type;
   private final FsId            id; // unique id
@@ -42,16 +75,19 @@ public final class FsSubject < S extends Substrate < S > > implements Subject < 
 
   /// Creates a root subject with the given name and type.
   public FsSubject ( Name name, Class < ? > type ) {
-    this.name = name;
+    this.name = name != null ? name : DEFAULT_NAME;
     this.parent = null;
     this.type = type;
     this.id = new FsId ( ID_COUNTER.getAndIncrement () );
   }
 
   /// Creates a child subject with the given name, parent, and type.
-  /// If name is null, this subject delegates name() to parent.
+  /// A null name inherits the parent's name (§11.2/§11.5/§11.6); with no parent
+  /// either, it takes the §16.3 default so that [#name()] stays total.
   public FsSubject ( Name name, FsSubject < ? > parent, Class < ? > type ) {
-    this.name = name;
+    this.name = name != null ? name
+      : parent != null ? parent.name ()
+      : DEFAULT_NAME;
     this.parent = parent;
     this.type = type;
     this.id = new FsId ( ID_COUNTER.getAndIncrement () );
@@ -64,8 +100,7 @@ public final class FsSubject < S extends Substrate < S > > implements Subject < 
 
   @Override
   public Name name () {
-    // Anonymous subjects delegate to parent's name
-    return name != null ? name : parent.name ();
+    return name;
   }
 
   @Override
@@ -105,11 +140,22 @@ public final class FsSubject < S extends Substrate < S > > implements Subject < 
 
   @Override
   public int compareTo ( Subject < ? > other ) {
+    requireNonNull ( other, "other must not be null" );
     if ( this == other ) return 0;
-    if ( other instanceof FsSubject < ? > fs ) {
-      return Long.compare ( this.id.value (), fs.id.value () );
+    if ( ! ( other instanceof FsSubject < ? > fs ) ) {
+      // §15.1 provider mismatch, MUST detect. A foreign subject carries no
+      // identifier this runtime can order against — §4.2 makes identifier
+      // comparison canonical identity, and a canonical identity minted by
+      // another provider is meaningless here, so falling back to a name
+      // comparison would fabricate a total order that is neither stable nor
+      // antisymmetric with the foreign side's own compareTo. §15.3 names the
+      // receiver as the fault's subject and renders the offending argument.
+      throw new Fault (
+        this,
+        "compareTo",
+        "subject is not from this runtime provider: " + other.getClass ().getName () );
     }
-    return name ().compareTo ( other.name () );
+    return Long.compare ( this.id.value (), fs.id.value () );
   }
 
   /// Finds the circuit ancestor in the subject hierarchy.

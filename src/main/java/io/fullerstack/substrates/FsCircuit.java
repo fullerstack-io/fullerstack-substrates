@@ -34,7 +34,6 @@ import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
@@ -91,6 +90,7 @@ public final class FsCircuit implements Circuit {
   // Circuit state (read-only after construction)
   // ─────────────────────────────────────────────────────────────────────────────
 
+  private final FsCortex            cortex;
   private final Subject < Circuit > subject;
   private final Thread              worker;
 
@@ -244,7 +244,8 @@ public final class FsCircuit implements Circuit {
   // Construction
   // ─────────────────────────────────────────────────────────────────────────────
 
-  public FsCircuit ( Subject < Circuit > subject ) {
+  public FsCircuit ( FsCortex cortex, Subject < Circuit > subject ) {
+    this.cortex  = cortex;
     this.subject = subject;
 
     // Pre-allocate marker receivers as concrete classes — distinct types
@@ -253,10 +254,19 @@ public final class FsCircuit implements Circuit {
     this.awaitMarkerReceiver = new AwaitMarker ( this );
     this.closeMarkerReceiver = new CloseMarker ( this );
 
-    // Create and start worker thread
-    this.worker = Thread.ofVirtual ()
+    // Create the worker unstarted, bind this circuit's Current to it, then start.
+    //
+    // §5.7: the worker thread's Current IS this circuit's Current, so that
+    // `cortex.current() == circuit.current()` is the on-circuit guard the spec
+    // documents. Binding happens on the creating thread, before the worker runs,
+    // so no dispatched work can observe an unbound worker. Thread ids are
+    // assigned at construction, so an unstarted thread already has one.
+    final Thread w = Thread.ofVirtual ()
       .name ( "circuit-" + subject.name () )
-      .start ( this::workerLoop );
+      .unstarted ( this::workerLoop );
+    this.worker = w;
+    cortex.bindCurrent ( w.threadId (), (FsCurrent) current () );
+    w.start ();
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -280,6 +290,26 @@ public final class FsCircuit implements Circuit {
   @jdk.internal.vm.annotation.ForceInline
   final void submitTransit ( Consumer < Object > receiver, Object value ) {
     transit.enqueue ( receiver, value );
+  }
+
+  /**
+   * Submit an emission to this circuit from an unknown thread — the same
+   * routing decision {@link FsPipe#emit} makes, factored out so that
+   * Flow/Fiber terminals reach the right queue too.
+   *
+   * <p>SPEC §5.3: a cascade re-entry raised on this circuit's own worker is
+   * transit work; anything raised from another thread — including another
+   * circuit's worker — is an ingress admission of <em>this</em> circuit. The
+   * transit ring is single-threaded, so routing a foreign-thread emission into
+   * it is a data race, not merely a lost emission.
+   */
+  @jdk.internal.vm.annotation.ForceInline
+  final void submit ( Consumer < Object > receiver, Object value ) {
+    if ( Thread.currentThread () == worker ) {
+      transit.enqueue ( receiver, value );
+    } else {
+      ingress.enqueue ( receiver, value );
+    }
   }
 
   /**
@@ -329,6 +359,14 @@ public final class FsCircuit implements Circuit {
   // ─────────────────────────────────────────────────────────────────────────────
 
   private void workerLoop () {
+    drainLoop ();
+    // §5.7: the binding lives exactly as long as the worker does. Released here
+    // rather than in close(), because work admitted before the close marker is
+    // still dispatched afterwards and must keep observing the circuit's Current.
+    cortex.unbindCurrent ( Thread.currentThread ().threadId () );
+  }
+
+  private void drainLoop () {
     // Hoist final field to local — guarantees register allocation.
     final IngressQueue q = ingress;
 
@@ -697,7 +735,11 @@ public final class FsCircuit implements Circuit {
   public Ticker ticker ( @NotNull Duration interval, @NotNull Pipe < ? super Long > target ) {
     requireNonNull ( interval );
     requireNonNull ( target );
-    return ticker ( cortex ().name ( "ticker" ), interval, target );
+    // §11.4 / §16.3: the two-argument form "uses a default name". Aligned with
+    // the owning circuit's name, as `cell` / `port` / `pin` are required to be —
+    // §16.3 leaves the ticker's default implementation-defined, so this is an
+    // alignment choice, not a correction (see TCK-GAPS §D2).
+    return ticker ( subject.name (), interval, target );
   }
 
   @New
@@ -743,6 +785,7 @@ public final class FsCircuit implements Circuit {
   public < E > Pipe < E > pipe () {
     // 2.3: no-arg pipe — queues emissions and discards them on the circuit thread.
     // Equivalent to circuit.pipe(Receptor.NOOP) but without the wrapper.
+    requireOpen ( "pipe" );
     return newPipe ( v -> { /* no-op */ } );
   }
 
@@ -755,6 +798,9 @@ public final class FsCircuit implements Circuit {
   @SuppressWarnings ( "unchecked" )
   public < E > Pipe < E > pipe ( @NotNull Pipe < ? super E > target ) {
     requireNonNull ( target );
+    // §9.1 / §16.1#9: the open-required check precedes the same-circuit fast
+    // path — a closed circuit must not hand the target back as-is.
+    requireOpen ( "pipe" );
     // Same-circuit pipe already routes through this circuit — return as-is
     if ( target instanceof FsPipe < ? > fsPipe && fsPipe.circuit () == this ) {
       return (Pipe < E >) target;
@@ -826,6 +872,7 @@ public final class FsCircuit implements Circuit {
   @Override
   public < E > Pipe < E > pipe ( @NotNull Receptor < ? super E > receptor ) {
     requireNonNull ( receptor );
+    requireOpen ( "pipe" );
     return newPipe ( receptor );
   }
 
@@ -836,12 +883,18 @@ public final class FsCircuit implements Circuit {
   public < E > Pipe < E > pipe ( @NotNull Name name, @NotNull Receptor < ? super E > receptor ) {
     requireNonNull ( name );
     requireNonNull ( receptor );
+    requireOpen ( "pipe" );
     return new FsPipe <> ( new ReceptorAdapter <> ( receptor ), this, name, (FsSubject < ? >) subject );
   }
 
   /// 2.7: cell factories. Both create a circuit-owned cell — empty or seeded.
-  /// 2.7: cell factories. Each call auto-generates a unique name so multiple
-  /// cells on the same circuit don't collide on conduit identity.
+  ///
+  /// SPEC §11.2 / §16.3: "when no name is supplied, the implementation uses the
+  /// owning circuit's name", and that default name "need not be unique;
+  /// uniqueness is provided by the subject identifier (§4.2)". `null` is the
+  /// same delegation idiom the sibling `pin(initial)` / `port(initial)`
+  /// factories already use — FsSubject resolves an omitted name from the
+  /// parent, and Id is minted per subject, so sibling cells stay distinct.
   /// Throws Fault if the circuit is closed (spec §11.3).
   @New
   @NotNull
@@ -849,7 +902,7 @@ public final class FsCircuit implements Circuit {
   public < E > Cell < E > cell ( @NotNull E initial ) {
     requireNonNull ( initial );
     requireOpen ( "cell" );
-    return new FsCell <> ( (FsSubject < ? >) subject, nextCellName (), this, initial );
+    return new FsCell <> ( (FsSubject < ? >) subject, null, this, initial );
   }
 
   /// 3.0: named cell — same semantics as [#cell(Object)] with the supplied
@@ -865,12 +918,6 @@ public final class FsCircuit implements Circuit {
     }
     requireOpen ( "cell" );
     return new FsCell <> ( (FsSubject < ? >) subject, name, this, initial );
-  }
-
-  private final AtomicLong cellSeq = new AtomicLong ();
-
-  private Name nextCellName () {
-    return cortex ().name ( "cell." + cellSeq.getAndIncrement () );
   }
 
   // ===================================================================================

@@ -1,9 +1,7 @@
 package io.fullerstack.substrates;
 
-import io.humainary.substrates.api.Substrates.Name;
 import io.humainary.substrates.api.Substrates.Pipe;
 import io.humainary.substrates.api.Substrates.Receptor;
-import io.humainary.substrates.api.Substrates.Routing;
 import io.humainary.substrates.api.Substrates.Subject;
 
 import java.util.ArrayList;
@@ -22,9 +20,9 @@ import java.util.function.Consumer;
 /// - **Ingress receiver**: implements Consumer<Object>. Stored in the
 ///   ingress queue. On dequeue, checks version and dispatches.
 /// - **Dispatch builder**: after rebuild, sets the dispatch Consumer
-///   which is used directly on the transit hot path. The dispatch
+///   which is used directly on the transit hot path. `cascadeDispatch`
 ///   already includes STEM propagation if applicable, so transit
-///   cascades can call dispatch directly without going through the
+///   cascades can call it directly without going through the
 ///   channel — bypassing the version check (which the spec guarantees
 ///   is stable mid-cascade per §5.4.1 + §7.6.2).
 ///
@@ -33,25 +31,59 @@ import java.util.function.Consumer;
 /// No lambda wrappers on the hot path.
 final class FsChannel < E > implements Receptor < E >, Consumer < Object > {
 
+  /// Shared empty ancestor chain. Every per-pipe-routed channel and every
+  /// root-named hierarchical channel shares it, so neither allocates.
+  private static final FsChannel < ? >[] NONE = new FsChannel < ? >[0];
+
+  @SuppressWarnings ( "unchecked" )
+  static < E > FsChannel < E >[] none () {
+    return (FsChannel < E >[]) NONE;
+  }
+
   private final Subject < Pipe < E > > subject;
   private final FsCircuit              circuit;
   private final FsHub < E >            hub;
-  private final boolean                stem;
-  private final FsConduit < E >        conduit;
+
+  /// §10.3 hierarchical routing: this channel's ancestor channels, ordered
+  /// nearest-first (direct parent, then its parent, … up to the root name).
+  ///
+  /// The chain is resolved once, by [FsConduit], when the channel is
+  /// materialised — a name's ancestry is immutable, so it is complete and final
+  /// for the life of the channel and dispatch never has to look anything up.
+  /// It is deliberately **not** a snapshot of "ancestors that happened to exist
+  /// at subscribe time": §10.3 propagates through *all* ancestor names, and a
+  /// subscriber registered before a leaf existed must still see that leaf's
+  /// future emissions at the ancestor.
+  ///
+  /// Empty under per-pipe routing, and empty for a root name (one with no
+  /// enclosure) even under hierarchical routing — §10.3: "Implementations that
+  /// do not provide it MUST behave as if per-pipe routing were always in
+  /// effect", which is exactly what an empty chain does.
+  final FsChannel < E >[] ancestors;
+
+  /// `ancestors.length != 0`, hoisted: the per-pipe path then costs one field
+  /// read instead of a field read plus an array-length load.
+  private final boolean stem;
+
+  /// The constant `cascadeDispatch` of a hierarchical channel. Held in a field
+  /// so a rebuild does not allocate a fresh method reference; null for per-pipe
+  /// channels, whose cascade dispatch is the receptor consumer itself.
+  private final Consumer < Object > stemCascade;
 
   /// The upstream pipe — what conduit.get(name) returns.
   final FsPipe < E > pipe;
 
   /// Downstream dispatch — receptors only, no STEM. Used by ingress receive()
-  /// (which adds version check + STEM externally) and by dispatchStem when
-  /// walking ancestors (must NOT trigger ancestor's STEM walk too).
+  /// (which adds the version check) and by dispatchStem when walking ancestors
+  /// (an ancestor must not trigger its own STEM walk — the chain is already
+  /// flattened, so walking again would double-deliver at every level above).
   Consumer < Object > dispatch;
 
   /// Transit-side cascade dispatch — receptors + STEM (if applicable).
   /// Submitted directly to transit by fiber/flow terminals to bypass the
-  /// version check on the cascade hot path. For non-STEM channels this is
-  /// the same reference as `dispatch`. For STEM channels it's a wrapper
-  /// that fires receptors then walks STEM.
+  /// version check on the cascade hot path. For per-pipe channels this is
+  /// the same reference as `dispatch`. For hierarchical channels it is
+  /// [#stemCascade], which fires this channel's receptors then walks the chain.
   Consumer < Object > cascadeDispatch;
 
   /// Version this channel was last built at.
@@ -64,14 +96,14 @@ final class FsChannel < E > implements Receptor < E >, Consumer < Object > {
     Subject < Pipe < E > > subject,
     FsCircuit circuit,
     FsHub < E > hub,
-    FsConduit < E > conduit,
-    Routing routing
+    FsChannel < E >[] ancestors
   ) {
     this.subject = subject;
     this.circuit = circuit;
     this.hub = hub;
-    this.conduit = conduit;
-    this.stem = routing == Routing.STEM;
+    this.ancestors = ancestors;
+    this.stem = ancestors.length != 0;
+    this.stemCascade = this.stem ? this::cascade : null;
     this.pipe = new FsPipe <> ( this, circuit );
   }
 
@@ -93,30 +125,61 @@ final class FsChannel < E > implements Receptor < E >, Consumer < Object > {
   // an ingress emission may follow a subscriber change (which is itself
   // queued in ingress order). Per §5.4.1 relation 3 + §7.6.2, no subscriber
   // change can interleave during a cascade, so transit-side dispatch goes
-  // straight to `dispatch` and skips this method entirely.
+  // straight to `cascadeDispatch` and skips this method entirely.
 
   @Override
   @jdk.internal.vm.annotation.ForceInline
   public void receive ( E emission ) {
     if ( builtVersion != hub.subscriberVersion ) rebuild ();
+    if ( stem ) {
+      dispatchStem ( emission );
+      return;
+    }
     Consumer < Object > d = dispatch;
     if ( d != null ) d.accept ( emission );
-    if ( stem ) dispatchStem ( emission );
   }
 
-  /// STEM — propagate to ancestor channels' dispatch (no version checks here;
-  /// rebuild is driven from receive() before any transit can run).
+  /// §10.3 hierarchical routing: "Emissions propagate from the target named
+  /// pipe upward through all ancestor names in the hierarchy, **leaf-first**."
+  ///
+  /// This channel's own receptors run first, then each ancestor's in
+  /// nearest-to-root order. Each ancestor is version-checked here rather than
+  /// in [#receive]: an ancestor may never have received a direct emission, so
+  /// this can be the first time its subscribers are activated (§10.2 — the
+  /// subscriber callback is invoked lazily when a named pipe receives its first
+  /// emission, and a propagated emission is that pipe's emission).
   private void dispatchStem ( E emission ) {
-    Name n = subject.name ();
-    while ( n.enclosure ().isPresent () ) {
-      n = n.enclosure ().get ();
-      FsChannel < E > ancestor = conduit.channel ( n );
-      if ( ancestor != null ) {
-        if ( ancestor.builtVersion != hub.subscriberVersion ) ancestor.rebuild ();
-        Consumer < Object > d = ancestor.dispatch;
-        if ( d != null ) d.accept ( emission );
-      }
+    deliver ( dispatch, emission );
+    FsChannel < E >[] chain = ancestors;
+    int version = hub.subscriberVersion;
+    for ( int i = 0, len = chain.length; i < len; i++ ) {
+      FsChannel < E > ancestor = chain[i];
+      if ( ancestor.builtVersion != version ) ancestor.rebuild ();
+      deliver ( ancestor.dispatch, emission );
     }
+  }
+
+  /// §15.4 #2 liveness: a receptor that throws at one level of the hierarchy
+  /// must not cost the remaining levels their delivery of the same emission.
+  /// The per-pipe path leaves this to the drain's trust boundary because there
+  /// is nothing after it to protect; a hierarchical dispatch has the rest of
+  /// the chain still to run.
+  private static void deliver ( Consumer < Object > d, Object emission ) {
+    if ( d == null ) return;
+    try {
+      d.accept ( emission );
+    } catch ( Throwable ignored ) {
+      // §15.4 #4: observability of a failed external callback is
+      // implementation-defined; continue up the chain.
+    }
+  }
+
+  /// Transit-side entry point for a hierarchical channel — [#receive] without
+  /// the version check (§5.4.1 + §7.6.2: subscriber state cannot change
+  /// mid-cascade, and this channel was rebuilt before the cascade began).
+  @SuppressWarnings ( "unchecked" )
+  private void cascade ( Object emission ) {
+    dispatchStem ( (E) emission );
   }
 
   // ─── Rebuild (cold path) ───
@@ -143,11 +206,13 @@ final class FsChannel < E > implements Receptor < E >, Consumer < Object > {
           subscriber.activate ( subject, registrar );
           subscriberReceptors.put ( subscriber, registrar.consumers () );
         } catch ( Throwable ignored ) {
-          // §15.4 + §16.1 #15: subscriber callback still counts as consumed
-          // even on throw — record empty consumer list so we never retry.
-          // Per the API doc, whether partial registrations are retained or
-          // discarded is implementation-defined; we discard for simplicity.
-          subscriberReceptors.put ( subscriber, Collections.emptyList () );
+          // §15.4 #3: "A failing subscriber callback is still considered
+          // consumed for that subscription/channel pair: registration calls
+          // completed before the failure remain registered, and the callback
+          // MUST NOT be retried for that subscription/channel pair." So keep
+          // whatever the callback managed to register before it threw — and
+          // still record an entry, which is what suppresses the retry.
+          subscriberReceptors.put ( subscriber, registrar.consumers () );
         }
       }
     }
@@ -182,19 +247,12 @@ final class FsChannel < E > implements Receptor < E >, Consumer < Object > {
       };
     }
 
-    // Build cascadeDispatch — what transit cascade terminals submit.
-    // Same as dispatch for non-STEM channels; wraps in STEM walk for STEM channels.
-    if ( stem ) {
-      final Consumer < Object > base = dispatch;
-      cascadeDispatch = v -> {
-        if ( base != null ) base.accept ( v );
-        @SuppressWarnings ( "unchecked" )
-        E e = (E) v;
-        dispatchStem ( e );
-      };
-    } else {
-      cascadeDispatch = dispatch;
-    }
+    // What transit cascade terminals submit. A hierarchical channel always
+    // publishes its stem walk, even with no receptors of its own — an ancestor
+    // may have some. A per-pipe channel publishes the receptor consumer
+    // directly, and null (no receptors) sends the terminal down its fallback
+    // path of submitting the channel itself.
+    cascadeDispatch = stem ? stemCascade : dispatch;
 
     builtVersion = hub.subscriberVersion;
   }

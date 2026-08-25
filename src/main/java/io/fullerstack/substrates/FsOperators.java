@@ -1,5 +1,7 @@
 package io.fullerstack.substrates;
 
+import io.humainary.substrates.api.Substrates;
+import io.humainary.substrates.api.Substrates.Fault;
 import io.humainary.substrates.api.Substrates.Pipe;
 import io.humainary.substrates.api.Substrates.Receptor;
 
@@ -28,6 +30,32 @@ import java.util.function.UnaryOperator;
 final class FsOperators {
 
   private FsOperators () {}
+
+  /// Package name every type produced by this provider lives in. Used by
+  /// [#foreign(Object)] to answer §15.1's provider-mismatch question without a
+  /// per-implementation `instanceof` ladder that would silently reject this
+  /// provider's own non-`FsPipe` carriers (`FsSink`'s channel pipes, say).
+  private static final String PROVIDER_PACKAGE = "io.fullerstack.substrates";
+
+  /// True when `candidate` was not produced by this provider.
+  ///
+  /// Spec §15.1 lists provider mismatch as MUST detect, naming exactly this
+  /// case: "a Cell, Pipe, Fiber, or Flow from a different provider is passed
+  /// to a composition operation (`Fiber.pipe`, `Flow.pipe`, `Flow.fiber`,
+  /// `Fiber.fiber`)". Appendix A.2 binds that to [Fault] in Java.
+  static boolean foreign ( Object candidate ) {
+    return !PROVIDER_PACKAGE.equals ( candidate.getClass ().getPackageName () );
+  }
+
+  /// Builds a fault for a receiver that carries no subject of its own.
+  ///
+  /// `Fiber`, `Flow` and `Window` are composition/temporal values, not
+  /// `Substrate`s, so none of them has a subject; §15.3's "identify the
+  /// receiver subject" is answered with the provider's cortex subject — the
+  /// nearest enclosing substrate every one of them belongs to.
+  static Fault fault ( String operation, String message ) {
+    return new Fault ( Substrates.cortex ().subject (), operation, message );
+  }
 
   /// Operator factory: takes the downstream consumer and returns a wrapping
   /// consumer. Single shared shape lets FsFiber and FsFlow store operators
@@ -178,7 +206,13 @@ final class FsOperators {
     @Override
     @SuppressWarnings ( "unchecked" )
     public void accept ( E v ) {
-      E r = op.apply ( (E) acc, v ); acc = r; d.accept ( r );
+      // Spec §6.2.3 (Reduce): "If the result is present, it is emitted; if the
+      // result is absent, the current emission is dropped and subsequent
+      // operator invocations receive absence as the accumulator until the
+      // operator returns a present value." The accumulator advances either way.
+      E r = op.apply ( (E) acc, v );
+      acc = r;
+      if ( r != null ) d.accept ( r );
     }
   }
 
@@ -230,8 +264,15 @@ final class FsOperators {
     @Override
     @SuppressWarnings ( "unchecked" )
     public void accept ( E v ) {
-      E r = op.apply ( (E) acc, v ); acc = r;
-      if ( fire.test ( r ) ) { acc = initial; d.accept ( r ); }
+      E r = op.apply ( (E) acc, v );
+      acc = r;
+      if ( fire.test ( r ) ) {
+        acc = initial;
+        // Spec §6.2.3 (Integrate): "If the fire predicate returns true for an
+        // absent state, the stage resets to the initial value but the absent
+        // output still drops the current emission."
+        if ( r != null ) d.accept ( r );
+      }
     }
   }
 
@@ -454,26 +495,85 @@ final class FsOperators {
     }
   }
 
-  /// Drop the first n emissions, then pass everything.
+  /// Refractory-period gate — spec §6.2.3 (Inhibit): "When an emission passes
+  /// through, the next `refractory` emissions reaching this operator are
+  /// suppressed. Once the refractory count is exhausted, the next emission
+  /// passes and the cycle repeats. The first emission always passes
+  /// immediately."
+  ///
+  /// Distinguished from [Skip], which the same paragraph separates it from:
+  /// Skip drops a one-off prefix and then passes everything for ever, whereas
+  /// Inhibit is a cooldown that re-arms after every pass. "The phase
+  /// difference matters when composed after event-detecting operators."
   static final class Inhibit < E > implements Consumer < E > {
-    final int            n;
+    final int            refractory;
     final Consumer < E > d;
-    int seen;
+    int remaining;
 
-    Inhibit ( int n, Consumer < E > d ) { this.n = n; this.d = d; }
+    Inhibit ( int refractory, Consumer < E > d ) { this.refractory = refractory; this.d = d; }
 
     @Override
-    public void accept ( E v ) { if ( seen < n ) seen++; else d.accept ( v ); }
+    public void accept ( E v ) {
+      if ( remaining > 0 ) { remaining--; return; }
+      // Re-armed before the successor runs: §15.4 treats a raising downstream
+      // as having dropped the emission, not as having left it un-sent, so the
+      // cooldown must already be set when user code is entered.
+      remaining = refractory;
+      d.accept ( v );
+    }
   }
 
-  /// Rolling window: combine the last `size` emissions with combiner over identity, emit running result.
+  /// Rising-edge detector — spec §6.2.3 (Pulse): "An internal `active` state
+  /// starts false. On each emission, if the predicate returns true **and the
+  /// previous state was false**, the current value is emitted and the state
+  /// becomes true; otherwise the emission is dropped and the state tracks the
+  /// current predicate result. The gate re-arms whenever the predicate returns
+  /// false — the next true reading emits again."
+  ///
+  /// A stateless [Guard] over the same predicate is a *level* detector: it
+  /// re-emits every "still true" reading. §6.2.3 contrasts Pulse with [Edge]
+  /// precisely on "retaining only a single boolean of state", which a guard
+  /// does not have.
+  static final class Pulse < E > implements Consumer < E > {
+    final Predicate < ? super E > p;
+    final Consumer < E >          d;
+    boolean active;
+
+    Pulse ( Predicate < ? super E > p, Consumer < E > d ) { this.p = p; this.d = d; }
+
+    @Override
+    public void accept ( E v ) {
+      final boolean reading = p.test ( v );
+      if ( reading && !active ) {
+        active = true;
+        d.accept ( v );
+      } else {
+        active = reading;
+      }
+    }
+  }
+
+  /// Sliding-window aggregation — spec §6.2.3 (Rolling): "Once the buffer is
+  /// full, each subsequent emission folds the entire buffer — from `identity`,
+  /// over all `size` values, **in insertion order** — through `combiner` and
+  /// emits the result **when present**. The combiner MAY return absence; the
+  /// fold continues with absence as the accumulator, and an absent final
+  /// aggregate drops the current emission. The first `size - 1` inputs are
+  /// warm-up and produce no output."
+  ///
+  /// The buffer is held in insertion order by shifting left once full rather
+  /// than by a modular write index. That is not tidiness: a ring's `[0, size)`
+  /// read order *is* insertion order until the ring wraps and is a rotation of
+  /// it afterwards, so a non-commutative combiner (concatenation, subtraction,
+  /// first-wins) silently changes answer on the `size + 1`-th input while every
+  /// commutative test still passes. The fold is O(size) per emission either
+  /// way, which §6.2.3 mandates so that non-invertible combiners work.
   static final class Rolling < E > implements Consumer < E > {
     final int                  size;
     final BinaryOperator < E > combiner;
     final E                    identity;
     final Object[]             buffer;
     final Consumer < E >       d;
-    int idx;
     int filled;
 
     Rolling ( int size, BinaryOperator < E > combiner, E identity, Consumer < E > d ) {
@@ -487,12 +587,16 @@ final class FsOperators {
     @Override
     @SuppressWarnings ( "unchecked" )
     public void accept ( E v ) {
-      buffer[idx] = v;
-      idx = ( idx + 1 ) % size;
-      if ( filled < size ) filled++;
+      if ( filled == size ) {
+        System.arraycopy ( buffer, 1, buffer, 0, size - 1 );
+        buffer[size - 1] = v;
+      } else {
+        buffer[filled++] = v;
+        if ( filled < size ) return;   // warm-up: the first size-1 inputs emit nothing
+      }
       E acc = identity;
-      for ( int i = 0; i < filled; i++ ) acc = combiner.apply ( acc, (E) buffer[i] );
-      d.accept ( acc );
+      for ( int i = 0; i < size; i++ ) acc = combiner.apply ( acc, (E) buffer[i] );
+      if ( acc != null ) d.accept ( acc );
     }
   }
 
@@ -560,12 +664,21 @@ final class FsOperators {
 
     @Override
     public void accept ( E v ) {
-      acc = combiner.apply ( acc, v );
-      filled++;
-      if ( filled == size ) {
-        d.accept ( acc );
-        acc    = identity;
+      // §6.2.3: "Tumble fires after a fixed number of inputs regardless of
+      // content", so the count advances and the batch boundary is taken before
+      // the combiner runs — a raising combiner drops its batch without shifting
+      // the batch grid for the life of the materialization.
+      if ( ++filled == size ) {
         filled = 0;
+        final E carried = acc;
+        // "if the batch fires with an absent accumulator the current emission
+        // is dropped **before the state resets** to `identity`" — so the reset
+        // is completed before user code is entered.
+        acc = identity;
+        final E r = combiner.apply ( carried, v );
+        if ( r != null ) d.accept ( r );
+      } else {
+        acc = combiner.apply ( acc, v );
       }
     }
   }

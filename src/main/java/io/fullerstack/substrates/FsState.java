@@ -16,8 +16,22 @@ import java.util.Spliterator;
 import java.util.Spliterators;
 import java.util.stream.Stream;
 
-/// An immutable collection of slots stored most-recent-first.
-/// Index 0 is the most recently added slot.
+/// An immutable collection of typed slots, stored most-recently-written first (SPEC §8.1).
+///
+/// Every write is a real **upsert**: "Writing a slot whose (name, type) matches an existing entry
+/// MUST upsert that logical entry: the new slot becomes the most recently written entry and the
+/// prior matching slot is removed" (§8.1, restated as a MUST in §16.3). The array therefore holds
+/// **at most one slot per (name, type) pair** and its length is bounded by the number of unique
+/// pairs ever written to the chain of states leading here — never by the number of writes.
+///
+/// The invariant is maintained on the write path, not recovered later by a compaction pass: a
+/// state that collapses duplicates only on demand still reports them through `stream()`,
+/// `iterator()` and `spliterator()`, and §8.1 makes those observations normative.
+///
+/// Immutability (§16.1#11) is structural: each write allocates a fresh spine and copies slot
+/// references into it, so no ancestor state can observe a descendant's write. The spine is copied
+/// rather than shared because the removal of the prior matching slot is a change in the middle of
+/// the sequence, which a shared cons-chain cannot express.
 @Provided
 final class FsState implements State {
 
@@ -27,36 +41,33 @@ final class FsState implements State {
   /// Subject.state()).
   /// Note: Cortex.state() must use create() to comply with @New annotation
   /// contract.
-  static final FsState EMPTY = new FsState ( EMPTY_ARRAY, 0 );
+  static final FsState EMPTY = new FsState ( EMPTY_ARRAY );
 
-  /// Slots in most-recent-first order. Never null, never mutated.
+  /// Slots in most-recently-written-first order, one per (name, type) pair.
+  /// Never null, never mutated, always exactly sized.
   private final Slot < ? >[] slots;
 
-  /// Number of valid elements in slots array.
-  private final int size;
-
-  /// Lazily-cached compacted slots array + size. Volatile for safe publication.
-  /// Same pattern as String.hashCode — a deterministic lazy cache that doesn't
-  /// break effective immutability. The compact() method computes this once and
-  /// returns a fresh FsState wrapping it on subsequent calls (the @New contract
-  /// requires a new instance per call, so we can't cache the FsState itself —
-  /// only the underlying array + size).
-  ///
-  /// Sentinel: if cachedCompactSlots == slots (this state's own array), it
-  /// means the state is already compact and compact() should return `this`.
-  private volatile Slot < ? >[] cachedCompactSlots;
-  private          int           cachedCompactSize;
-
   /// Private constructor.
-  private FsState ( Slot < ? >[] slots, int size ) {
+  private FsState ( Slot < ? >[] slots ) {
     this.slots = slots;
-    this.size = size;
   }
 
   /// Factory method to create new empty State - required by @New annotation
   /// contract.
   static FsState create () {
-    return new FsState ( EMPTY_ARRAY, 0 );
+    return new FsState ( EMPTY_ARRAY );
+  }
+
+  /// SPEC §8.2 slot matching: "Slot matching uses both name canonical identity (§1.2) and type
+  /// value equality (§4.5)."
+  ///
+  /// Names are interned (§16.1#4), so canonical identity is reference identity. Slot types are
+  /// class literals drawn from the fixed §8.3 set, so type *value* equality is likewise reference
+  /// identity. There is deliberately **no** `isAssignableFrom` fallback: §4.5 defines type
+  /// matching as equality, not as a subtype test, and a fallback would collapse distinct §8.3
+  /// types that share a supertype.
+  private static boolean matches ( Slot < ? > candidate, Name name, Class < ? > type ) {
+    return candidate.name () == name && candidate.type () == type;
   }
 
   @Override
@@ -66,64 +77,57 @@ final class FsState implements State {
 
   @Override
   public Spliterator < Slot < ? > > spliterator () {
-    return Arrays.spliterator ( slots, 0, size );
+    return Arrays.spliterator ( slots );
   }
 
-  /// Removed from State interface in 2.0 — kept as FsState-local utility.
-  public State compact () {
-    // Fast path: cached result from a previous call on this state.
-    // The volatile read gives us safe publication; cachedCompactSize is
-    // published through the volatile slots reference via happens-before.
-    Slot < ? >[] cached = cachedCompactSlots;
-    if ( cached != null ) {
-      // Sentinel: own slots array means "already compact, return this"
-      if ( cached == slots )
-        return this;
-      // Otherwise wrap the cached dedup'd array in a fresh FsState
-      // (@New contract requires a new instance per call).
-      return new FsState ( cached, cachedCompactSize );
-    }
-    // Cold path: compute the compaction once and memoise
-    final int len = size;
-    if ( len <= 1 ) {
-      cachedCompactSize = len;
-      cachedCompactSlots = slots; // sentinel
-      return this;
-    }
-    var result = new Slot < ? >[len];
-    int idx = 0;
-    outer:
-    for ( int i = 0; i < len; i++ ) {
-      Name name = slots[i].name ();
-      Class < ? > type = slots[i].type ();
-      for ( int j = 0; j < idx; j++ ) {
-        if ( result[j].name () == name && result[j].type () == type )
-          continue outer;
-      }
-      result[idx++] = slots[i];
-    }
-    if ( idx == len ) {
-      cachedCompactSize = len;
-      cachedCompactSlots = slots; // sentinel
-      return this;
-    }
-    cachedCompactSize = idx;
-    cachedCompactSlots = result; // volatile publish (happens-after size write)
-    return new FsState ( result, idx );
-  }
-
+  /// The §8.1 / §16.3 upsert.
+  ///
+  /// 1. §16.3: "Writing a slot whose (name, type, value) already matches the existing entry MUST
+  ///    return the same state instance." The rule is applied only when the matching entry is
+  ///    already the most recently written one — rewriting an *older* entry has to move it to the
+  ///    head (§8.1), and iteration order is observable, so that is a genuine change and MUST
+  ///    produce a new state. Value equality is the boxed `equals`, which for `Float`/`Double` is
+  ///    bitwise; without that a `NaN` slot could never satisfy the same-instance MUST.
+  /// 2. Otherwise the new slot becomes the head and any prior slot with the same (name, type) is
+  ///    *removed*, not shadowed. At most one such slot can exist, because every write maintains
+  ///    that invariant.
   private State addSlot ( Slot < ? > slot ) {
-    // Idempotent: if most recent slot has same name/type/value, return this
-    if ( size > 0
-      && slots[0].name () == slot.name ()
-      && slots[0].type () == slot.type ()
-      && Objects.equals ( slots[0].value (), slot.value () ) ) {
+    final Name        name = slot.name ();
+    final Class < ? > type = slot.type ();
+    final Slot < ? >[] src = slots;
+    final int         len  = src.length;
+
+    // (1) semantically equivalent write of the most recent entry (§16.3, §16.1#11)
+    if ( len > 0
+      && matches ( src[0], name, type )
+      && Objects.equals ( src[0].value (), slot.value () ) ) {
       return this;
     }
-    var arr = new Slot < ? >[size + 1];
+
+    // (2) locate the prior entry for this (name, type) pair, if any
+    int prior = -1;
+    for ( int i = 0; i < len; i++ ) {
+      if ( matches ( src[i], name, type ) ) {
+        prior = i;
+        break;
+      }
+    }
+
+    if ( prior < 0 ) {
+      // a new (name, type) pair: prepend, keeping every existing slot
+      var arr = new Slot < ? >[len + 1];
+      arr[0] = slot;
+      System.arraycopy ( src, 0, arr, 1, len );
+      return new FsState ( arr );
+    }
+
+    // an upsert: the new slot leads, the prior matching slot is dropped, and the
+    // relative order of every other slot is preserved
+    var arr = new Slot < ? >[len];
     arr[0] = slot;
-    System.arraycopy ( slots, 0, arr, 1, size );
-    return new FsState ( arr, size + 1 );
+    System.arraycopy ( src, 0, arr, 1, prior );
+    System.arraycopy ( src, prior + 1, arr, prior + 1, len - prior - 1 );
+    return new FsState ( arr );
   }
 
   @New ( conditional = true )
@@ -218,61 +222,24 @@ final class FsState implements State {
 
   @Override
   public Stream < Slot < ? > > stream () {
-    return Arrays.stream ( slots, 0, size );
+    return Arrays.stream ( slots );
   }
 
-  /// Type-match check: == for exact match (common case, avoids reflective call),
-  /// fall back to isAssignableFrom for subtypes.
-  private static boolean typeMatches ( Class < ? > target, Class < ? > actual ) {
-    return target == actual || target.isAssignableFrom ( actual );
-  }
-
+  /// SPEC §16.3: "The `value` operation returns the value of the slot matching the given slot's
+  /// (name, type) pair, or the template slot's own value when no match exists." Upsert makes the
+  /// match unique, so the first hit is the only hit.
   @Override
   @SuppressWarnings ( "unchecked" )
   public < T > T value ( Slot < T > slot ) {
-    Name targetName = slot.name ();
-    Class < T > targetType = slot.type ();
-    for ( int i = 0; i < size; i++ ) {
-      if ( slots[i].name () == targetName && typeMatches ( targetType, slots[i].type () ) ) {
-        return (T) slots[i].value ();
+    final Name        name = slot.name ();
+    final Class < T > type = slot.type ();
+    final Slot < ? >[] src = slots;
+    for ( int i = 0; i < src.length; i++ ) {
+      if ( matches ( src[i], name, type ) ) {
+        return (T) src[i].value ();
       }
     }
     return slot.value ();
-  }
-
-  /// Cached values() result for a single (slot → matches) binding.
-  /// Saves the filter loop on repeated calls with the same slot argument.
-  private volatile Slot < ? > cachedValuesSlot;
-  private          Object[]   cachedValuesMatches;
-  private          int        cachedValuesCount;
-
-  /// Removed from State interface in 2.0 — kept as FsState-local utility.
-  @SuppressWarnings ( "unchecked" )
-  public < T > Stream < T > values ( Slot < ? extends T > slot ) {
-    Objects.requireNonNull ( slot, "slot must not be null" );
-    // Fast path: if same slot as last call, reuse the cached matches array.
-    // Returns a fresh Stream (streams aren't reusable), backed by the same data.
-    if ( slot == cachedValuesSlot ) {
-      int c = cachedValuesCount;
-      if ( c == 0 ) return Stream.empty ();
-      return (Stream < T >) Arrays.stream ( cachedValuesMatches, 0, c );
-    }
-    // Cold path: filter and cache
-    Name targetName = slot.name ();
-    Class < ? extends T > targetType = slot.type ();
-    Object[] matches = new Object[size];
-    int idx = 0;
-    for ( int i = 0; i < size; i++ ) {
-      if ( slots[i].name () == targetName && typeMatches ( targetType, slots[i].type () ) ) {
-        matches[idx++] = slots[i].value ();
-      }
-    }
-    cachedValuesCount   = idx;
-    cachedValuesMatches = matches;
-    cachedValuesSlot    = slot; // volatile publish (happens-after count + matches)
-    if ( idx == 0 )
-      return Stream.empty ();
-    return (Stream < T >) Arrays.stream ( matches, 0, idx );
   }
 
 }

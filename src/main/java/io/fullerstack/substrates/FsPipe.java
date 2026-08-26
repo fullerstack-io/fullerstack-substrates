@@ -109,11 +109,10 @@ public final class FsPipe < E > implements Pipe < E > {
   /// Cascade priority is the spec's mechanism for ensuring effects of an emission
   /// resolve before the next external input is processed.
   @Override
-  @jdk.internal.vm.annotation.ForceInline
   public void emit ( @NotNull E emission ) {
     requireNonNull ( emission, "emission must not be null" );
     if ( circuit.closed ) return;
-    if ( cortex ().current () == circuit.current () ) {
+    if ( circuit.onWorker () ) {
       circuit.submitTransit ( receiver, emission );
     } else {
       circuit.submitIngress ( receiver, emission );

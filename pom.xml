@@ -167,8 +167,6 @@
           <target>${java.version}</target>
           <compilerArgs>
             <arg>--enable-preview</arg>
-            <arg>--add-exports</arg>
-            <arg>java.base/jdk.internal.vm.annotation=ALL-UNNAMED</arg>
           </compilerArgs>
         </configuration>
       </plugin>
@@ -180,7 +178,6 @@
           <argLine>
             --enable-preview
             -XX:+EnableDynamicAgentLoading
-            -XX:-RestrictContended
             -Dnet.bytebuddy.experimental=true
             --add-opens java.base/java.lang=ALL-UNNAMED
             --add-opens java.base/java.util=ALL-UNNAMED

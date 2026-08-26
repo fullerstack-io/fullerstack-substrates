@@ -128,7 +128,6 @@ final class FsChannel < E > implements Receptor < E >, Consumer < Object > {
   // straight to `cascadeDispatch` and skips this method entirely.
 
   @Override
-  @jdk.internal.vm.annotation.ForceInline
   public void receive ( E emission ) {
     if ( builtVersion != hub.subscriberVersion ) rebuild ();
     if ( stem ) {

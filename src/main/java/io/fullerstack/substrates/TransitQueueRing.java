@@ -34,7 +34,6 @@ final class TransitQueueRing {
   private int              head;
   private int              tail;
 
-  @jdk.internal.vm.annotation.ForceInline
   void enqueue ( Consumer < Object > receiver, Object value ) {
     int i = tail & mask;
     receivers[i] = receiver;
@@ -62,12 +61,10 @@ final class TransitQueueRing {
     tail = n;
   }
 
-  @jdk.internal.vm.annotation.ForceInline
   boolean hasWork () {
     return head != tail;
   }
 
-  @jdk.internal.vm.annotation.ForceInline
   @SuppressWarnings ( "unchecked" )
   boolean drain () {
     if ( head == tail ) return false;

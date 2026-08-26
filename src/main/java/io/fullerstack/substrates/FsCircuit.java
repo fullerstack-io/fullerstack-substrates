@@ -94,9 +94,16 @@ public final class FsCircuit implements Circuit {
   private final Subject < Circuit > subject;
   private final Thread              worker;
 
-  /// 2.4: lazily-initialised Current for this circuit's execution context.
-  /// Must remain stable for the circuit's lifetime (spec §11.3).
-  private volatile Current circuitCurrent;
+  /// This circuit's execution context, stable for its lifetime (spec §11.3).
+  ///
+  /// Constructed eagerly rather than lazily: [#workerLoop] calls [#current] as its
+  /// first act and the worker starts in the constructor, so a lazy holder is forced
+  /// microseconds later for every circuit and can never save the allocation. It only
+  /// cost — a volatile read per call, and a 76-byte accessor that missed
+  /// `MaxInlineSize` at colder call sites. `cortex().current() == circuit.current()`
+  /// runs on every emission (see FsPipe.emit and the guards below), where it measured
+  /// 16.9% of the profile.
+  private final Current circuitCurrent;
 
   /// 2.8: lazily-initialised scheduler shared by all Tickers on this circuit
   /// (spec §11.5). Single-thread daemon — tick callbacks just submit emissions
@@ -262,6 +269,11 @@ public final class FsCircuit implements Circuit {
     this.awaitMarkerReceiver = new AwaitMarker ( this );
     this.closeMarkerReceiver = new CloseMarker ( this );
 
+    // Assigned before w.start() below, so the worker's own current() call sees it:
+    // Thread.start() happens-before everything the started thread runs.
+    this.circuitCurrent = new FsCurrent (
+      new FsSubject <> ( subject.name (), (FsSubject < ? >) subject, Current.class ) );
+
     // Create the worker unstarted, bind this circuit's Current to it, then start.
     //
     // §5.7: the worker thread's Current IS this circuit's Current, so that
@@ -285,7 +297,6 @@ public final class FsCircuit implements Circuit {
    * Fire-and-forget: just enqueue, no worker wake-up.
    * Worker self-wakes via timed park — producers never pay unpark cost.
    */
-  @jdk.internal.vm.annotation.ForceInline
   final void submitIngress ( Consumer < Object > receiver, Object value ) {
     ingress.enqueue ( receiver, value );
   }
@@ -294,7 +305,6 @@ public final class FsCircuit implements Circuit {
    * Submit cascade emission from worker thread to transit queue.
    * Single-threaded — uses shared QChunk buffer for zero-allocation transit.
    */
-  @jdk.internal.vm.annotation.ForceInline
   final void submitTransit ( Consumer < Object > receiver, Object value ) {
     transit.enqueue ( receiver, value );
   }
@@ -310,9 +320,8 @@ public final class FsCircuit implements Circuit {
    * transit ring is single-threaded, so routing a foreign-thread emission into
    * it is a data race, not merely a lost emission.
    */
-  @jdk.internal.vm.annotation.ForceInline
   final void submit ( Consumer < Object > receiver, Object value ) {
-    if ( cortex.current () == current () ) {
+    if ( onWorker () ) {
       transit.enqueue ( receiver, value );
     } else {
       ingress.enqueue ( receiver, value );
@@ -323,7 +332,6 @@ public final class FsCircuit implements Circuit {
    * Returns true if transit queue has pending cascade work.
    * Plain field read — single-threaded, no volatile needed.
    */
-  @jdk.internal.vm.annotation.ForceInline
   boolean transitHasWork () {
     return transit.hasWork ();
   }
@@ -331,7 +339,6 @@ public final class FsCircuit implements Circuit {
   /**
    * Drain all queued cascade emissions. Delegates to TransitQueueRing.
    */
-  @jdk.internal.vm.annotation.ForceInline
   boolean drainTransit () {
     return transit.drain ();
   }
@@ -341,7 +348,6 @@ public final class FsCircuit implements Circuit {
    * Splits the call site so the hot path {@code r.accept(v)} only
    * ever sees regular ReceptorAdapters — monomorphic, no class_check traps.
    */
-  @jdk.internal.vm.annotation.ForceInline
   boolean isMarker ( Consumer < Object > r ) {
     return r == awaitMarkerReceiver || r == closeMarkerReceiver;
   }
@@ -354,6 +360,42 @@ public final class FsCircuit implements Circuit {
     marker.accept ( value );
   }
 
+
+  /// True when the calling thread is this circuit's execution context.
+  ///
+  /// It exists so the worker `Thread` never leaves this class, and so the §5.3 routing
+  /// decision has exactly one definition rather than a hand-copied branch per call site.
+  ///
+  /// **Why the thread and not `cortex.current() == current()`.** That literal form is what
+  /// §11.3 writes, and both were tried here. They are the same predicate: §5.7 requires this
+  /// circuit's `Current` to BE its worker's — `workerLoop` binds `circuitCurrent` to this
+  /// thread and nothing else ever binds it — so the tokens compare equal exactly when the
+  /// threads do. §11.3 settles which to use: the mechanism "is not specified; only the
+  /// identity and temporal guarantees are REQUIRED", and it names `Thread.currentThread()`
+  /// as the Java one. The ThreadLocal stays as the storage that hands tokens to callers,
+  /// who cannot know which thread the worker is.
+  ///
+  /// **The cost it avoids** (perfasm, 2026-08-26, on the padded build): the literal form is
+  /// six dependent loads — ThreadLocal -> `t.threadLocals` -> `map.table` -> hash & mask ->
+  /// `table[i]` -> weak-reference check -> `e.value` — measuring 16.9% of the emission
+  /// profile. This is one register read and one field load.
+  ///
+  /// An earlier A/B found the literal form free. That was measured before the false-sharing
+  /// fix, when those loads issued in the shadow of a `lock xadd` stalled on a contended
+  /// cache line. The stall is now roughly half as long and the cost is exposed; that
+  /// measurement no longer applies.
+  ///
+  /// The thread form is also the more robust of the two: it answers correctly even before
+  /// the worker has bound its `Current`, a window the literal form would report as "not on
+  /// the circuit". Nothing reaches it today — the bind is `workerLoop`'s first statement —
+  /// but the asymmetry is worth knowing.
+  ///
+  /// A final method on a final class reading one field: 16 bytes, well under `MaxInlineSize`,
+  /// so the JIT inlines it to the same compare a hand-written branch would produce. That was
+  /// verified as bytecode, not assumed.
+  final boolean onWorker () {
+    return Thread.currentThread () == worker;
+  }
 
   // ─────────────────────────────────────────────────────────────────────────────
   // Worker Loop - FIFO depth-first processing with spin-before-park
@@ -433,21 +475,7 @@ public final class FsCircuit implements Circuit {
   @NotNull
   @Override
   public Current current () {
-    Current c = circuitCurrent;
-    if ( c == null ) {
-      synchronized ( this ) {
-        c = circuitCurrent;
-        if ( c == null ) {
-          FsSubject < Current > cs = new FsSubject <> (
-            subject.name (),
-            (FsSubject < ? >) subject,
-            Current.class );
-          c = new FsCurrent ( cs );
-          circuitCurrent = c;
-        }
-      }
-    }
-    return c;
+    return circuitCurrent;
   }
 
   @Override

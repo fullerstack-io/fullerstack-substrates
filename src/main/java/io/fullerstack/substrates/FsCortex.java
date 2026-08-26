@@ -77,9 +77,19 @@ final class FsCortex implements Cortex {
   }
 
   /// Gets or creates the Current for the current thread.
+  ///
+  /// The minting path lives in [#mintCurrent] so that this method stays small
+  /// enough to inline at any call site. Inlined together they measured 97
+  /// bytes, well past the 35-byte `MaxInlineSize` that applies wherever the
+  /// call is not hot enough to earn the `FreqInlineSize` budget — and this is
+  /// read on every emission, via `cortex().current()`.
   private FsCurrent getOrCreateCurrent () {
     final FsCurrent cached = current.get ();
-    if ( cached != null ) return cached;
+    return cached != null ? cached : mintCurrent ();
+  }
+
+  /// Mints and caches this thread's Current. Runs once per thread.
+  private FsCurrent mintCurrent () {
     final Thread t = Thread.currentThread ();
     String threadName = t.getName ();
     // Handle empty thread names (common with virtual threads)

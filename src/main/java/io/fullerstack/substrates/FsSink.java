@@ -135,7 +135,7 @@ public final class FsSink < E > implements Sink < E > {
       // the worker's thread context otherwise; we explicitly substitute
       // circuit.current() on the cascade path so it coincides with the
       // circuit identity as the spec requires.
-      Subject < Current > current = cortex ().current () == circuit.current ()
+      Subject < Current > current = circuit.onWorker ()
         ? circuit.current ().subject ()
         : cortex ().current ().subject ();
       State state = cortex ().state ();

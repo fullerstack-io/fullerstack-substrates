@@ -27,7 +27,7 @@ import java.util.function.UnaryOperator;
 /// and may be materialised against multiple pipes, each materialisation producing
 /// independent state.
 ///
-/// Operators are stored in an immutable `Wrap[]` (factory functions). Materialise
+/// Operators are held as an immutable [Recipe] (a tree of factory functions). Materialise
 /// (via `pipe(Pipe<E>)`) walks the array front-to-back, wrapping the target pipe's
 /// receiver with each operator. Operator implementations live in {@link FsOperators}.
 @Provided
@@ -37,49 +37,39 @@ public final class FsFiber < E > implements Fiber < E > {
   // Immutable state
   // ─────────────────────────────────────────────────────────────────────────────
 
-  private static final Wrap < ? >[] EMPTY = new Wrap < ? >[0];
-
-  private final Wrap < ? >[] operators;
-  private final int          count;
+  /// The wiring plan. Immutable and structurally shared — see [Recipe].
+  private final Recipe recipe;
 
   /// Identity fiber — no operators.
   public FsFiber () {
-    this.operators = EMPTY;
-    this.count     = 0;
+    this.recipe = Recipe.EMPTY;
   }
 
-  private FsFiber ( Wrap < ? >[] operators, int count ) {
-    this.operators = operators;
-    this.count     = count;
+  private FsFiber ( Recipe recipe ) {
+    this.recipe = recipe;
   }
 
-  /// Returns a new fiber with the given operator appended.
+  /// Returns a new fiber with the given operator composed after this one's. O(1).
   private FsFiber < E > append ( Wrap < E > op ) {
-    Wrap < ? >[] newOps = new Wrap < ? >[count + 1];
-    System.arraycopy ( operators, 0, newOps, 0, count );
-    newOps[count] = op;
-    return new FsFiber <> ( newOps, count + 1 );
+    return new FsFiber <> ( recipe.then ( op ) );
   }
 
   /// Materialise this fiber into a concrete consumer chain that delivers to `target`.
   /// Each call produces independent state for stateful operators.
   ///
-  /// operators[0] = first-added = outermost (closest to input, applied first)
-  /// operators[n-1] = last-added = innermost (closest to target, applied last)
+  /// The first-composed operator ends up outermost and sees each value first, so runtime data
+  /// flow matches the user's reading order per SPEC §6.2.5. [Recipe] holds the plan
+  /// newest-first, which is exactly the order that wiring consumes.
   ///
-  /// Iterate from high to low so the last-added op wraps target first
-  /// (innermost) and the first-added op ends up outermost. Runtime data
-  /// flow then matches user reading order per SPEC §6.2.5.
-  @SuppressWarnings ( { "unchecked", "rawtypes" } )
+  /// No subject is threaded: a fiber's plan cannot contain a per-attachment factory, because
+  /// the `Fiber` API has no operator that takes one.
+  @SuppressWarnings ( "unchecked" )
   Consumer < E > materialise ( Consumer < E > target ) {
-    Consumer c = target;
-    for ( int i = count - 1; i >= 0; i-- ) c = ( (Wrap) operators[i] ).wrap ( c );
-    return c;
+    return (Consumer < E >) (Consumer < ? >) recipe.wire ( (Consumer < Object >) target );
   }
 
-  /// Internal accessors used by FsFlow when inlining a fiber as a stage.
-  Wrap < ? >[] operators () { return operators; }
-  int operatorCount () { return count; }
+  /// Internal accessor used by FsFlow when composing a fiber into a flow.
+  Recipe recipe () { return recipe; }
 
   // ─────────────────────────────────────────────────────────────────────────────
   // Composition with a pipe
@@ -131,7 +121,7 @@ public final class FsFiber < E > implements Fiber < E > {
     }
     // Empty fiber elision — no operators means nothing to do. Returning
     // target directly skips the transit hop that wraps a no-op chain.
-    if ( count == 0 ) return (Pipe < E >) target;
+    if ( recipe.isEmpty () ) return (Pipe < E >) target;
     final Consumer < E > chain;
     if ( target instanceof FsPipe < ? > fp ) {
       final FsCircuit c = fp.circuit ();
@@ -437,14 +427,9 @@ public final class FsFiber < E > implements Fiber < E > {
       // §15.1 provider mismatch, MUST detect; Appendix A.2 binds it to Fault.
       throw FsOperators.fault ( "fiber", "next fiber is not from this runtime provider" );
     }
-    if ( nextFiber.count == 0 ) return this;
-    Wrap < ? >[] merged = new Wrap < ? >[count + nextFiber.count];
-    // FIXED convention: low index = outermost = first applied to input.
-    // this.fiber(next) reads "this then next" — so this goes first (low),
-    // next goes last (high = innermost = applied last just before target).
-    System.arraycopy ( operators, 0, merged, 0, count );
-    System.arraycopy ( nextFiber.operators, 0, merged, count, nextFiber.count );
-    return new FsFiber <> ( merged, count + nextFiber.count );
+    // `this.fiber(next)` reads "this then next", so next is composed after this one's plan
+    // and ends up innermost — applied last, just before the target.
+    return new FsFiber <> ( recipe.then ( nextFiber.recipe ) );
   }
 
   @NotNull
@@ -558,7 +543,7 @@ public final class FsFiber < E > implements Fiber < E > {
     }
     // Empty sub-fiber → matched path is identity (= downstream) → both branches
     // pass-through unchanged → this stage is a no-op.
-    if ( sub.count == 0 ) return this;
+    if ( sub.recipe.isEmpty () ) return this;
     return append ( d -> new FsOperators.When <> ( predicate, sub, d ) );
   }
 }

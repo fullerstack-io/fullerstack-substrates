@@ -12,13 +12,12 @@ import java.util.function.Consumer;
 /// can observe a node. So the chain is built once, grown on demand to the
 /// deepest cascade seen, and then reused. No atomics, no memory ordering.
 ///
-/// It deliberately does **not** reuse [Job]. Ingress jobs are immutable and
-/// allocated per emission — they cannot be recycled at all — while these must be
-/// overwritten, which is the whole point. Sharing a node type across the two
-/// queues has cost us twice already: the original `TransitQueue` shared
-/// [QChunk] and paid a `StoreLoad` fence per overflow link because `QChunk.next`
-/// must be volatile for the MPSC queue, and `Job.next` was volatile for
-/// [JobQueue]'s benefit until that fence was measured at ~13% of a profile.
+/// It shares [Job] with [JobQueue]. That was once thought unsafe — the original `TransitQueue`
+/// shared a chunk type with the ingress queue and paid a `StoreLoad` fence per overflow link.
+/// But the cause there was a **`volatile` declaration**, which forces its cost on every user of
+/// the type. `Job.next` is a plain field and both queues take their ordering from the access
+/// site: release/acquire on ingress, plain reads here. Nothing is forced on anyone, so one
+/// carrier serves both and the recycling policy stays where it belongs — in the queue.
 ///
 /// **Measured against [TransitQueueRing]** — 4 interleaved reps, 5 forks,
 /// `-prof gc`, all TCK-green:
@@ -39,22 +38,16 @@ import java.util.function.Consumer;
 /// comparison that is not noise.
 final class TransitJobQueue {
 
-  private static final class Node {
-    Consumer < Object > receiver;
-    Object              value;
-    Node                next;      // permanent chain link; never unlinked
-  }
+  private final Job first = new Job ();
 
-  private final Node first = new Node ();
-
-  private Node writeNode = first;   // next node to fill
-  private Node readNode  = first;   // next node to dispatch
+  private Job writeNode = first;   // next node to fill
+  private Job readNode  = first;   // next node to dispatch
 
   void enqueue ( Consumer < Object > receiver, Object value ) {
-    final Node n = writeNode;
+    final Job n = writeNode;
     n.receiver = receiver;
     n.value    = value;
-    final Node next = n.next;
+    final Job next = n.next;
     if ( next == null ) { grow ( n ); return; }
     writeNode = next;
   }
@@ -71,8 +64,8 @@ final class TransitJobQueue {
   /// whose extraction cost `SinkOps` 3.6 ns, this one runs once per
   /// cascade-depth for the entire life of the circuit: after the deepest cascade
   /// ever seen, it is never reached again.
-  private void grow ( final Node tail ) {
-    final Node fresh = new Node ();
+  private void grow ( final Job tail ) {
+    final Job fresh = new Job ();
     tail.next = fresh;
     writeNode = fresh;
   }
@@ -84,7 +77,7 @@ final class TransitJobQueue {
   boolean drain () {
     if ( readNode == writeNode ) return false;
     do {
-      final Node n = readNode;
+      final Job n = readNode;
       final Consumer < Object > r = n.receiver;
       final Object              v = n.value;
       n.receiver = null;            // clear for GC — the node itself is retained

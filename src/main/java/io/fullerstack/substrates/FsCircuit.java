@@ -72,7 +72,26 @@ public final class FsCircuit implements Circuit {
   /// (shallow cyclic_emit_await regresses 10ns/op), 1000 catches the marker, 5000+ wastes
   /// ~3ns/op on deep-cascade awaits whose 140µs the spin can never catch anyway. Real
   /// awaits are rare — tests, shutdown, bridges — so the spin cost is negligible.
-  private static final int AWAIT_SPIN_COUNT = 1_000;
+  /// Iterations of `Thread.onSpinWait` before `await` parks.
+  ///
+  /// Tuned by sweep, and the shape is a cliff rather than a slope: 500 falls below it
+  /// (shallow `cyclic_emit_await` regresses 10ns/op), 1000 catches the marker, 5000+ wastes
+  /// ~3ns/op on deep-cascade awaits whose 140µs the spin can never catch anyway. Real
+  /// awaits are rare — tests, shutdown, bridges — so the spin cost is negligible.
+  ///
+  /// **What that sweep could not see.** It measured elapsed time on an otherwise idle box,
+  /// where the awaiter and the worker each hold a core and a spin is free. It does not measure
+  /// CPU *consumed*: behind a backlog the spin can never catch the marker, so it burns a core
+  /// for its whole duration — ~20-26µs on Zen 3, where `pause` is around 65 cycles — and
+  /// competes with the very worker that will release it. perfasm put `awaitImpl` at 22% of the
+  /// samples in a fanout batch and 10-23% across the batch families.
+  ///
+  /// Both readings are correct and they do not conflict: the spin costs no wall-clock when a
+  /// core is free, and costs a core when one is not. It is left at the swept value, and made
+  /// overridable via `io.fullerstack.substrates.await.spin` so the two can be measured against
+  /// each other in one binary rather than argued about.
+  private static final int AWAIT_SPIN_COUNT =
+    Integer.getInteger ( "io.fullerstack.substrates.await.spin", 1_000 );
 
   /// Bounded park on the slow path, so a close racing an await is observed without the
   /// awaiter having registered itself anywhere.

@@ -166,11 +166,21 @@ final class FsWindow < E > implements Window < E > {
   }
 
   /// Encounter-order accessor.
+  ///
+  /// The physical index is taken modulo the buffer, which is why every buffer handed to this
+  /// type MUST have a power-of-two length (`FsFlow.physical`). Two reasons, and the second is
+  /// the one that pays: a ring-backed window presents a `start` that wraps, so the modulo is
+  /// load-bearing there; and on every backing strategy the masked index is *provably* within
+  /// the array, so C2 drops the bounds check it cannot drop for a bare `start + idx`.
+  ///
+  /// `buffer.length` is not an extra load — the bounds check needs the array length anyway,
+  /// so the mask reuses a value already in a register.
   private E at ( int idx ) {
+    final int mask = buffer.length - 1;
     if ( reversed ) {
-      return (E) buffer[ start + length - 1 - idx ];
+      return (E) buffer[ ( start + length - 1 - idx ) & mask ];
     }
-    return (E) buffer[ start + idx ];
+    return (E) buffer[ ( start + idx ) & mask ];
   }
 
   // ─── Terminal operations ──────────────────────────────────────────────────

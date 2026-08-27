@@ -86,24 +86,43 @@ public final class FsFlow < I, O > implements Flow < I, O > {
 
     @Override
     public Consumer < Object > wrap ( Consumer < Object > downstream ) {
-      final Object[] slot = { initial.get () };
-      return v -> {
-        Object prev = slot[ 0 ];
-        Object next;
-        try {
-          next = step.apply ( prev, v );
-        } catch ( RuntimeException re ) {
-          return;   // state unchanged, drop emission
-        }
-        slot[ 0 ] = next;
-        Object projection;
-        try {
-          projection = emit.apply ( next );
-        } catch ( RuntimeException re ) {
-          return;   // state already advanced; drop this emission
-        }
-        if ( projection != null ) downstream.accept ( projection );
-      };
+      return new ScanState ( initial.get (), step, emit, downstream );
+    }
+  }
+
+  /// The materialised scan stage.
+  static final class ScanState implements Consumer < Object > {
+    private final BiFunction < Object, Object, Object > step;
+    private final Function < Object, Object >           emit;
+    private final Consumer < Object >                   d;
+    private       Object                                state;
+
+    ScanState ( Object initial,
+                BiFunction < Object, Object, Object > step,
+                Function < Object, Object > emit,
+                Consumer < Object > d ) {
+      this.state = initial;
+      this.step  = step;
+      this.emit  = emit;
+      this.d     = d;
+    }
+
+    @Override
+    public void accept ( Object v ) {
+      final Object next;
+      try {
+        next = step.apply ( state, v );
+      } catch ( RuntimeException raised ) {
+        return;                     // state unchanged, drop emission
+      }
+      state = next;
+      final Object projection;
+      try {
+        projection = emit.apply ( next );
+      } catch ( RuntimeException raised ) {
+        return;                     // state already advanced; drop this emission
+      }
+      if ( projection != null ) d.accept ( projection );
     }
   }
 
@@ -125,24 +144,43 @@ public final class FsFlow < I, O > implements Flow < I, O > {
 
     @Override
     public Consumer < Object > wrap ( Consumer < Object > downstream ) {
-      final Object[] slot = { initial.get () };
-      return v -> {
-        Object prev = slot[ 0 ];
-        Object next;
-        try {
-          next = step.apply ( prev, v );
-        } catch ( RuntimeException re ) {
-          return;
-        }
-        slot[ 0 ] = next;
-        Object projection;
-        try {
-          projection = emit.apply ( next, v );
-        } catch ( RuntimeException re ) {
-          return;
-        }
-        if ( projection != null ) downstream.accept ( projection );
-      };
+      return new ScanInputAware ( initial.get (), step, emit, downstream );
+    }
+  }
+
+  /// The materialised input-aware scan stage.
+  static final class ScanInputAware implements Consumer < Object > {
+    private final BiFunction < Object, Object, Object > step;
+    private final BiFunction < Object, Object, Object > emit;
+    private final Consumer < Object >                   d;
+    private       Object                                state;
+
+    ScanInputAware ( Object initial,
+                     BiFunction < Object, Object, Object > step,
+                     BiFunction < Object, Object, Object > emit,
+                     Consumer < Object > d ) {
+      this.state = initial;
+      this.step  = step;
+      this.emit  = emit;
+      this.d     = d;
+    }
+
+    @Override
+    public void accept ( Object v ) {
+      final Object next;
+      try {
+        next = step.apply ( state, v );
+      } catch ( RuntimeException raised ) {
+        return;
+      }
+      state = next;
+      final Object projection;
+      try {
+        projection = emit.apply ( next, v );
+      } catch ( RuntimeException raised ) {
+        return;
+      }
+      if ( projection != null ) d.accept ( projection );
     }
   }
 
@@ -164,7 +202,9 @@ public final class FsFlow < I, O > implements Flow < I, O > {
 
     @Override
     public Consumer < Object > wrap ( Consumer < Object > downstream ) {
-      final Object[] buffer = new Object[ count ];
+      // Power-of-two physical length: `FsWindow.at` masks with `buffer.length - 1`. The
+      // logical capacity is still `count`; only the slab is rounded up.
+      final Object[] buffer = new Object[ FsWindows.physical ( count ) ];
       final int[]    sizeRef = { 0 };   // current valid length
       // §6.4.1 temporal lease, per materialization — see FsWindow.Lease.
       final FsWindow.Lease lease = new FsWindow.Lease ();
@@ -210,7 +250,8 @@ public final class FsFlow < I, O > implements Flow < I, O > {
 
     @Override
     public Consumer < Object > wrap ( Consumer < Object > downstream ) {
-      final Object[] values = new Object[ capacity ];
+      // `values` reaches FsWindow, so it takes the power-of-two length; `times` never does.
+      final Object[] values = new Object[ FsWindows.physical ( capacity ) ];
       final long[]   times  = new long[ capacity ];
       // tracked as a contiguous [0..length) range
       final int[]    sizeRef = { 0 };
@@ -250,171 +291,44 @@ public final class FsFlow < I, O > implements Flow < I, O > {
   // Immutable state
   // ═══════════════════════════════════════════════════════════════════════════
 
-  private static final Wrap < ? >[]        EMPTY             = new Wrap < ? >[0];
-  private static final FactoryEntry[]      NO_FACTORIES      = null;
-  private static final FlowFactoryEntry[]  NO_FLOW_FACTORIES = null;
-
-  private final Wrap < ? >[]           operators;
-  private final int                    count;
-  /// 2.4 per-attachment fiber factories. Null in common case (no
-  /// `fiber(Function)` call). Each entry records the value of `count` at
-  /// the time the factory was added; at `pipe(target)` time the factory is
-  /// invoked once with `target.subject()` and the resulting fiber's
-  /// operators are inlined at that recorded position.
-  private final FactoryEntry[]         factories;
-  /// 2.6 per-attachment flow factories. Same idea as factories but the
-  /// produced value is a Flow (which itself has operators and may have
-  /// its own factories — these are recursively resolved against the same
-  /// target subject when this flow is materialised).
-  private final FlowFactoryEntry[]     flowFactories;
-
-  /// Records a per-attachment fiber factory and its insertion position.
-  private record FactoryEntry(
-    int position,
-    Function < ? super Subject < ? >, ? extends Fiber < ? > > factory
-  ) { }
-
-  /// Records a per-attachment flow factory and its insertion position.
-  private record FlowFactoryEntry(
-    int position,
-    Function < ? super Subject < ? >, ? extends Flow < ?, ? > > factory
-  ) { }
+  /// The wiring plan. Immutable and structurally shared — see [Recipe].
+  ///
+  /// This replaces four fields: an operator array, its length, and two arrays of positioned
+  /// per-attachment factories. A factory is now just a [Recipe.Deferred] node sitting where it
+  /// was composed, so there is no position to record and nothing to splice.
+  private final Recipe recipe;
 
   /// Identity flow — no operators.
   public FsFlow () {
-    this.operators     = EMPTY;
-    this.count         = 0;
-    this.factories     = NO_FACTORIES;
-    this.flowFactories = NO_FLOW_FACTORIES;
+    this.recipe = Recipe.EMPTY;
   }
 
-  private FsFlow ( Wrap < ? >[] operators, int count,
-                   FactoryEntry[] factories,
-                   FlowFactoryEntry[] flowFactories ) {
-    this.operators     = operators;
-    this.count         = count;
-    this.factories     = factories;
-    this.flowFactories = flowFactories;
+  private FsFlow ( Recipe recipe ) {
+    this.recipe = recipe;
   }
 
-  /// Backwards-compatible constructor (no flow factories).
-  private FsFlow ( Wrap < ? >[] operators, int count, FactoryEntry[] factories ) {
-    this ( operators, count, factories, NO_FLOW_FACTORIES );
-  }
-
-  /// Returns a new FsFlow with the given operator appended.
+  /// Returns a new FsFlow with the given operator composed after this one's. O(1).
   @SuppressWarnings ( "unchecked" )
   private < X, Y > FsFlow < X, Y > append ( Wrap < ? > op ) {
-    Wrap < ? >[] newOps = new Wrap < ? >[count + 1];
-    System.arraycopy ( operators, 0, newOps, 0, count );
-    newOps[count] = op;
-    return new FsFlow <> ( newOps, count + 1, factories, flowFactories );
+    return (FsFlow < X, Y >) (FsFlow < ?, ? >) new FsFlow <> ( recipe.then ( op ) );
   }
+
+  /// Internal accessor used when one flow is composed into another.
+  Recipe recipe () { return recipe; }
 
   // ═══════════════════════════════════════════════════════════════════════════
   // Materialisation
   // ═══════════════════════════════════════════════════════════════════════════
 
-  /// Materialises this flow into a concrete consumer chain.
-  /// Each call produces independent state for stateful operators.
+  /// Builds this flow's consumer chain for one attachment, terminating at `downstream`.
   ///
-  /// operators[0] = first-added = outermost (closest to input, applied first)
-  /// operators[n-1] = last-added = innermost (closest to target, applied last)
-  ///
-  /// Iterating from highest to lowest index wraps the last-added op around
-  /// target first (making it innermost) and the first-added op last (making
-  /// it outermost). Runtime data flow then matches the user's left-to-right
-  /// reading order per SPEC §6.2.5.
-  @SuppressWarnings ( { "unchecked", "rawtypes" } )
-  Consumer < I > materialise ( Consumer < O > target ) {
-    Consumer c = target;
-    for ( int i = count - 1; i >= 0; i-- ) c = ( (Wrap) operators[i] ).wrap ( c );
-    return c;
-  }
-
-  /// 2.4 — materialise an effective Wrap[] (factories already resolved).
-  /// Used by `pipe(target)` when factories are present.
-  @SuppressWarnings ( { "unchecked", "rawtypes" } )
-  private Consumer < I > materialiseFrom ( Wrap < ? >[] effective, int effectiveCount, Consumer < O > target ) {
-    Consumer c = target;
-    for ( int i = effectiveCount - 1; i >= 0; i-- ) c = ( (Wrap) effective[i] ).wrap ( c );
-    return c;
-  }
-
-  /// Resolves all per-attachment factories (fiber + flow) against
-  /// `targetSubject` and builds the effective Wrap[] for materialisation.
-  /// Flow factories may have their own nested factories; those are
-  /// recursively resolved against the same subject.
-  private Wrap < ? >[] resolveFactories ( Subject < ? > targetSubject ) {
-    final int nFiberFactories = factories == null ? 0 : factories.length;
-    final int nFlowFactories  = flowFactories == null ? 0 : flowFactories.length;
-
-    // Resolve fiber factories (each produces a Wrap[] of fiber operators)
-    Wrap < ? >[][] resolvedFiber = new Wrap < ? >[nFiberFactories][];
-    int totalExtra = 0;
-    for ( int i = 0; i < nFiberFactories; i++ ) {
-      Fiber < ? > f = factories[i].factory.apply ( targetSubject );
-      Objects.requireNonNull ( f, "fiber factory must not return null" );
-      if ( !( f instanceof FsFiber < ? > fsFiber ) ) {
-        // §15.1 provider mismatch — a factory result is a composition argument
-        // like any other.
-        throw FsOperators.fault ( "fiber", "fiber factory produced a value from another provider" );
-      }
-      Wrap < ? >[] ops = fsFiber.operators ();
-      int fc = fsFiber.operatorCount ();
-      Wrap < ? >[] copy = new Wrap < ? >[fc];
-      System.arraycopy ( ops, 0, copy, 0, fc );
-      resolvedFiber[i] = copy;
-      totalExtra += fc;
-    }
-
-    // Resolve flow factories (each produces a Wrap[] of flow operators —
-    // recursively resolved if the inner flow has its own factories)
-    Wrap < ? >[][] resolvedFlow = new Wrap < ? >[nFlowFactories][];
-    for ( int i = 0; i < nFlowFactories; i++ ) {
-      Flow < ?, ? > f = flowFactories[i].factory.apply ( targetSubject );
-      Objects.requireNonNull ( f, "flow factory must not return null" );
-      if ( !( f instanceof FsFlow < ?, ? > fsFlow ) ) {
-        // §15.1 provider mismatch — a factory result is a composition argument
-        // like any other.
-        throw FsOperators.fault ( "flow", "flow factory produced a value from another provider" );
-      }
-      // Recursive resolve: if the inner flow has its own factories, resolve
-      // them too; otherwise use its operators directly.
-      Wrap < ? >[] innerEffective;
-      if ( fsFlow.factories == null && fsFlow.flowFactories == null ) {
-        innerEffective = new Wrap < ? >[fsFlow.count];
-        System.arraycopy ( fsFlow.operators, 0, innerEffective, 0, fsFlow.count );
-      } else {
-        innerEffective = fsFlow.resolveFactories ( targetSubject );
-      }
-      resolvedFlow[i] = innerEffective;
-      totalExtra += innerEffective.length;
-    }
-
-    // Build merged array: walk positions 0..count, inline factories at each
-    // position. For positions with both fiber and flow factories at the same
-    // index, fiber factories go first (preserves prior behaviour).
-    Wrap < ? >[] merged = new Wrap < ? >[count + totalExtra];
-    int w = 0;
-    for ( int p = 0; p <= count; p++ ) {
-      for ( int i = 0; i < nFiberFactories; i++ ) {
-        if ( factories[i].position == p ) {
-          Wrap < ? >[] r = resolvedFiber[i];
-          System.arraycopy ( r, 0, merged, w, r.length );
-          w += r.length;
-        }
-      }
-      for ( int i = 0; i < nFlowFactories; i++ ) {
-        if ( flowFactories[i].position == p ) {
-          Wrap < ? >[] r = resolvedFlow[i];
-          System.arraycopy ( r, 0, merged, w, r.length );
-          w += r.length;
-        }
-      }
-      if ( p < count ) merged[w++] = operators[p];
-    }
-    return merged;
+  /// The first-composed operator ends up outermost and sees each value first, so runtime data
+  /// flow matches the user's reading order per SPEC §6.2.5. Per-attachment factories (§6.2 /
+  /// 2.4 / 2.6) resolve here, once, against `subject` — they are nodes in the plan, so they
+  /// need no separate resolution pass.
+  @SuppressWarnings ( "unchecked" )
+  private Consumer < I > wire ( Subject < ? > subject, Consumer < Object > downstream ) {
+    return (Consumer < I >) (Consumer < ? >) recipe.wire ( subject, downstream );
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -437,14 +351,9 @@ public final class FsFlow < I, O > implements Flow < I, O > {
       // §15.1 provider mismatch, MUST detect; Appendix A.2 binds it to Fault.
       throw FsOperators.fault ( "fiber", "fiber is not from this runtime provider" );
     }
-    int fc = fsFiber.operatorCount ();
-    if ( fc == 0 ) return this;
-    // Inline the fiber's Wraps directly. Fiber operators are type-preserving
-    // (E→E with E ≡ O at this position), so they slot into the flow's array.
-    Wrap < ? >[] merged = new Wrap < ? >[count + fc];
-    System.arraycopy ( operators, 0, merged, 0, count );
-    System.arraycopy ( fsFiber.operators (), 0, merged, count, fc );
-    return new FsFlow <> ( merged, count + fc, factories, flowFactories );
+    // Fiber operators are type-preserving (E→E with E ≡ O at this position), so the fiber's
+    // plan composes directly after this one's.
+    return new FsFlow <> ( recipe.then ( fsFiber.recipe () ) );
   }
 
   /// 2.4: Per-attachment fiber factory. The factory is invoked once per
@@ -454,16 +363,16 @@ public final class FsFlow < I, O > implements Flow < I, O > {
   @Override
   public Flow < I, O > fiber ( @NotNull Function < ? super Subject < ? >, ? extends Fiber < O > > factory ) {
     Objects.requireNonNull ( factory );
-    FactoryEntry entry = new FactoryEntry ( count, factory );
-    FactoryEntry[] newFactories;
-    if ( factories == null ) {
-      newFactories = new FactoryEntry[]{entry};
-    } else {
-      newFactories = new FactoryEntry[factories.length + 1];
-      System.arraycopy ( factories, 0, newFactories, 0, factories.length );
-      newFactories[factories.length] = entry;
-    }
-    return new FsFlow <> ( operators, count, newFactories, flowFactories );
+    // The provider check belongs at resolution, not composition: a factory result is a
+    // composition argument like any other, and it does not exist until the attachment.
+    return new FsFlow <> ( recipe.thenResolving ( subject -> {
+      final Fiber < ? > produced = factory.apply ( subject );
+      Objects.requireNonNull ( produced, "fiber factory must not return null" );
+      if ( !( produced instanceof FsFiber < ? > fsFiber ) ) {
+        throw FsOperators.fault ( "fiber", "fiber factory produced a value from another provider" );
+      }
+      return fsFiber.recipe ();
+    } ) );
   }
 
   @NotNull
@@ -475,40 +384,12 @@ public final class FsFlow < I, O > implements Flow < I, O > {
       // §15.1 provider mismatch, MUST detect; Appendix A.2 binds it to Fault.
       throw FsOperators.fault ( "flow", "next flow is not from this runtime provider" );
     }
-    if ( nextFlow.count == 0 && nextFlow.factories == null && nextFlow.flowFactories == null ) {
+    if ( nextFlow.recipe.isEmpty () ) {
       return (Flow < I, P >) (Flow < ?, ? >) this;
     }
-    Wrap < ? >[] merged = new Wrap < ? >[count + nextFlow.count];
-    // operators[0..count) of `this` — innermost at index 0 — must remain innermost.
-    // next's operators run after `this`, so they wrap further out (higher indices).
-    System.arraycopy ( operators, 0, merged, 0, count );
-    System.arraycopy ( nextFlow.operators, 0, merged, count, nextFlow.count );
-
-    // Translate next's fiber factories: each next factory at position p shifts to position count+p.
-    FactoryEntry[] mergedFactories = factories;
-    if ( nextFlow.factories != null ) {
-      int existing = factories == null ? 0 : factories.length;
-      mergedFactories = new FactoryEntry[existing + nextFlow.factories.length];
-      if ( existing > 0 ) System.arraycopy ( factories, 0, mergedFactories, 0, existing );
-      for ( int i = 0; i < nextFlow.factories.length; i++ ) {
-        FactoryEntry fe = nextFlow.factories[i];
-        mergedFactories[existing + i] = new FactoryEntry ( count + fe.position, fe.factory );
-      }
-    }
-
-    // Translate next's flow factories: same position shift.
-    FlowFactoryEntry[] mergedFlowFactories = flowFactories;
-    if ( nextFlow.flowFactories != null ) {
-      int existing = flowFactories == null ? 0 : flowFactories.length;
-      mergedFlowFactories = new FlowFactoryEntry[existing + nextFlow.flowFactories.length];
-      if ( existing > 0 ) System.arraycopy ( flowFactories, 0, mergedFlowFactories, 0, existing );
-      for ( int i = 0; i < nextFlow.flowFactories.length; i++ ) {
-        FlowFactoryEntry fe = nextFlow.flowFactories[i];
-        mergedFlowFactories[existing + i] = new FlowFactoryEntry ( count + fe.position, fe.factory );
-      }
-    }
-
-    return new FsFlow <> ( merged, count + nextFlow.count, mergedFactories, mergedFlowFactories );
+    // next runs after `this`, so its plan composes after — and its own per-attachment
+    // factories travel with it, needing no position translation.
+    return (Flow < I, P >) (Flow < ?, ? >) new FsFlow <> ( recipe.then ( nextFlow.recipe ) );
   }
 
   /// 2.6: Per-attachment Flow factory. Same as fiber-factory but produces
@@ -520,16 +401,14 @@ public final class FsFlow < I, O > implements Flow < I, O > {
   public < P > Flow < I, P > flow (
       @NotNull Function < ? super Subject < ? >, ? extends Flow < ? super O, ? extends P > > factory ) {
     Objects.requireNonNull ( factory, "factory" );
-    FlowFactoryEntry entry = new FlowFactoryEntry ( count, factory );
-    FlowFactoryEntry[] newFlowFactories;
-    if ( flowFactories == null ) {
-      newFlowFactories = new FlowFactoryEntry[]{entry};
-    } else {
-      newFlowFactories = new FlowFactoryEntry[flowFactories.length + 1];
-      System.arraycopy ( flowFactories, 0, newFlowFactories, 0, flowFactories.length );
-      newFlowFactories[flowFactories.length] = entry;
-    }
-    return (Flow < I, P >) (Flow) new FsFlow <> ( operators, count, factories, newFlowFactories );
+    return (Flow < I, P >) (Flow) new FsFlow <> ( recipe.thenResolving ( subject -> {
+      final Flow < ?, ? > produced = factory.apply ( subject );
+      Objects.requireNonNull ( produced, "flow factory must not return null" );
+      if ( !( produced instanceof FsFlow < ?, ? > fsFlow ) ) {
+        throw FsOperators.fault ( "flow", "flow factory produced a value from another provider" );
+      }
+      return fsFlow.recipe ();
+    } ) );
   }
 
   /// When target is a same-circuit FsPipe, the flow's terminal submits to
@@ -550,22 +429,11 @@ public final class FsFlow < I, O > implements Flow < I, O > {
     if ( FsOperators.foreign ( target ) ) {
       throw FsOperators.fault ( "pipe", "target pipe is not from this runtime provider" );
     }
-    // Empty flow elision — no operators AND no pending factories means I == O.
-    if ( count == 0 && factories == null && flowFactories == null ) return (Pipe < I >) (Pipe < ? >) target;
+    // Empty flow elision — nothing composed means I == O. A pending factory is never empty:
+    // §6.2 promises it runs once per attachment, so it has to be wired to find out.
+    if ( recipe.isEmpty () ) return (Pipe < I >) (Pipe < ? >) target;
 
-    // Resolve per-attachment factories (if any) against target.subject(). Each
-    // factory is invoked once at attachment time per spec §6.2 / 2.4 / 2.6.
-    final Wrap < ? >[] effective;
-    final int          effectiveCount;
-    if ( factories == null && flowFactories == null ) {
-      effective      = operators;
-      effectiveCount = count;
-    } else {
-      effective      = resolveFactories ( target.subject () );
-      effectiveCount = effective.length;
-    }
-    if ( effectiveCount == 0 ) return (Pipe < I >) (Pipe < ? >) target;
-
+    final Subject < ? > subject = target.subject ();
     final Consumer < I > chain;
     if ( target instanceof FsPipe < ? > fp ) {
       final FsCircuit c = fp.circuit ();
@@ -573,12 +441,12 @@ public final class FsFlow < I, O > implements Flow < I, O > {
       if ( targetReceiver instanceof FsChannel < ? > channel ) {
         // Submit channel.cascadeDispatch directly — receptors + STEM, no
         // version check. Falls back to channel before first rebuild.
-        chain = materialiseFrom ( effective, effectiveCount, (Consumer < O >) v -> {
+        chain = wire ( subject, v -> {
           Consumer < Object > d = channel.cascadeDispatch;
           c.submit ( d != null ? d : channel, v );
         } );
       } else {
-        chain = materialiseFrom ( effective, effectiveCount, (Consumer < O >) v -> c.submit ( targetReceiver, v ) );
+        chain = wire ( subject, v -> c.submit ( targetReceiver, v ) );
       }
       // §4.3: a materialized pipe's enclosure is the pipe it feeds, one level
       // deeper, so chained attachments form a fully-qualified nested path.
@@ -587,7 +455,8 @@ public final class FsFlow < I, O > implements Flow < I, O > {
     }
     // This provider's own non-FsPipe carriers (an FsSink channel pipe, say)
     // expose no receiver to submit to, so the chain is driven through emit().
-    chain = materialiseFrom ( effective, effectiveCount, target::emit );
+    final Pipe < Object > carrier = (Pipe < Object >) (Pipe < ? >) target;
+    chain = wire ( subject, carrier::emit );
     final Subject < Pipe < I > > nested = (Subject < Pipe < I > >) (Subject < ? >)
       new FsSubject <> ( null, (FsSubject < ? >) target.subject (), Pipe.class );
     return new Pipe <> () {
@@ -654,19 +523,31 @@ public final class FsFlow < I, O > implements Flow < I, O > {
   static final class RunWrap implements Wrap < Object > {
     @Override
     public Consumer < Object > wrap ( Consumer < Object > downstream ) {
-      final Object[] prev   = { null };
-      final long[]   length = { 0L };
-      final boolean[] seeded = { false };
-      return v -> {
-        if ( ! seeded[ 0 ] || ! Objects.equals ( v, prev[ 0 ] ) ) {
-          prev[ 0 ]   = v;
-          length[ 0 ] = 1L;
-          seeded[ 0 ] = true;
-        } else {
-          length[ 0 ]++;
-        }
-        downstream.accept ( new RunImpl ( v, length[ 0 ] ) );
-      };
+      return new RunLength ( downstream );
+    }
+  }
+
+  /// The materialised run stage: emits every admission with the length of the run it belongs to.
+  static final class RunLength implements Consumer < Object > {
+    private final Consumer < Object > d;
+    private       Object              prev;
+    private       long                length;
+    private       boolean             seeded;
+
+    RunLength ( Consumer < Object > d ) {
+      this.d = d;
+    }
+
+    @Override
+    public void accept ( Object v ) {
+      if ( !seeded || !Objects.equals ( v, prev ) ) {
+        prev   = v;
+        length = 1L;
+        seeded = true;
+      } else {
+        length++;
+      }
+      d.accept ( new RunImpl ( v, length ) );
     }
   }
 
@@ -682,25 +563,36 @@ public final class FsFlow < I, O > implements Flow < I, O > {
   static final class ChangeWrap implements Wrap < Object > {
     @Override
     public Consumer < Object > wrap ( Consumer < Object > downstream ) {
-      final Object[]  prev    = { null };
-      final long[]    length  = { 0L };
-      final boolean[] hasPrev = { false };
-      return v -> {
-        if ( ! hasPrev[ 0 ] ) {
-          prev[ 0 ]    = v;
-          length[ 0 ]  = 1L;
-          hasPrev[ 0 ] = true;
-          return;       // first admission opens the first run silently
-        }
-        if ( Objects.equals ( v, prev[ 0 ] ) ) {
-          length[ 0 ]++;
-          return;       // still in the same run
-        }
-        // Run boundary — emit Change for the closed run.
-        downstream.accept ( new ChangeImpl ( prev[ 0 ], v, length[ 0 ] ) );
-        prev[ 0 ]   = v;
-        length[ 0 ] = 1L;
-      };
+      return new RunBoundary ( downstream );
+    }
+  }
+
+  /// The materialised change stage: emits only where one run ends and the next begins.
+  static final class RunBoundary implements Consumer < Object > {
+    private final Consumer < Object > d;
+    private       Object              prev;
+    private       long                length;
+    private       boolean             hasPrev;
+
+    RunBoundary ( Consumer < Object > d ) {
+      this.d = d;
+    }
+
+    @Override
+    public void accept ( Object v ) {
+      if ( !hasPrev ) {
+        prev    = v;
+        length  = 1L;
+        hasPrev = true;
+        return;                     // the first admission opens the first run silently
+      }
+      if ( Objects.equals ( v, prev ) ) {
+        length++;
+        return;                     // still inside the same run
+      }
+      d.accept ( new ChangeImpl ( prev, v, length ) );
+      prev   = v;
+      length = 1L;
     }
   }
 
@@ -731,18 +623,34 @@ public final class FsFlow < I, O > implements Flow < I, O > {
 
     @Override
     public Consumer < Object > wrap ( Consumer < Object > downstream ) {
-      final Object[] prev = { initial };
-      return v -> {
-        Object p = prev[ 0 ];
-        prev[ 0 ] = v;          // advance regardless of projection / throw
-        Object projection;
-        try {
-          projection = op.apply ( p, v );
-        } catch ( RuntimeException re ) {
-          return;
-        }
-        if ( projection != null ) downstream.accept ( projection );
-      };
+      return new Relation ( initial, op, downstream );
+    }
+  }
+
+  /// The materialised relate stage: projects each `(prev, curr)` pair, advancing `prev` on every
+  /// admission — including one whose projection is filtered or raises.
+  static final class Relation implements Consumer < Object > {
+    private final BiFunction < Object, Object, Object > op;
+    private final Consumer < Object >                   d;
+    private       Object                                prev;
+
+    Relation ( Object initial, BiFunction < Object, Object, Object > op, Consumer < Object > d ) {
+      this.prev = initial;
+      this.op   = op;
+      this.d    = d;
+    }
+
+    @Override
+    public void accept ( Object v ) {
+      final Object p = prev;
+      prev = v;                     // advance regardless of projection or throw
+      final Object projection;
+      try {
+        projection = op.apply ( p, v );
+      } catch ( RuntimeException raised ) {
+        return;
+      }
+      if ( projection != null ) d.accept ( projection );
     }
   }
 
@@ -779,7 +687,7 @@ public final class FsFlow < I, O > implements Flow < I, O > {
   @Override
   public Flow < I, Window < O > > window ( int size ) {
     if ( size <= 0 ) throw new IllegalArgumentException ( "size must be > 0" );
-    return appendOp ( new WindowCountWrap ( size ) );
+    return appendOp ( FsWindows.count ( size ) );
   }
 
   /// 2.7: time-based windowing with capacity bound.
@@ -791,15 +699,12 @@ public final class FsFlow < I, O > implements Flow < I, O > {
     return appendOp ( new WindowDurationWrap ( duration, maxSize ) );
   }
 
-  /// Internal helper: returns a new FsFlow with the given op appended.
-  /// The output type changes from O to whatever the op produces — at the
-  /// type level we erase to Object since operators travel as Wrap[].
+  /// Internal helper: returns a new FsFlow with the given op composed after this one's.
+  ///
+  /// The output type changes from O to whatever the op produces. Operators travel untyped
+  /// inside the plan, so the new output type is asserted here rather than tracked.
   @SuppressWarnings ( { "unchecked", "rawtypes" } )
   private < P > Flow < I, P > appendOp ( Wrap < ? > op ) {
-    final int newCount = count + 1;
-    final Wrap < ? >[] newOps = new Wrap < ? >[ newCount ];
-    System.arraycopy ( operators, 0, newOps, 0, count );
-    newOps[ count ] = op;
-    return (Flow < I, P >) (Flow) new FsFlow <> ( newOps, newCount, factories, flowFactories );
+    return (Flow < I, P >) (Flow) new FsFlow <> ( recipe.then ( op ) );
   }
 }

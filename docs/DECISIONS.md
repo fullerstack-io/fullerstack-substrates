@@ -1,0 +1,210 @@
+# Decisions
+
+Designs that were built, measured, and rejected — and the findings that outlived them.
+
+Source javadoc explains what the code *does*. This file records what we *tried*, what it cost,
+and why it lost, so a rejected design is not rediscovered as a good idea. Each entry names the
+mechanism, not just the number: a timing without a mechanism is not a finding.
+
+All figures from a 2 vCPU workspace, JDK 26, G1, compact object headers off. Allocation counts
+are exact. Timings carry ±5–11% on this hardware and are quoted only where the mechanism, rather
+than the magnitude, carries the argument.
+
+---
+
+## Ingress queue
+
+### Chunked MPSC — `IngressQueue` + `QChunk` (superseded 2026-08-27)
+
+A node held 128 `(receiver, value)` entries in an interleaved `Object[]`, so one allocation
+covered 128 emissions: **~10 B/op against `JobQueue`'s 24**.
+
+It lost on three counts, and the first is the one that decided it.
+
+- **Secondary supertype check.** Batching heterogeneous work into one node forces an untyped
+  `Object[]`, so reading a receiver back is a cast to an *interface*. perfasm measured that as
+  the hottest instruction in the drain profile — roughly 11%, a `popcntq` and a hashed probe of
+  the secondary-super table, with a stub call on a miss. A typed `Job` field is a *class*, so
+  there is no check and dispatch is `invokevirtual` rather than `invokeinterface`.
+- **Marker branch.** The chunked drain asked `isMarker(r)` per item. With a job hierarchy a
+  marker is just another subclass and the vtable does the work.
+- **Promotion under backpressure.** One surviving node per 128 emissions becomes one per
+  emission, but a chunk that survives a young collection promotes 128 entries with it.
+
+**Do not revisit** without a way to keep entries typed inside a batched node.
+
+### Free-list recycling of chunks — REFUTED, and it was a correctness bug
+
+Recycling a chunk across the thread boundary is an ABA: a producer can claim a node the consumer
+has already freed. It **lost emissions**, and a lost await-marker left `await` parked forever.
+
+The general rule this bought: **a carrier that crosses threads cannot be recycled.** Worker-confined
+carriers can be, and are. See *Transit* below.
+
+### Steal-the-head Treiber MPSC — `JobQueueSteal` — REFUTED, **3.7× slower**
+
+`JobQueue` is Vyukov: publish-then-link, wait-free for producers, FIFO, but with a window where a
+published node is not yet linked — so the consumer must re-read `next` with acquire semantics per
+item. The idea was to close that window with Treiber ordering (link-then-publish, so a reachable
+node is always fully linked) and let the consumer take the entire chain in one exchange.
+
+It failed for a reason the design did not anticipate: the consumer's `getAndSet` of the head
+operates on **the same word the producers CAS**, so stealing couples the two ends rather than
+decoupling them. Producers also CAS instead of exchanging, so they retry under contention and are
+no longer wait-free. The steal-and-reverse pass to restore FIFO order is pure additional work.
+
+Making `Job.next` non-volatile for the steal path was measured separately and was worth ~13% of
+that profile — see *Job.next* below — and even with it the design remained far behind.
+
+---
+
+## Transit queue
+
+Transit is worker-confined: one thread enqueues, the same thread drains, nothing else can observe
+a node. Recycling is therefore safe here for exactly the reason it is not safe on ingress.
+
+### `QChunk`-backed transit — `TransitQueue` (superseded)
+
+Reused one pre-allocated chunk per drain cycle: no CAS, no free list, zero steady-state
+allocation. It lost to a cost it inherited rather than chose: **`QChunk.next` must be `volatile`
+because the MPSC ingress queue requires it**, so linking and following an overflow chunk cost a
+volatile store and load that a single-threaded queue has no use for.
+
+The lesson generalises past this queue: **sharing a carrier type across the thread boundary
+forces the strictest member's memory ordering onto every user of it.** Carriers and their
+worker-confined counterparts should share a vocabulary and no representation.
+
+### Reusable node chain — `TransitJobQueue` — **OPEN, not decided**
+
+A chain of mutable nodes, grown to the deepest cascade seen and then reused forever. Four
+interleaved reps, five forks, `-prof gc`, TCK green throughout:
+
+| benchmark | ring | node |
+|---|---:|---:|
+| `cyclic_emit_deep_100k` | 13.279 | 12.500 |
+| `cyclic_emit_direct` | 17.602 | 16.605 |
+| `cyclic_emit_registrar` | 16.842 | 17.165 |
+
+Lower on three rows of four, but **no row is significant**: the deltas (0.32–1.00 ns) sit inside
+the within-arm ranges (1.3–6.2 ns), and `registrar` flipped sign between two reps and four.
+
+The one signal that was not noise was allocation on deep cascades — the ring managed
+**0.024 B/op with zero collections** against 0.055 B/op and five, because a node chain extends to
+cascade depth while a ring does not.
+
+**This entry is not a verdict.** `TransitQueueRing` is what is currently wired, but that was a
+choice of which arm to run a benchmark suite against, not a decision between the two designs. The
+timings above cannot separate them, and the allocation difference is 0.03 B/op — real, but tiny
+in absolute terms and confined to deep cascades. The node version is also the more readable of
+the two: its append is `writeNode = writeNode.next` with no index arithmetic and no growth check
+on the common path.
+
+Both designs stay in the tree until a measurement that can actually separate them says otherwise.
+See *What an accurate transit comparison needs* below.
+
+---
+
+## Job
+
+### `Job.next` is deliberately non-volatile
+
+It was `volatile` for the queue's benefit until the resulting `StoreLoad` fence was measured at
+~13% of a profile. Ordering now comes from the access mode at the use site — `NEXT.setRelease`
+on publish, `NEXT.getAcquire` on read — which a `VarHandle` provides independently of how the
+field is declared. **Do not restore the modifier**; it buys nothing the access modes do not
+already give, and costs a fence per emission.
+
+---
+
+## Window backing
+
+### Shift-backed buffer — the shipped default until measured
+
+`WindowCountWrap` evicts with `System.arraycopy(buffer, 1, buffer, 0, n-1)` on every emission
+once full — O(n) where a ring is O(1). perfasm put `oop_disjoint_arraycopy_stub` at **7.05% of
+the profile at capacity 4 and 15.64% at capacity 64**, roughly 2.8 ns and 7.4 ns per emission.
+
+The cost is dominated by the stub **call**, not the copy length, which is why a 4 → 64 capacity
+sweep looks nearly flat (31.7 → 34.4 → 36.3 ns) and hides it. A capacity sweep that fails to rise
+is evidence of a fixed per-call cost, not evidence of an absent one.
+
+The same `arraycopy` shift is present in `FsOperators.Rolling`, which has no benchmark coverage.
+
+### Ring vs intrusive node chain — a tie on append
+
+Two O(1) backings measured against the shipped shift, one binary, one property flip:
+
+| | legacy | ring | node |
+|---|---:|---:|---:|
+| `window_64` (append only) | 43.71 ± 4.48 | 34.82 ± 3.04 | 34.75 ± 4.10 |
+| `window_for_each` (walks 16) | 72.87 ± 15.83 | 55.81 ± 6.24 | 60.45 ± 4.52 |
+
+Both remove the `arraycopy` and both beat the shift by **~8.9 ns at capacity 64**. On append they
+are indistinguishable — 0.07 ns apart on a ±3–4 ns measurement.
+
+On traversal the ring leads by 4.64 ns, the direction predicted by cache density (4 bytes per
+element in an `Object[]` against 24 in a chain), but the error bars overlap and it is **not** a
+significant result on this hardware.
+
+---
+
+## Boundaries
+
+### A per-emission envelope only allocates because it crosses a queue
+
+`FsFlow.pipe(target)` terminates a chain with `v -> circuit.submit(target, v)`, which on the
+worker is a transit enqueue. The emitted value is therefore queued, many can be in flight, and
+each must be a distinct object.
+
+Measured with the same window at the same capacity, differing only in where the value is
+consumed:
+
+| shape | ns/op | B/op |
+|---|---:|---:|
+| `window(16)` → pipe → receptor | 39.46 | **64.0** |
+| `window(16).map(Window::size)` → pipe | 28.50 | **24.0** |
+
+24 B/op is the bare ingress `Job`. Consumed inside the chain the `Window` never crosses a queue,
+so escape analysis removes it — **all 40 bytes were the boundary, not the window**. Identical in
+both the array and node backings, so neither is responsible for any of it.
+
+This is why the doctrine's "express a pipeline as one chain" is a cost rule and not only a style
+rule, and it should apply to every per-emission envelope the API mints — `Capture`, `Run`,
+`Change` — not only to `Window`.
+
+---
+
+## Open questions
+
+### What an accurate transit comparison needs
+
+Every transit measurement so far has been taken on a 2 vCPU workspace where a batch benchmark
+also spins a full core inside `circuit.await()` — 10–23% of all CPU samples — while the worker
+drains on the other core and G1 collects at 1.2–2.2 GB/s. Three CPU consumers, two cores. That is
+why deltas of 0.3–1.0 ns sit inside within-arm ranges of 1.3–6.2 ns, and why one row flipped sign
+between reps.
+
+A comparison that could decide it needs, at minimum:
+
+- **More forks, not more iterations.** The variance is between forks, not within them.
+- **The cascade rows only.** `cyclic_emit_deep_100k` is where the two designs actually differ —
+  a node chain extends to cascade depth, a ring does not. Shallow rows measure nothing relevant.
+- **Interleaved arms.** Run A/B/A/B rather than all of A then all of B, so machine drift cannot
+  masquerade as an effect.
+- **Nothing else touching the machine** for the duration.
+- **A pre-registered margin.** State beforehand what difference would count, so a null result is
+  read as a tie rather than argued into a preference.
+
+Until that runs, the choice is open and both implementations stay.
+
+---
+
+## Measurement practice
+
+- **Do not poll the machine during a run.** Interactive commands against the workspace produced
+  3× iteration spikes and 5–10× variance, and inverted one result outright.
+- **A capacity or size sweep that looks flat may be hiding a fixed per-call cost.** Check the
+  profile, not the slope.
+- **Prefer a combiner that does not allocate when measuring storage.** `rolling(n, Integer::sum, 0)`
+  and `window.fold(0L, Long::sum)` box per element — 208 and 312 B/op of `valueOf` — and the row
+  then measures boxing rather than the structure under test.

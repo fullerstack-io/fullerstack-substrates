@@ -4,30 +4,20 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.function.Consumer;
 
-/// Intrusive-linked MPSC ingress queue — the alternative to [IngressQueue]'s
-/// chunked array.
+/// Intrusive-linked MPSC ingress queue: one [Job] per emission, carrying its
+/// own `next`.
 ///
-/// Both are intrusive linked structures; they differ only in **granularity**.
-/// [QChunk] is a node holding 128 entries in an interleaved `Object[]`; a [Job]
-/// here is a node holding exactly one. That single difference decides three
-/// costs:
+/// A batched alternative — one node holding 128 entries in an interleaved
+/// `Object[]` — was built and rejected. It allocated a third as much but had to
+/// read receivers back out of an untyped array, making every dispatch an
+/// interface cast; perfasm found that secondary supertype check to be the
+/// hottest instruction in the drain. A typed `Job` field is a *class*, so there
+/// is no check and dispatch is `invokevirtual`. See `docs/DECISIONS.md`.
 ///
-/// - **Type check.** Batching heterogeneous work into one node forces an
-///   untyped `Object[]`, so reading a receiver back is a cast to an
-///   *interface* — a secondary supertype check, which perfasm measured as the
-///   hottest instruction in the drain profile (~11%: `popcntq`, a hashed
-///   probe of the secondary-super table, and a stub call on miss). A `Job`
-///   field is typed and is a *class*, so there is no check and dispatch is
-///   `invokevirtual` rather than `invokeinterface`.
-/// - **Marker branch.** The chunked drain asks `isMarker(r)` per item. Here a
-///   marker is simply another [Job] subclass and `run` dispatches to it.
-/// - **Allocation.** One node per 128 emissions becomes one per emission:
-///   ~10 B/op against ~32 B/op. Under backpressure that is also 128x more
-///   objects that can survive a young collection and be promoted.
-///
-/// Neither design recycles. Pooling was tried at chunk granularity and is the
-/// ABA that lost emissions and parked `await` — see [QChunk] — and pooling jobs
-/// has the same hazard with 128x more chances to hit it.
+/// **Nothing here is recycled.** A carrier that crosses the thread boundary
+/// cannot be: a producer can claim a node the consumer has already freed, which
+/// is an ABA that lost emissions and left `await` parked forever. Worker-confined
+/// carriers can be recycled and are — see `TransitQueueRing`.
 ///
 /// Producers are wait-free: one `getAndSet` of the head, then a release store
 /// linking the previous node. FIFO across producers. The consumer walks from a
@@ -36,13 +26,27 @@ import java.util.function.Consumer;
 /// between its `getAndSet` and its link, which reads the same to the consumer
 /// as "nothing committed yet" — the role the receiver slot plays in the
 /// chunked queue.
-/// Leading isolation for the consumer's cursor — see IngressPad0 for why the
-/// padding is a hierarchy of `int` fields rather than `@Contended`.
+/// Leading isolation for the consumer's cursor.
 ///
-/// Without this, `head` and `tail` sat 4 bytes apart in one cache line: the
-/// producer `getAndSet`s `head` on every emission and the consumer writes
-/// `tail` on every drain, so the two ends of the queue fought over one line.
-/// That is the same defect that cost IngressQueue 34%.
+/// Without this, `head` and `tail` sit 4 bytes apart in one cache line: the
+/// producer `getAndSet`s `head` on every emission and the consumer writes `tail`
+/// on every drain, so the two ends of the queue fight over one line. Measured at
+/// 34% of emission cost when it was allowed to happen.
+///
+/// **Why a class hierarchy of `int` fields, and not `@Contended`.** Both halves
+/// of that were measured on this codebase.
+///
+/// HotSpot honours `jdk.internal.vm.annotation.Contended` only for classes loaded
+/// by the boot loader, unless the JVM is started with `-XX:-RestrictContended`. A
+/// library cannot require that flag of its consumer, and without it the annotation
+/// is inert: emission measured 20.5 ns unpadded against 13.5 ns padded.
+///
+/// The fields are `int`, not `long`, because `long` needs 8-byte alignment. After
+/// the 12-byte object header that leaves a 4-byte hole, and HotSpot's field layout
+/// hoists a 4-byte subclass field into any hole it finds — silently relocating the
+/// very fields this padding exists to separate. `int` fields are 4-byte aligned, so
+/// under compressed oops the hierarchy packs with no holes and the layout matches
+/// the declaration. Verify with `objectFieldOffset` after changing any field here.
 abstract class JobQueuePad0 {
   int p00, p01, p02, p03, p04, p05, p06, p07;
   int p08, p09, p10, p11, p12, p13, p14, p15;
@@ -77,51 +81,6 @@ abstract class JobQueuePad2 extends JobQueueProducer {
 
 final class JobQueue extends JobQueuePad2 {
 
-  /// Consumed-node placeholder, so the consumer never needs a null tail.
-  private static final class StubJob extends Job {
-    @Override void run ( FsCircuit circuit ) { }
-  }
-
-  /// User work: the §15.4 isolation boundary, then the transit drain.
-  private static final class ReceptorJob extends Job {
-
-    private final Consumer < Object > receiver;
-    private final Object              value;
-
-    ReceptorJob ( Consumer < Object > receiver, Object value ) {
-      this.receiver = receiver;
-      this.value    = value;
-    }
-
-    @Override
-    void run ( FsCircuit circuit ) {
-      try {
-        receiver.accept ( value );
-      } catch ( Throwable ignored ) {
-        // §15.4 #4: observability is implementation-defined.
-      }
-      if ( circuit.transitHasWork () ) circuit.drainTransit ();
-    }
-  }
-
-  /// Await/close markers: no isolation wrapper, no transit drain — the chunked
-  /// queue reaches this by branching on `isMarker`; here it is the vtable.
-  private static final class MarkerJob extends Job {
-
-    private final Consumer < Object > marker;
-    private final Object              value;
-
-    MarkerJob ( Consumer < Object > marker, Object value ) {
-      this.marker = marker;
-      this.value  = value;
-    }
-
-    @Override
-    void run ( FsCircuit circuit ) {
-      marker.accept ( value );
-    }
-  }
-
   private static final VarHandle HEAD;
   private static final VarHandle NEXT;
 
@@ -136,16 +95,22 @@ final class JobQueue extends JobQueuePad2 {
   }
 
   JobQueue () {
-    final Job stub = new StubJob ();
+    // The consumer walks from an already-consumed node, so it needs one to start from. This
+    // placeholder is never run: the drain advances to `next` before dispatching.
+    final Job stub = new Job ();
     head = stub;
     tail = stub;
   }
 
   /// Wait-free: one atomic exchange, then the link that commits it.
+  ///
+  /// The fields are written before the exchange, which is a full fence, and the consumer reaches
+  /// the node only through an acquire load of `next` — so the release below carries them across.
   void enqueue ( Consumer < Object > receiver, Object value, boolean marker ) {
-    final Job job = marker
-      ? new MarkerJob ( receiver, value )
-      : new ReceptorJob ( receiver, value );
+    final Job job = new Job ();
+    job.receiver = receiver;
+    job.value    = value;
+    job.marker   = marker;
     final Job prev = (Job) HEAD.getAndSet ( this, job );
     NEXT.setRelease ( prev, job );
   }
@@ -171,12 +136,34 @@ final class JobQueue extends JobQueuePad2 {
       // and deliberately not inside the transit drain.
       circuit.stimulus.valid = false;
 
-      j.run ( circuit );
+      run ( j, circuit );
 
       j = (Job) NEXT.getAcquire ( t );
     } while ( j != null );
 
     tail = t;
     return true;
+  }
+
+  /// Runs one admitted job.
+  ///
+  /// A marker skips both the §15.4 isolation wrapper and the transit drain. This was a virtual
+  /// `Job.run` dispatched through a subclass per kind; markers are 0.009% of admissions, and the
+  /// call was measured failing to inline into the drain, so a predicted branch is the cheaper
+  /// shape for something that almost never happens.
+  private static void run ( Job job, FsCircuit circuit ) {
+
+    if ( job.marker ) {
+      job.receiver.accept ( job.value );
+      return;
+    }
+
+    try {
+      job.receiver.accept ( job.value );
+    } catch ( Throwable ignored ) {
+      // §15.4 #4: observability is implementation-defined.
+    }
+
+    if ( circuit.transitHasWork () ) circuit.drainTransit ();
   }
 }

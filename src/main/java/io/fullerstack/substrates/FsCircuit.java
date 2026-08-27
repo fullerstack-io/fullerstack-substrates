@@ -114,7 +114,7 @@ public final class FsCircuit implements Circuit {
   // Queue infrastructure
   // ─────────────────────────────────────────────────────────────────────────────
 
-  private final IngressQueue     ingress = new IngressQueue ();
+  private final JobQueue         ingress = new JobQueue ();
   private final TransitQueueRing transit = new TransitQueueRing ();
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -298,7 +298,7 @@ public final class FsCircuit implements Circuit {
    * Worker self-wakes via timed park — producers never pay unpark cost.
    */
   final void submitIngress ( Consumer < Object > receiver, Object value ) {
-    ingress.enqueue ( receiver, value );
+    ingress.enqueue ( receiver, value, false );
   }
 
   /**
@@ -324,7 +324,7 @@ public final class FsCircuit implements Circuit {
     if ( onWorker () ) {
       transit.enqueue ( receiver, value );
     } else {
-      ingress.enqueue ( receiver, value );
+      ingress.enqueue ( receiver, value, false );
     }
   }
 
@@ -421,7 +421,7 @@ public final class FsCircuit implements Circuit {
 
   private void drainLoop () {
     // Hoist final field to local — guarantees register allocation.
-    final IngressQueue q = ingress;
+    final JobQueue q = ingress;
 
     for ( ; ; ) {
 
@@ -595,7 +595,7 @@ public final class FsCircuit implements Circuit {
     final AwaitBarrier barrier = AWAIT_BARRIER.get ();
     barrier.released = false;
 
-    submitIngress ( awaitMarkerReceiver, barrier );
+    ingress.enqueue ( awaitMarkerReceiver, barrier, true );
     LockSupport.unpark ( worker );
 
     // Spin first, and in the common case that is the whole of it. The marker fires in
@@ -661,7 +661,7 @@ public final class FsCircuit implements Circuit {
 
     // Inject close marker FIRST (while still accepting emissions)
     // This ensures all emissions before close() are processed
-    submitIngress ( closeMarkerReceiver, null );
+    ingress.enqueue ( closeMarkerReceiver, null, true );
 
     // NOW reject new emissions
     closed = true;

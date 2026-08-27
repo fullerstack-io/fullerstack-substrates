@@ -202,24 +202,42 @@ public final class FsFlow < I, O > implements Flow < I, O > {
 
     @Override
     public Consumer < Object > wrap ( Consumer < Object > downstream ) {
+      return new CountWindow ( count, downstream );
+    }
+  }
+
+  /// The materialised count-window stage.
+  ///
+  /// Retains the last `capacity` values and emits a view of them on every admission. The buffer
+  /// is shifted rather than ringed, which is O(capacity) per emission — see `docs/DECISIONS.md`
+  /// and the ring and node backings in [FsWindows].
+  static final class CountWindow implements Consumer < Object > {
+    private final int                 capacity;
+    private final Object[]            buffer;
+    private final Consumer < Object > d;
+    /// §6.4.1 temporal lease, per materialisation — see FsWindow.Lease.
+    private final FsWindow.Lease      lease = new FsWindow.Lease ();
+    private       int                 length;
+
+    CountWindow ( int capacity, Consumer < Object > d ) {
+      this.capacity = capacity;
       // Power-of-two physical length: `FsWindow.at` masks with `buffer.length - 1`. The
-      // logical capacity is still `count`; only the slab is rounded up.
-      final Object[] buffer = new Object[ FsWindows.physical ( count ) ];
-      final int[]    sizeRef = { 0 };   // current valid length
-      // §6.4.1 temporal lease, per materialization — see FsWindow.Lease.
-      final FsWindow.Lease lease = new FsWindow.Lease ();
-      return v -> {
-        int len = sizeRef[ 0 ];
-        if ( len < count ) {
-          buffer[ len ] = v;
-          sizeRef[ 0 ] = len + 1;
-        } else {
-          // Shift left and append (drop oldest).
-          System.arraycopy ( buffer, 1, buffer, 0, count - 1 );
-          buffer[ count - 1 ] = v;
-        }
-        downstream.accept ( new FsWindow <> ( buffer, 0, sizeRef[ 0 ], false, lease, lease.latch () ) );
-      };
+      // logical capacity is still `capacity`; only the slab is rounded up.
+      this.buffer   = new Object[ FsWindows.physical ( capacity ) ];
+      this.d        = d;
+    }
+
+    @Override
+    public void accept ( Object v ) {
+      final int len = length;
+      if ( len < capacity ) {
+        buffer[ len ] = v;
+        length = len + 1;
+      } else {
+        System.arraycopy ( buffer, 1, buffer, 0, capacity - 1 );   // drop oldest
+        buffer[ capacity - 1 ] = v;
+      }
+      d.accept ( new FsWindow <> ( buffer, 0, length, false, lease, lease.latch () ) );
     }
   }
 
@@ -250,40 +268,65 @@ public final class FsFlow < I, O > implements Flow < I, O > {
 
     @Override
     public Consumer < Object > wrap ( Consumer < Object > downstream ) {
+      return new DurationWindow ( durationNanos, capacity, downstream );
+    }
+  }
+
+  /// The materialised duration-window stage.
+  ///
+  /// Retains the last `capacity` values, and drops any older than `durationNanos` relative to
+  /// the §5.8 processing time of the admission being handled. Values and their capture stamps
+  /// are held as a contiguous `[0..length)` range across two parallel arrays.
+  static final class DurationWindow implements Consumer < Object > {
+    private final long                durationNanos;
+    private final int                 capacity;
+    private final Object[]            values;
+    private final long[]              times;
+    private final Consumer < Object > d;
+    /// §6.4.1 temporal lease, per materialisation — see FsWindow.Lease.
+    private final FsWindow.Lease      lease = new FsWindow.Lease ();
+    private       int                 length;
+
+    DurationWindow ( long durationNanos, int capacity, Consumer < Object > d ) {
+      this.durationNanos = durationNanos;
+      this.capacity      = capacity;
       // `values` reaches FsWindow, so it takes the power-of-two length; `times` never does.
-      final Object[] values = new Object[ FsWindows.physical ( capacity ) ];
-      final long[]   times  = new long[ capacity ];
-      // tracked as a contiguous [0..length) range
-      final int[]    sizeRef = { 0 };
-      // §6.4.1 temporal lease, per materialization — see FsWindow.Lease.
-      final FsWindow.Lease lease = new FsWindow.Lease ();
-      return v -> {
-        final long now = FsOperators.stimulus ();   // §5.8: one reading per ingress chain
-        // Evict entries older than (now - durationNanos).
-        int newStart = 0;
-        final int len = sizeRef[ 0 ];
-        while ( newStart < len && now - times[ newStart ] > durationNanos ) {
-          newStart++;
-        }
-        int newLen = len - newStart;
-        if ( newStart > 0 ) {
-          System.arraycopy ( values, newStart, values, 0, newLen );
-          System.arraycopy ( times,  newStart, times,  0, newLen );
-        }
-        if ( newLen < capacity ) {
-          values[ newLen ] = v;
-          times [ newLen ] = now;
-          newLen++;
-        } else {
-          // Capacity-bound eviction: drop oldest.
-          System.arraycopy ( values, 1, values, 0, capacity - 1 );
-          System.arraycopy ( times,  1, times,  0, capacity - 1 );
-          values[ capacity - 1 ] = v;
-          times [ capacity - 1 ] = now;
-        }
-        sizeRef[ 0 ] = newLen;
-        downstream.accept ( new FsWindow <> ( values, 0, newLen, false, lease, lease.latch () ) );
-      };
+      this.values        = new Object[ FsWindows.physical ( capacity ) ];
+      this.times         = new long[ capacity ];
+      this.d             = d;
+    }
+
+    @Override
+    public void accept ( Object v ) {
+
+      final long now = FsOperators.stimulus ();   // §5.8: one reading per ingress chain
+
+      // Evict entries older than (now - durationNanos).
+      final int len = length;
+      int start = 0;
+      while ( start < len && now - times[ start ] > durationNanos ) {
+        start++;
+      }
+
+      int newLen = len - start;
+      if ( start > 0 ) {
+        System.arraycopy ( values, start, values, 0, newLen );
+        System.arraycopy ( times,  start, times,  0, newLen );
+      }
+
+      if ( newLen < capacity ) {
+        values[ newLen ] = v;
+        times [ newLen ] = now;
+        newLen++;
+      } else {
+        System.arraycopy ( values, 1, values, 0, capacity - 1 );   // drop oldest
+        System.arraycopy ( times,  1, times,  0, capacity - 1 );
+        values[ capacity - 1 ] = v;
+        times [ capacity - 1 ] = now;
+      }
+
+      length = newLen;
+      d.accept ( new FsWindow <> ( values, 0, newLen, false, lease, lease.latch () ) );
     }
   }
 

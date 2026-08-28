@@ -240,9 +240,14 @@ Measured on the same probe:
 | back-to-back delivery, p50 | 0.08–0.7 µs | 0.3 µs |
 
 The one regression is the p50 after a *long* quiet period — 8 µs → 39 µs — and it is the honest
-price: a circuit that quiet is now parked, and a wake costs what a wake costs. Everything at p90
-improves by 6–30×, because the old design's median was fast only while it held a core and its
-tail was the timer it depended on.
+price: a circuit that quiet is now parked, and a wake costs what a wake costs.
+
+**Read the p90 column with its spread.** The p50s above are stable across repeats — 39–53 µs
+after an idle gap, against 392–648 µs before — but p90 is not: repeating the identical build
+minutes later gave 1.20 ms and 1.53 ms where the table shows 592 µs and 82 µs. What survives
+repetition is that the tail moved from milliseconds-always to milliseconds-sometimes, on a box
+whose own GC and hypervisor produce multi-millisecond stalls in a control that never parks at all
+(9.5 ms, above). A tighter claim than that needs a quieter machine.
 
 **Liveness, stressed rather than argued.** With `worker.spin=0` (park on every idle round) and a
 2 s safety timeout, 13,000 admissions across one and three producers were all delivered, and the

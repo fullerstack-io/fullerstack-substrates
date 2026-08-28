@@ -329,6 +329,24 @@ handoff is two orders of magnitude cheaper: the awaiter's park round trip read *
 sporadic feed is the circuit's own after-idle delivery, measured above at ~39-48 µs p50 with a
 virtual worker.
 
+A first warm data point, same probe and same session, says the switch is not the free win the
+cold table suggests — it is a trade, and the half it loses is the half everything else measures:
+
+| | virtual worker | platform worker |
+|---|---:|---:|
+| idle CPU | 0.010 cores | 0.000 cores |
+| back-to-back delivery, p50 | **107 ns** | 7,654 ns |
+| after 0.1 ms gap, p50 / p90 | 52.9 µs / 1.20 ms | **8.5 µs / 15.3 µs** |
+| after 1 ms gap, p50 / p90 | 43.4 µs / 1.53 ms | **16.7 µs / 38.8 µs** |
+| after 5 ms gap, p50 / p90 | 38.6 µs / 714 µs | **23.8 µs / 467 µs** |
+
+The platform worker wakes 2-6× faster and far more steadily — its p90 after an idle gap is tens of
+microseconds where the virtual worker's is over a millisecond. It also delivers a *burst* far
+worse: 7.7 µs against 107 ns back-to-back, which is the shape every benchmark row in the suite
+measures and the one the library leads with. Whether that gap is per-emission cost or queueing
+that the burst inherits from a slow first wake has not been separated, and it must be before this
+question can be reopened.
+
 What the table does support is a difference in *shape*: the virtual path's p90 is 16× the
 platform path's on the same cold probe. Now that a wake sits on the critical path of a sporadic
 feed, the worker's thread kind is a live question rather than a free choice. It has not been

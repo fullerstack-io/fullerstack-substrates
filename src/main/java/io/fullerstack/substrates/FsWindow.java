@@ -17,7 +17,7 @@ import java.lang.invoke.VarHandle;
 
 import static java.util.Objects.requireNonNull;
 
-/// **WindowView** — the `Window` implementation: a strided view over a [DelayLine]'s ring.
+/// **FsWindow** — the `Window` implementation: a strided view over a [DelayLine]'s ring.
 ///
 /// §6.2.3 emits a window on every accepted input, and the spec is explicit that this is a view
 /// rather than a copy — "emitted windows are temporal views over a worker-thread-local ring".
@@ -41,7 +41,7 @@ import static java.util.Objects.requireNonNull;
 /// operator below opens with that check; [WindowLease] is the mechanism, and a derived view
 /// inherits its root's lease and stamp so a whole family expires together.
 @SuppressWarnings ( "unchecked" )
-final class WindowView < E > implements Window < E > {
+final class FsWindow < E > implements Window < E > {
 
   private final Object[] buffer;
   private final int      start;
@@ -53,7 +53,7 @@ final class WindowView < E > implements Window < E > {
   /// whole family of views expires together with the callback that produced the root.
   private final long     generation;
 
-  WindowView ( Object[] buffer, int start, int length, boolean reversed, WindowLease lease, long generation ) {
+  FsWindow ( Object[] buffer, int start, int length, boolean reversed, WindowLease lease, long generation ) {
     this.buffer     = buffer;
     this.start      = start;
     this.length     = length;
@@ -64,8 +64,8 @@ final class WindowView < E > implements Window < E > {
 
   /// A restriction of this window: same buffer, same lease, same generation. Sharing the
   /// stamp is the point — a view must not outlive the callback its root belongs to.
-  private WindowView < E > view ( int start, int length, boolean reversed ) {
-    return new WindowView <> ( buffer, start, length, reversed, lease, generation );
+  private FsWindow < E > view ( int start, int length, boolean reversed ) {
+    return new FsWindow <> ( buffer, start, length, reversed, lease, generation );
   }
 
   /// §6.4.1: every operator entry — on the root window and on every derived

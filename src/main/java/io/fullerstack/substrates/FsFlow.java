@@ -225,7 +225,7 @@ public final class FsFlow < I, O > implements Flow < I, O > {
     public void accept ( Object v ) {
       line.append ( v );
       d.accept (
-        new WindowView <> ( line.buffer (), line.start (), line.size (), false, lease, lease.latch () )
+        new FsWindow <> ( line.buffer (), line.start (), line.size (), false, lease, lease.latch () )
       );
     }
   }
@@ -295,7 +295,7 @@ public final class FsFlow < I, O > implements Flow < I, O > {
       line.append ( v, now );
 
       d.accept (
-        new WindowView <> ( line.buffer (), line.start (), line.size (), false, lease, lease.latch () )
+        new FsWindow <> ( line.buffer (), line.start (), line.size (), false, lease, lease.latch () )
       );
     }
   }

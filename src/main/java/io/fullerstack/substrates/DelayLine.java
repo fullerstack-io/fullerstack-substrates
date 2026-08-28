@@ -150,14 +150,14 @@ final class DelayLine {
     return times[ ( head + index ) & mask ];
   }
 
-  /// The ring itself, for a [WindowView] that reads it in place. Never copied, and never
+  /// The ring itself, for a [FsWindow] that reads it in place. Never copied, and never
   /// written by anyone but this line.
   Object[] buffer () {
     return values;
   }
 
   /// Physical index of the oldest retained value — a view's `start`. Wraps, which is what
-  /// [WindowView#at]'s masking exists for.
+  /// [FsWindow#at]'s masking exists for.
   int start () {
     return head;
   }

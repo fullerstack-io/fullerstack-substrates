@@ -208,36 +208,25 @@ public final class FsFlow < I, O > implements Flow < I, O > {
 
   /// The materialised count-window stage.
   ///
-  /// Retains the last `capacity` values and emits a view of them on every admission. The buffer
-  /// is shifted rather than ringed, which is O(capacity) per emission — see `docs/DECISIONS.md`
-  /// and the ring and node backings in [FsWindows].
+  /// Retains the last `capacity` values on a [DelayLine] and emits a view over it — no copy,
+  /// and O(1) per admission where the shift this replaced was O(capacity).
   static final class CountWindow implements Consumer < Object > {
-    private final int                 capacity;
-    private final Object[]            buffer;
+    private final DelayLine           line;
     private final Consumer < Object > d;
-    /// §6.4.1 temporal lease, per materialisation — see FsWindow.Lease.
-    private final FsWindow.Lease      lease = new FsWindow.Lease ();
-    private       int                 length;
+    /// §6.4.1 temporal lease, per materialisation — see [WindowLease].
+    private final WindowLease         lease = new WindowLease ();
 
     CountWindow ( int capacity, Consumer < Object > d ) {
-      this.capacity = capacity;
-      // Power-of-two physical length: `FsWindow.at` masks with `buffer.length - 1`. The
-      // logical capacity is still `capacity`; only the slab is rounded up.
-      this.buffer   = new Object[ FsWindows.physical ( capacity ) ];
-      this.d        = d;
+      this.line = DelayLine.of ( capacity );
+      this.d    = d;
     }
 
     @Override
     public void accept ( Object v ) {
-      final int len = length;
-      if ( len < capacity ) {
-        buffer[ len ] = v;
-        length = len + 1;
-      } else {
-        System.arraycopy ( buffer, 1, buffer, 0, capacity - 1 );   // drop oldest
-        buffer[ capacity - 1 ] = v;
-      }
-      d.accept ( new FsWindow <> ( buffer, 0, length, false, lease, lease.latch () ) );
+      line.append ( v );
+      d.accept (
+        new WindowView <> ( line.buffer (), line.start (), line.size (), false, lease, lease.latch () )
+      );
     }
   }
 
@@ -274,25 +263,21 @@ public final class FsFlow < I, O > implements Flow < I, O > {
 
   /// The materialised duration-window stage.
   ///
-  /// Retains the last `capacity` values, and drops any older than `durationNanos` relative to
-  /// the §5.8 processing time of the admission being handled. Values and their capture stamps
-  /// are held as a contiguous `[0..length)` range across two parallel arrays.
+  /// Retains the last `capacity` values on a [DelayLine] and drops any older than
+  /// `durationNanos` relative to the §5.8 processing time of the admission being handled.
+  ///
+  /// The line owns the capture stamps, so ageing entries out is a scan and a `dropOldest`, and
+  /// this stage never sees a physical index.
   static final class DurationWindow implements Consumer < Object > {
     private final long                durationNanos;
-    private final int                 capacity;
-    private final Object[]            values;
-    private final long[]              times;
+    private final DelayLine           line;
     private final Consumer < Object > d;
-    /// §6.4.1 temporal lease, per materialisation — see FsWindow.Lease.
-    private final FsWindow.Lease      lease = new FsWindow.Lease ();
-    private       int                 length;
+    /// §6.4.1 temporal lease, per materialisation — see [WindowLease].
+    private final WindowLease         lease = new WindowLease ();
 
     DurationWindow ( long durationNanos, int capacity, Consumer < Object > d ) {
       this.durationNanos = durationNanos;
-      this.capacity      = capacity;
-      // `values` reaches FsWindow, so it takes the power-of-two length; `times` never does.
-      this.values        = new Object[ FsWindows.physical ( capacity ) ];
-      this.times         = new long[ capacity ];
+      this.line          = DelayLine.timed ( capacity );
       this.d             = d;
     }
 
@@ -301,32 +286,17 @@ public final class FsFlow < I, O > implements Flow < I, O > {
 
       final long now = FsOperators.stimulus ();   // §5.8: one reading per ingress chain
 
-      // Evict entries older than (now - durationNanos).
-      final int len = length;
-      int start = 0;
-      while ( start < len && now - times[ start ] > durationNanos ) {
-        start++;
-      }
+      // Values are held in capture order, so the first young enough ends the scan.
+      final int held    = line.size ();
+      int       expired = 0;
+      while ( expired < held && now - line.timeAt ( expired ) > durationNanos ) expired++;
+      if ( expired > 0 ) line.dropOldest ( expired );
 
-      int newLen = len - start;
-      if ( start > 0 ) {
-        System.arraycopy ( values, start, values, 0, newLen );
-        System.arraycopy ( times,  start, times,  0, newLen );
-      }
+      line.append ( v, now );
 
-      if ( newLen < capacity ) {
-        values[ newLen ] = v;
-        times [ newLen ] = now;
-        newLen++;
-      } else {
-        System.arraycopy ( values, 1, values, 0, capacity - 1 );   // drop oldest
-        System.arraycopy ( times,  1, times,  0, capacity - 1 );
-        values[ capacity - 1 ] = v;
-        times [ capacity - 1 ] = now;
-      }
-
-      length = newLen;
-      d.accept ( new FsWindow <> ( values, 0, newLen, false, lease, lease.latch () ) );
+      d.accept (
+        new WindowView <> ( line.buffer (), line.start (), line.size (), false, lease, lease.latch () )
+      );
     }
   }
 
@@ -730,7 +700,7 @@ public final class FsFlow < I, O > implements Flow < I, O > {
   @Override
   public Flow < I, Window < O > > window ( int size ) {
     if ( size <= 0 ) throw new IllegalArgumentException ( "size must be > 0" );
-    return appendOp ( FsWindows.count ( size ) );
+    return appendOp ( new WindowCountWrap ( size ) );
   }
 
   /// 2.7: time-based windowing with capacity bound.

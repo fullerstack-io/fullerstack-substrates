@@ -384,26 +384,20 @@ final class FsOperators {
 
   /// Ring-buffer lookback; emits initial for the first `depth` emissions.
   static final class Delay < E > implements Consumer < E > {
-    final int            depth;
-    final Object[]       buffer;
+    final DelayLine      line;
     final Consumer < E > d;
-    int  idx;
-    long count;
 
     Delay ( int depth, E initial, Consumer < E > d ) {
-      this.depth  = depth;
-      this.buffer = new Object[depth];
-      Arrays.fill ( buffer, initial );
-      this.d = d;
+      this.line = DelayLine.seeded ( depth, initial );
+      this.d    = d;
     }
 
     @Override
     @SuppressWarnings ( "unchecked" )
     public void accept ( E v ) {
-      E out = (E) buffer[idx];
-      buffer[idx] = v;
-      idx = ( idx + 1 ) % depth;
-      count++;
+      // Read the value from `depth` admissions ago, then append — which evicts it.
+      final E out = (E) line.at ( 0 );
+      line.append ( v );
       d.accept ( out );
     }
   }
@@ -613,30 +607,26 @@ final class FsOperators {
     final int                  size;
     final BinaryOperator < E > combiner;
     final E                    identity;
-    final Object[]             buffer;
+    final DelayLine            line;
     final Consumer < E >       d;
-    int filled;
 
     Rolling ( int size, BinaryOperator < E > combiner, E identity, Consumer < E > d ) {
       this.size     = size;
       this.combiner = combiner;
       this.identity = identity;
-      this.buffer   = new Object[size];
+      this.line     = DelayLine.of ( size );
       this.d        = d;
     }
 
     @Override
     @SuppressWarnings ( "unchecked" )
     public void accept ( E v ) {
-      if ( filled == size ) {
-        System.arraycopy ( buffer, 1, buffer, 0, size - 1 );
-        buffer[size - 1] = v;
-      } else {
-        buffer[filled++] = v;
-        if ( filled < size ) return;   // warm-up: the first size-1 inputs emit nothing
-      }
+      line.append ( v );
+      if ( !line.full () ) return;    // warm-up: the first size-1 inputs emit nothing
+      // The fold stays O(size): an arbitrary BinaryOperator is not invertible, so a sliding
+      // reduce cannot be computed incrementally. Only the eviction became O(1).
       E acc = identity;
-      for ( int i = 0; i < size; i++ ) acc = combiner.apply ( acc, (E) buffer[i] );
+      for ( int i = 0; i < size; i++ ) acc = combiner.apply ( acc, (E) line.at ( i ) );
       if ( acc != null ) d.accept ( acc );
     }
   }

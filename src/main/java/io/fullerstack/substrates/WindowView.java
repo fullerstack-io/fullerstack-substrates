@@ -17,128 +17,43 @@ import java.lang.invoke.VarHandle;
 
 import static java.util.Objects.requireNonNull;
 
-/// **FsWindow** — array-backed view over a stable emission set.
+/// **WindowView** — the `Window` implementation: a strided view over a [DelayLine]'s ring.
 ///
-/// Implements `Substrates.Window<E>` (new in 2.6). A Window is callback-scoped:
-/// instances are only valid during the callback that received them. Restriction
-/// operations (`prefix`, `suffix`, `skip`, `trim`, `slice`, `reverse`) produce
-/// new view instances over the **same underlying buffer** — no value copies.
+/// §6.2.3 emits a window on every accepted input, and the spec is explicit that this is a view
+/// rather than a copy — "emitted windows are temporal views over a worker-thread-local ring".
+/// Nothing is copied here: a view is `(buffer, start, length, reversed)`, and every restriction
+/// (`prefix`, `suffix`, `skip`, `trim`, `slice`, `reverse`) computes another view over the same
+/// storage.
 ///
-/// ## Strided view representation
+/// ## Encounter order
 ///
-/// `(buffer, start, length, reversed)`:
-/// - `buffer` — the underlying Object[] holding values
-/// - `start`  — physical offset of the leftmost value in this view's bounds
-/// - `length` — number of values visible through this view
-/// - `reversed` — when true, encounter order traverses [start+length-1 .. start]
-///                instead of [start .. start+length-1]
+/// Index `i` maps to a physical slot as:
+/// - `reversed = false` — `buffer[ start + i ]`
+/// - `reversed = true`  — `buffer[ start + length - 1 - i ]`
 ///
-/// Encounter-order index `i` maps to physical buffer index:
-/// - reversed=false: `buffer[start + i]`
-/// - reversed=true:  `buffer[start + length - 1 - i]`
+/// both taken modulo the buffer, because the ring's `start` wraps. See [#at].
 ///
-/// Restriction operations compute the equivalent (start, length, reversed)
-/// for the requested sub-view; no element copies, allocation only of the
-/// new FsWindow record.
+/// ## Lifetime
+///
+/// A view is valid only inside the callback that received it (§6.4). §6.4.1 requires that to be
+/// detected rather than left undefined, by name and with the cost argument spelled out —
+/// "detection via a per-operator lease check imposes one branch per operator entry". Every
+/// operator below opens with that check; [WindowLease] is the mechanism, and a derived view
+/// inherits its root's lease and stamp so a whole family expires together.
 @SuppressWarnings ( "unchecked" )
-final class FsWindow < E > implements Window < E > {
-
-  /// The §6.4.1 temporal lease, shared by a root window and every view derived
-  /// from it.
-  ///
-  /// §6.4 makes `Window` callback-scoped, and §6.4.1 withdraws the
-  /// performance escape clause for this type by name: "Implementations MUST
-  /// detect and signal `Window` temporal contract violations; undefined
-  /// behavior is not an acceptable choice for this type." Its own cost
-  /// argument is the design here — "one branch per operator entry … entirely
-  /// off the framework emission hot path".
-  ///
-  /// The lease is a **(context, generation)** pair, opened afresh on every emission rather
-  /// than captured once, because the operator array reaches `wrap` without a circuit
-  /// reference and the stage always runs on the context that will deliver the window;
-  /// latching there gets the owner without threading a circuit through materialisation.
-  ///
-  /// **Both halves are load-bearing, and the second one was missing.**
-  ///
-  /// The *context* catches a window that has left the worker — another thread, another
-  /// circuit, a caller that came back for it after the circuit moved on. That is the escape
-  /// the TCK exercises.
-  ///
-  /// The *generation* catches a window retained into a later callback **on the same worker**,
-  /// which a bare thread check cannot see because the worker is still the worker. This is not
-  /// a stale read: `Flow.window` rewrites one buffer in place on every emission, so the
-  /// retained view reports whatever is in that buffer *now* while presenting itself as the
-  /// window from an earlier callback. §6.4.1 withdraws the performance escape clause for this
-  /// type by name — "Implementations MUST detect and signal `Window` temporal contract
-  /// violations; undefined behavior is not an acceptable choice for this type" — and a silent
-  /// wrong answer is the worst reading of that.
-  ///
-  /// Closing the lease around the operator call instead — latch, `accept`, release — does not
-  /// work: a transit hop queues the window and the receptor runs after `accept` has returned,
-  /// so release would fault every delivery the hop legitimately makes.
-  static final class Lease {
-
-    private static final VarHandle GENERATION;
-
-    static {
-      try {
-        GENERATION = MethodHandles.lookup ()
-          .findVarHandle ( Lease.class, "generation", long.class );
-      } catch ( ReflectiveOperationException error ) {
-        throw new ExceptionInInitializerError ( error );
-      }
-    }
-
-    /// The context that minted the current window.
-    private Thread owner;
-
-    /// Which mint the current window belongs to. Monotonic, and the half of the identity
-    /// that distinguishes one callback from the next on the SAME worker — the case a bare
-    /// thread check cannot see, because the worker is still the worker.
-    private long generation;
-
-    /// Opens a new generation and binds it to the minting context.
-    ///
-    /// Returns the generation the caller must stamp on the window it is about to emit.
-    /// `owner` is written first and published by the RELEASE store below, so a reader that
-    /// sees this generation also sees this owner. Release rather than volatile because this
-    /// runs on the emission path once per window, and on x86 a release store is a plain
-    /// store while a volatile store is a locked instruction.
-    long latch () {
-      final long next = generation + 1;
-      owner = Thread.currentThread ();
-      GENERATION.setRelease ( this, next );
-      return next;
-    }
-
-    /// §6.4.1: is `stamp`'s window still the one this lease describes?
-    ///
-    /// Two questions, and both are needed. The generation catches a window retained into a
-    /// LATER callback — the buffer has been rewritten under it, so the values it would return
-    /// are not the ones it was handed. The owner catches a window that has left the context
-    /// entirely, which the generation alone cannot see while the circuit is idle and the
-    /// generation has not moved.
-    ///
-    /// The acquire load orders the `owner` read after it, which is what makes the pair sound
-    /// from a thread that never latched.
-    boolean valid ( long stamp ) {
-      return (long) GENERATION.getAcquire ( this ) == stamp
-             && owner == Thread.currentThread ();
-    }
-
-  }
+final class WindowView < E > implements Window < E > {
 
   private final Object[] buffer;
   private final int      start;
   private final int      length;
   private final boolean  reversed;
-  private final Lease    lease;
+  private final WindowLease lease;
 
   /// The generation this window was minted in. A derived view inherits its root's, so a
   /// whole family of views expires together with the callback that produced the root.
   private final long     generation;
 
-  FsWindow ( Object[] buffer, int start, int length, boolean reversed, Lease lease, long generation ) {
+  WindowView ( Object[] buffer, int start, int length, boolean reversed, WindowLease lease, long generation ) {
     this.buffer     = buffer;
     this.start      = start;
     this.length     = length;
@@ -149,8 +64,8 @@ final class FsWindow < E > implements Window < E > {
 
   /// A restriction of this window: same buffer, same lease, same generation. Sharing the
   /// stamp is the point — a view must not outlive the callback its root belongs to.
-  private FsWindow < E > view ( int start, int length, boolean reversed ) {
-    return new FsWindow <> ( buffer, start, length, reversed, lease, generation );
+  private WindowView < E > view ( int start, int length, boolean reversed ) {
+    return new WindowView <> ( buffer, start, length, reversed, lease, generation );
   }
 
   /// §6.4.1: every operator entry — on the root window and on every derived

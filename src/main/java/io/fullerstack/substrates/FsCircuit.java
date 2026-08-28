@@ -61,39 +61,43 @@ import java.util.function.Function;
 @Provided
 public final class FsCircuit implements Circuit {
 
-  // Spin count before parking (~100μs with Thread.onSpinWait)
-  // Based on benchmarking: hot spin provides no benefit, cool spin of 1000 is optimal
-  /// Spin iterations an awaiter performs before falling back to park().
+  /// Iterations of `Thread.onSpinWait` an awaiter performs before it parks.
   ///
-  /// The marker fires within ~2µs when the worker is running, so spinning catches the signal
-  /// without paying the ~5-15µs virtual-thread park/unpark round trip. Behind a parked worker
-  /// it cannot: `await` unparks the worker, and that wake alone measures ~41µs at the median on
-  /// this box, which no spin of this length can cover.
+  /// A spin only pays while it can catch the marker. On a running worker the marker fires in
+  /// roughly a hundred nanoseconds, which any spin catches; behind a drain it cannot be caught
+  /// at all, and every further iteration is a core burned against the worker that will release
+  /// it. So the budget wants to be just longer than the fire time, and no longer.
   ///
-  /// Tuned by sweep, and the shape is a cliff rather than a slope: 500 falls below it
-  /// (shallow cyclic_emit_await regresses 10ns/op), 1000 catches the marker, 5000+ wastes
-  /// ~3ns/op on deep-cascade awaits whose 140µs the spin can never catch anyway. Real
-  /// awaits are rare — tests, shutdown, bridges — so the spin cost is negligible.
-  /// Iterations of `Thread.onSpinWait` before `await` parks.
+  /// Swept at 1000, 50 and 0 in one session, three forks each, on the rows built for the
+  /// question (`AwaitOps`, plus the cheapest batch rows, where an awaiter spinning through a
+  /// 10,000-item drain would show up if it showed up anywhere):
   ///
-  /// Tuned by sweep, and the shape is a cliff rather than a slope: 500 falls below it
-  /// (shallow `cyclic_emit_await` regresses 10ns/op), 1000 catches the marker, 5000+ wastes
-  /// ~3ns/op on deep-cascade awaits whose 140µs the spin can never catch anyway. Real
-  /// awaits are rare — tests, shutdown, bridges — so the spin cost is negligible.
+  /// | ns/op | 1000 | 50 | 0 |
+  /// |---|---:|---:|---:|
+  /// | `await_empty` | 87.4 | 95.2 | 614.3 |
+  /// | `await_one` | 103.1 | 102.6 | 668.2 |
+  /// | `await_after_batch` | 13464 | 13055 | 15487 |
+  /// | `async_emit_batch` | 11.64 | 11.03 | 11.32 |
+  /// | `empty_emit_batch` | 11.61 | 11.61 | 11.81 |
   ///
-  /// **What that sweep could not see.** It measured elapsed time on an otherwise idle box,
-  /// where the awaiter and the worker each hold a core and a spin is free. It does not measure
-  /// CPU *consumed*: behind a backlog the spin can never catch the marker, so it burns a core
-  /// for its whole duration — ~20-26µs on Zen 3, where `pause` is around 65 cycles — and
-  /// competes with the very worker that will release it. perfasm put `awaitImpl` at 22% of the
-  /// samples in a fanout batch and 10-23% across the batch families.
+  /// 50 and 1000 are the same measurement everywhere; 0 is 6-7x worse on the tight rows. So the
+  /// spin is worth having and its old length was not: the marker arrives inside the first
+  /// handful of iterations or not at all. 50 keeps the win and spends a twentieth of the CPU
+  /// when there is no win to be had.
   ///
-  /// Both readings are correct and they do not conflict: the spin costs no wall-clock when a
-  /// core is free, and costs a core when one is not. It is left at the swept value, and made
-  /// overridable via `io.fullerstack.substrates.await.spin` so the two can be measured against
-  /// each other in one binary rather than argued about.
+  /// Two earlier readings this supersedes. A sweep on the previous design found a cliff at 1000
+  /// — it was measuring a worker that self-woke on a 1µs timer, so a marker on a quiet circuit
+  /// took microseconds to fire rather than the ~100ns it takes a running worker now. And
+  /// perfasm put `awaitImpl` at 10-23% of samples across the batch families, which is true and
+  /// turned out not to be a wall-clock cost: the awaiter is the producer thread, which is idle
+  /// during the drain, so on a two-core box it burns its own core rather than the worker's. The
+  /// batch rows above are flat across all three arms, which is that prediction refuted.
+  ///
+  /// Overridable via `io.fullerstack.substrates.await.spin`. Raise it where an awaiter's park
+  /// round trip is dear — it measured ~520ns here, on a warm machine, and a cold or virtual
+  /// awaiter pays more.
   private static final int AWAIT_SPIN_COUNT =
-    Integer.getInteger ( "io.fullerstack.substrates.await.spin", 1_000 );
+    Integer.getInteger ( "io.fullerstack.substrates.await.spin", 50 );
 
   /// Bounded park on the slow path, so a close racing an await is observed without the
   /// awaiter having registered itself anywhere.

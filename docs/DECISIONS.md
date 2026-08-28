@@ -275,6 +275,43 @@ ordered. If a producer's flag read preceded the worker's flag write, that produc
 preceded it too, so the worker sees `head != tail` and does not park. The check is on the park
 path only and costs the emission path nothing.
 
+### The awaiter's spin: worth having, at a twentieth of its length
+
+`AwaitOps` exists because every other class ends an invocation with one `await` amortised over
+thousands of emissions, which can only ever show the spin's cost and never its benefit. Swept in
+one session, three forks per arm, on those rows plus the cheapest batch rows — where an awaiter
+spinning through a 10,000-item drain would surface if it surfaced anywhere:
+
+| ns/op | spin 1000 | spin 50 | spin 0 |
+|---|---:|---:|---:|
+| `await_empty` | 87.4 | 95.2 | **614.3** |
+| `await_one` | 103.1 | 102.6 | **668.2** |
+| `await_after_batch` | 13464 | 13055 | 15487 |
+| `async_emit_batch` | 11.64 | 11.03 | 11.32 |
+| `async_emit_admission_batch` | 10.26 | 10.10 | 9.82 |
+| `empty_emit_batch` | 11.61 | 11.61 | 11.81 |
+
+50 and 1000 are the same measurement on every row; 0 is 6-7× worse on the tight rows. A marker on
+a running worker fires in about a hundred nanoseconds — inside the first handful of iterations —
+and behind a drain no spin catches it at all. The budget therefore wants to be just longer than
+the fire time: **the default is now 50**, which keeps the win and spends a twentieth of the CPU
+when there is none to be had.
+
+**Two earlier readings this supersedes, and one refuted prediction.**
+
+- The sweep that chose 1000 found a cliff there, but it was measuring the old worker, which
+  self-woke on a 1µs timer: a marker on a quiet circuit took microseconds to fire rather than the
+  ~100 ns a running worker takes now. The cliff was a property of the design that has since gone.
+- perfasm put `awaitImpl` at 10-23% of samples across the batch families. True, and **not** a
+  wall-clock cost: the awaiter is the producer thread, idle during the drain, so on a two-core
+  box it burns its own core rather than the worker's. The prediction that a shorter spin would
+  return 5-20% to the batch rows is refuted by the flat rows above — the correct instrument for
+  "does this cost time" was never the sample profile.
+- The awaiter's park round trip measured **~520 ns** here, from the `spin 0` arm — not the
+  19-41µs an isolated park/unpark probe reported. That probe slept a millisecond between samples
+  and paid for waking descheduled CPUs; a warm handoff is two orders of magnitude cheaper. Wake
+  cost is not one number, and which one applies depends on whether the machine is warm.
+
 ### What the wake path costs, and the question it leaves open
 
 Unparking a parked thread on this box, measured in isolation (park, unpark from another thread,

@@ -663,7 +663,7 @@ This avoids locking during subscription changes — the spec's "eventual consist
 | `TransitQueueRing.INITIAL_CAP` | 8 | Initial transit ring capacity (grows by doubling). Cyclic cascades alternate enqueue/dequeue on one thread, so steady-state max simultaneous entries ≈ 1; an 8-slot start covers any realistic multi-submit fiber without growth |
 | `FsCircuit.SPIN_COUNT` | 1000 | Worker spin iterations before parking (~5µs with `Thread.onSpinWait`) |
 | `FsCircuit.SPIN_COUNT` | 1000 | Worker spin before parking (~26µs). A circuit fed faster than this never parks. Override: `io.fullerstack.substrates.worker.spin` |
-| `FsCircuit.AWAIT_SPIN_COUNT` | 1000 | Awaiter spin-before-park budget (~2µs window). Catches the marker fire in tight ping-pong (sync-bridge / shallow cyclic) without paying the virtual-thread park/unpark round-trip; falls back to `LockSupport.park()` for longer waits. Tuned via sweep — 500 falls below the cliff, 5000+ wastes spin on deep cascades. |
+| `FsCircuit.AWAIT_SPIN_COUNT` | 50 | Awaiter spin before parking. A marker on a running worker fires in ~100ns, so a short budget catches it; behind a drain no budget catches it. 50 and 1000 measure the same on every row, 0 is 6-7x worse on tight awaits. Override: `io.fullerstack.substrates.await.spin` |
 | `FsCircuit.PARK_NANOS` | 100,000,000 | Park timeout (100ms). A safety net only — producers unpark. Override: `io.fullerstack.substrates.worker.park` |
 
 ## Diagnostics

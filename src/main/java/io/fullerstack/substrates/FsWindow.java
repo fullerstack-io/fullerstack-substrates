@@ -1,5 +1,7 @@
 package io.fullerstack.substrates;
 
+import io.humainary.substrates.api.Substrates;
+import io.humainary.substrates.api.Substrates.Fault;
 import io.humainary.substrates.api.Substrates.NotNull;
 import io.humainary.substrates.api.Substrates.Window;
 
@@ -8,12 +10,6 @@ import java.util.function.BiFunction;
 import java.util.function.BinaryOperator;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
-
-import io.humainary.substrates.api.Substrates;
-import io.humainary.substrates.api.Substrates.Fault;
-
-import java.lang.invoke.MethodHandles;
-import java.lang.invoke.VarHandle;
 
 import static java.util.Objects.requireNonNull;
 
@@ -83,13 +79,18 @@ final class FsWindow < E > implements Window < E > {
   /// Encounter-order accessor.
   ///
   /// The physical index is taken modulo the buffer, which is why every buffer handed to this
-  /// type MUST have a power-of-two length (`FsFlow.physical`). Two reasons, and the second is
-  /// the one that pays: a ring-backed window presents a `start` that wraps, so the modulo is
-  /// load-bearing there; and on every backing strategy the masked index is *provably* within
-  /// the array, so C2 drops the bounds check it cannot drop for a bare `start + idx`.
+  /// type MUST have a power-of-two length (`DelayLine.physical`). Two reasons, and the second
+  /// is the one that pays: a ring-backed window presents a `start` that wraps, so the modulo is
+  /// load-bearing there; and the masked index is *provably* within the array, so C2 drops the
+  /// bounds check it cannot drop for a bare `start + idx`.
   ///
-  /// `buffer.length` is not an extra load — the bounds check needs the array length anyway,
-  /// so the mask reuses a value already in a register.
+  /// **The mask MUST be derived from `buffer.length` here, not held in a field.** That is what
+  /// makes the range check provable: C2 types `x & (len - 1)` as `[0, len - 1]` and drops the
+  /// check against `len`, whereas a field is opaque — it cannot know the field is `len - 1`, so
+  /// the check stays. Verified in the compiled code of this method: derived, the traversal loop
+  /// is `lea / mov / and / mov`; with the identical mask in a `final int` field, the same loop
+  /// carries an extra `cmp / jae` per element. Both loads hoist out of the loop, so the field
+  /// saves nothing and costs a range check on every element read. See `docs/DECISIONS.md`.
   private E at ( int idx ) {
     final int mask = buffer.length - 1;
     if ( reversed ) {

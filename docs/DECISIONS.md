@@ -146,6 +146,40 @@ On traversal the ring leads by 4.64 ns, the direction predicted by cache density
 element in an `Object[]` against 24 in a chain), but the error bars overlap and it is **not** a
 significant result on this hardware.
 
+### The index mask in a field — REFUTED, and it costs a range check per element
+
+`FsWindow.at` derives its mask as `buffer.length - 1` on every call. Holding it in a `final int`
+field instead looks free — the buffer is fixed for the view's life, the field is loop-invariant,
+and with compact headers it lands inside the padding the object already carries (37 bytes round
+to 40, as 33 did).
+
+It is not free, and the direction is the opposite of the intuition. The derived form is what
+makes the range check **provable**: C2 types `x & (len - 1)` as `[0, len - 1]` and drops the
+check against `len`. A field is opaque — nothing tells C2 it holds `len - 1` — so the check
+comes back. In the compiled body of `forEach` (`CompileCommand=print`, JDK 26, C2, unrolled by
+two), one element reads:
+
+```
+derived   lea (%rdx,%r9),%r8d ; mov %r11d,%esi ; and %r8d,%esi ; mov 0xc(%r10,%rsi,4),%eax
+field     lea (%rdx,%r14),%edi ; mov %edi,%ecx ; and %ebx,%ecx ; cmp %r9d,%ecx ; jae <trap>
+          ; mov 0xc(%r10,%rcx,4),%ecx
+```
+
+Both the mask and the array length hoist out of the loop either way, so the field saves no load
+and adds a compare and a branch to **every element read** — `forEach`, `all`, `any`, `none`,
+`count`, `fold`, `reduce`, and every derived view.
+
+**How it nearly shipped, which is the more useful half.** A before/after pair of decision runs
+showed most window rows faster and the change was written up as "~5% across every traversal row,
+and the uniformity identifies a per-element cost". The runs were not comparable: several rows
+carried errors as large as their means (`window_skip` 114.07 ± 36.51, `window_fold` 97.64 ±
+49.54), and `window_size` — which returns `length` and never calls `at` — moved -32%. The
+"uniformity" was machine state, not a per-element cost.
+
+**The general rule:** a per-element claim on this box cannot be settled by a pair of JMH runs.
+Read it off the compiled code or the allocation counter, where the answer does not depend on
+what else the machine was doing.
+
 ---
 
 ## Boundaries

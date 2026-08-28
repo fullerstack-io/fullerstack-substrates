@@ -322,11 +322,19 @@ timestamp the resume):
 | virtual | 41 µs | 401 µs | 2.4 ms |
 | platform | 19 µs | 25 µs | 1.7 ms |
 
-Both are slow in absolute terms — this is a 2 vCPU cloud VM, where waking a descheduled thread is
-expensive — but the *shape* differs: the virtual path's p90 is 16× the platform path's. Now that
-a wake sits on the critical path of a sporadic feed, the worker's thread kind is a live question
-rather than a free choice. It has not been decided here: it needs the same treatment this entry
-gave the park, including what N platform threads cost when N circuits are open.
+**These are cold figures and must not be read as the price of a wake.** The probe sleeps a
+millisecond between samples, so each one pays to wake CPUs the OS has already let go idle. A warm
+handoff is two orders of magnitude cheaper: the awaiter's park round trip read **~520 ns** off the
+`spin 0` arm of the await sweep, on a machine that was busy. The number that matters for a
+sporadic feed is the circuit's own after-idle delivery, measured above at ~39-48 µs p50 with a
+virtual worker.
+
+What the table does support is a difference in *shape*: the virtual path's p90 is 16× the
+platform path's on the same cold probe. Now that a wake sits on the critical path of a sporadic
+feed, the worker's thread kind is a live question rather than a free choice. It has not been
+decided here: it needs the same treatment this entry gave the park — a warm measurement of
+after-idle delivery on both, the hot rows re-run, and what N platform threads cost when N
+circuits are open.
 
 ---
 

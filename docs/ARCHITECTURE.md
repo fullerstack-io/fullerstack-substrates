@@ -200,29 +200,39 @@ Transit priority ensures **causal completion** — all cascading effects of an e
 The circuit thread runs a spin-then-park loop:
 
 ```java
-private void workerLoop() {
-  final IngressQueue q = ingress;
+private void drainLoop() {
+  final JobQueue q = ingress;
 
   for (;;) {
-    boolean didWork = q.drainBatch(this);  // drain ingress + interleaved transit
-    if (didWork) continue;
+    if (q.drainBatch(this)) continue;      // drain ingress + interleaved transit
     if (shouldExit) return;
 
-    // Spin before parking
+    // Spin first: a circuit fed faster than the spin lasts never parks at all
     Object found = null;
     for (int i = 0; i < SPIN_COUNT && found == null; i++) {
       Thread.onSpinWait();
       found = q.peek();
     }
+    if (found != null) continue;
 
-    if (found == null) {
-      LockSupport.parkNanos(PARK_NANOS);   // self-waking timed park
-    }
+    parked = true;                         // published before the re-check
+    VarHandle.fullFence();
+
+    // quiescent() = nothing linked AND no producer holding an unlinked slot
+    while (q.quiescent() && !shouldExit) LockSupport.parkNanos(PARK_NANOS);
+
+    parked = false;
   }
+}
+
+// on every admission from a thread that is not the worker
+final void submitIngress(Consumer<Object> receiver, Object value) {
+  ingress.enqueue(receiver, value, false);
+  if (parked) LockSupport.unpark(worker);
 }
 ```
 
-**Self-waking design:** the worker uses `parkNanos` instead of `park`. Producers never call `unpark` — the worker wakes itself after the timeout. This eliminates the cost of producer-side park/unpark coordination on the hot path. The only explicit `unpark` calls are from `await()` and `close()` (cold paths).
+**Park until told:** the worker spins, then publishes `parked` and parks; a producer that admits work reads that flag after its exchange and unparks the worker. The pair is a Dekker handshake, so no admission can be left unnoticed, and the timeout is only a safety net for a wake that was somehow missed. The worker used to self-wake on a 1µs `parkNanos` with no producer-side coordination at all: measured, that cost 0.95 cores per *idle* circuit and delivered an emission into a quiet circuit in 648µs at the median and 3.8ms at p90, because the timer that had to wake it competed with the carrier it was spinning on. The producer now pays one byte load and a not-taken branch on a cache line it already reads (`closed` and `parked` are adjacent). See `docs/DECISIONS.md`.
 
 **Callback isolation (spec §15.4):** `IngressQueue.drainBatchLoop` and `TransitQueueRing.drain` each wrap their `r.accept(v)` dispatch in a `try { … } catch (Throwable ignored) { }` so an uncaught client-callback exception cannot terminate the worker. `FsChannel`'s multi-consumer dispatch lambda wraps each sibling receptor invocation the same way — a throwing receptor doesn't block siblings on the same channel from receiving the emission (§16.1 #14). The subscriber callback in `FsChannel.rebuild` is similarly guarded and records an empty consumer list on throw so the callback is never retried for that subscription/channel pair (§16.1 #15).
 
@@ -642,7 +652,7 @@ This avoids locking during subscription changes — the spec's "eventual consist
 | Wait-free producer | Performance — `getAndAdd` always succeeds in one atomic operation |
 | No node pooling | Adds contention, breaks wait-free property |
 | Eager thread start | Circuit ready immediately on construction |
-| Self-waking park | Producers never pay unpark cost on hot path |
+| Spin, then park until told | An idle circuit consumes nothing; a busy one never parks, so its producers never pay an unpark |
 
 ## Constants
 
@@ -652,8 +662,9 @@ This avoids locking during subscription changes — the spec's "eventual consist
 | `QChunk.ARRAY_LEN` | 256 | Array length (128 × 2 for interleaving) |
 | `TransitQueueRing.INITIAL_CAP` | 8 | Initial transit ring capacity (grows by doubling). Cyclic cascades alternate enqueue/dequeue on one thread, so steady-state max simultaneous entries ≈ 1; an 8-slot start covers any realistic multi-submit fiber without growth |
 | `FsCircuit.SPIN_COUNT` | 1000 | Worker spin iterations before parking (~5µs with `Thread.onSpinWait`) |
+| `FsCircuit.SPIN_COUNT` | 1000 | Worker spin before parking (~26µs). A circuit fed faster than this never parks. Override: `io.fullerstack.substrates.worker.spin` |
 | `FsCircuit.AWAIT_SPIN_COUNT` | 1000 | Awaiter spin-before-park budget (~2µs window). Catches the marker fire in tight ping-pong (sync-bridge / shallow cyclic) without paying the virtual-thread park/unpark round-trip; falls back to `LockSupport.park()` for longer waits. Tuned via sweep — 500 falls below the cliff, 5000+ wastes spin on deep cascades. |
-| `FsCircuit.PARK_NANOS` | 1,000 | Timed park interval (1µs — virtual-thread-friendly) |
+| `FsCircuit.PARK_NANOS` | 100,000,000 | Park timeout (100ms). A safety net only — producers unpark. Override: `io.fullerstack.substrates.worker.park` |
 
 ## Diagnostics
 

@@ -29,6 +29,7 @@ import io.humainary.substrates.api.Substrates.Subject;
 import io.humainary.substrates.api.Substrates.Subscriber;
 import io.humainary.substrates.api.Substrates.Ticker;
 
+import java.lang.invoke.VarHandle;
 import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
@@ -48,7 +49,7 @@ import java.util.function.Function;
  *   <li>Pre-allocated ring buffer for transit (cascade emissions)
  *   <li>VarHandle release/acquire semantics for thread coordination
  *   <li>Thread identity routing (worker vs external)
- *   <li>Self-waking timed park — producers never wake the worker
+ *   <li>Park until told: an idle worker consumes nothing, and a producer wakes it
  * </ul>
  *
  * <p><b>Dual-queue architecture:</b>
@@ -64,9 +65,10 @@ public final class FsCircuit implements Circuit {
   // Based on benchmarking: hot spin provides no benefit, cool spin of 1000 is optimal
   /// Spin iterations an awaiter performs before falling back to park().
   ///
-  /// The marker fires within ~2µs in the common case (the worker self-wakes every
-  /// PARK_NANOS, drains, fires the marker), so spinning catches the signal without paying
-  /// the ~5-15µs virtual-thread park/unpark round trip.
+  /// The marker fires within ~2µs when the worker is running, so spinning catches the signal
+  /// without paying the ~5-15µs virtual-thread park/unpark round trip. Behind a parked worker
+  /// it cannot: `await` unparks the worker, and that wake alone measures ~41µs at the median on
+  /// this box, which no spin of this length can cover.
   ///
   /// Tuned by sweep, and the shape is a cliff rather than a slope: 500 falls below it
   /// (shallow cyclic_emit_await regresses 10ns/op), 1000 catches the marker, 5000+ wastes
@@ -97,12 +99,34 @@ public final class FsCircuit implements Circuit {
   /// awaiter having registered itself anywhere.
   private static final long AWAIT_PARK_NANOS = 1_000_000L;
 
-  private static final int SPIN_COUNT = 1000;
+  /// Iterations the worker spins on an empty queue before it parks.
+  ///
+  /// This is the latency/CPU dial, and it is a dial rather than a constant because the right
+  /// answer is a property of the deployment. A circuit fed faster than the spin lasts — about
+  /// 26µs at 1000 iterations on Zen 3, where `pause` is around 65 cycles — never parks, so it
+  /// keeps sub-microsecond pickup and its producers never pay an unpark. A circuit quieter than
+  /// that parks and consumes nothing until work arrives, at the cost of the wake path: measured
+  /// on this 2 vCPU box, unparking a parked virtual thread takes ~41µs at the median.
+  ///
+  /// Raise it to trade CPU for latency on a sporadic feed; a very large value spins forever and
+  /// restores the pre-park behaviour of holding a core per circuit.
+  private static final int SPIN_COUNT =
+    Integer.getInteger ( "io.fullerstack.substrates.worker.spin", 1000 );
 
-  // Timed park interval when no work after spin phase.
-  // Worker self-wakes — producers never need to unpark.
-  // 1μs: on virtual threads this is just an FJP reschedule, no carrier blocking.
-  private static final long PARK_NANOS = 1_000L;
+  /// How long the worker parks for when its spin found nothing.
+  ///
+  /// This is a **safety net, not the wake mechanism**: a producer that admits work to a parked
+  /// worker unparks it (see [#submitIngress]), so the timeout only bounds how long a wake that
+  /// was somehow missed could stall the circuit. At 100ms an idle circuit wakes ten times a
+  /// second to find an empty queue — 0.03% of a core including the spin that follows each wake.
+  ///
+  /// It used to be 1µs, back when the worker self-woke and nothing unparked it. That was
+  /// measured as the worst of both worlds: on a virtual thread a 1µs timed park costs more CPU
+  /// than spinning does (an idle circuit consumed 0.95 cores either way) and the timer that has
+  /// to deliver the wake competes with the very carrier that is spinning, so an emission into a
+  /// quiet circuit waited 648µs at the median and 3.8ms at p90. See `docs/DECISIONS.md`.
+  private static final long PARK_NANOS =
+    Long.getLong ( "io.fullerstack.substrates.worker.park", 100_000_000L );
 
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -146,6 +170,17 @@ public final class FsCircuit implements Circuit {
 
   // Set when close() is called to reject new emissions
   volatile boolean closed;
+
+  /// Whether the worker has committed to a park and needs an unpark to run again.
+  ///
+  /// Written by the worker only, at the two edges of a park; read by every producer after it
+  /// has admitted an emission. Both are volatile because the pair is a Dekker handshake — see
+  /// [#drainLoop] and [#submitIngress].
+  ///
+  /// It sits beside `closed` deliberately: producers read both on the same emission, and the
+  /// worker writes this one only when it parks or wakes, so the line stays shared-clean for as
+  /// long as the circuit has work.
+  private volatile boolean parked;
 
   // Pre-allocated marker receivers — ReceptorAdapter wrapping marker lambdas.
   // Drain loop splits the call site: isMarker() identity check routes markers
@@ -311,13 +346,21 @@ public final class FsCircuit implements Circuit {
   // Emission API (called by FsPipe)
   // ─────────────────────────────────────────────────────────────────────────────
 
-  /**
-   * Submit emission from external thread to ingress queue.
-   * Fire-and-forget: just enqueue, no worker wake-up.
-   * Worker self-wakes via timed park — producers never pay unpark cost.
-   */
+  /// Admits an emission from a thread that is not this circuit's worker.
+  ///
+  /// The enqueue is wait-free and the wake is a single volatile read that is false on every
+  /// emission into a circuit whose worker is running — the line is shared-clean, and the flag
+  /// only changes when the worker actually parks or leaves a park.
+  ///
+  /// **Why the read is there at all.** The worker used to self-wake on a 1µs timed park so that
+  /// producers paid nothing. Measured, that was the worst of both: a virtual thread's timed park
+  /// cost *more* CPU than spinning — an idle circuit consumed 0.95 cores — and the wake arrived
+  /// through a timer that the spinning carrier itself delayed, so a producer that emitted into a
+  /// quiet circuit waited 648µs at the median and 3.8ms at p90. Parking until told costs one
+  /// predictable branch here and lets an idle circuit consume nothing.
   final void submitIngress ( Consumer < Object > receiver, Object value ) {
     ingress.enqueue ( receiver, value, false );
+    if ( parked ) LockSupport.unpark ( worker );
   }
 
   /**
@@ -343,7 +386,7 @@ public final class FsCircuit implements Circuit {
     if ( onWorker () ) {
       transit.enqueue ( receiver, value );
     } else {
-      ingress.enqueue ( receiver, value, false );
+      submitIngress ( receiver, value );
     }
   }
 
@@ -417,7 +460,7 @@ public final class FsCircuit implements Circuit {
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // Worker Loop - FIFO depth-first processing with spin-before-park
+  // Worker Loop - FIFO depth-first processing, spin then park until woken
   // ─────────────────────────────────────────────────────────────────────────────
 
   private void workerLoop () {
@@ -453,7 +496,9 @@ public final class FsCircuit implements Circuit {
       // Check here after drain confirms empty — no work left, safe to exit.
       if ( shouldExit ) return;
 
-      // No work available - spin before parking
+      // Spin before parking. A circuit fed faster than the spin lasts never parks at all,
+      // so a busy worker keeps its sub-microsecond pickup and no producer ever pays an
+      // unpark: the spin is what makes the park protocol below free on a hot circuit.
       Object found = null;
 
       for ( int i = 0; i < SPIN_COUNT && found == null; i++ ) {
@@ -461,11 +506,23 @@ public final class FsCircuit implements Circuit {
         found = q.peek ();
       }
 
-      if ( found == null ) {
-        // Self-waking park — no producer wake-up needed.
-        // Worker resumes after PARK_NANOS or explicit unpark (await/close).
-        LockSupport.parkNanos ( PARK_NANOS );
-      }
+      if ( found != null ) continue;
+
+      // Committed to parking, so publish that first and re-check afterwards. This is the
+      // Dekker half of the wake protocol in `submitIngress`, and the re-check is
+      // `quiescent()` rather than `peek()` because a producer between its exchange and its
+      // link is invisible to `peek` while its own read of this flag may already have happened
+      // — see JobQueue#quiescent. The fence makes the store-then-load ordering explicit rather
+      // than resting on x86's, and costs nothing a park does not already cost.
+      parked = true;
+      VarHandle.fullFence ();
+
+      // Re-park rather than re-spin: a wake that finds nothing is either the safety timeout or
+      // a stale permit, and spinning 26µs on each of those is what an idle circuit would spend
+      // its CPU on.
+      while ( q.quiescent () && !shouldExit ) LockSupport.parkNanos ( PARK_NANOS );
+
+      parked = false;
     }
   }
 

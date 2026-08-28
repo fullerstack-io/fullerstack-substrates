@@ -120,6 +120,23 @@ final class JobQueue extends JobQueuePad2 {
     return NEXT.getAcquire ( tail );
   }
 
+  /// True when nothing is committed **and** no producer holds a slot it has not linked yet.
+  ///
+  /// [#peek] alone cannot carry the park decision. A producer publishes in two steps — exchange
+  /// the head, then link the previous node — and only the second is visible to `peek`. Between
+  /// them the queue looks empty, and the producer's own check of the worker's `parked` flag can
+  /// be reordered ahead of its link on any store-buffered machine, so both sides can conclude
+  /// "nothing to do here" about the same emission: the worker parks and the producer does not
+  /// wake it.
+  ///
+  /// The head closes that. Its write is the exchange — a locked read-modify-write, globally
+  /// ordered — so if a producer's flag read preceded the worker's flag write, that producer's
+  /// exchange precedes it too, and the worker sees `head != tail` and does not park. Read only
+  /// when the worker is about to park, never on the emission path.
+  boolean quiescent () {
+    return NEXT.getAcquire ( tail ) == null && head == tail;
+  }
+
   /// Runs every committed job, interleaving transit exactly as the chunked
   /// drain does. Returns true if any job ran.
   boolean drainBatch ( FsCircuit circuit ) {

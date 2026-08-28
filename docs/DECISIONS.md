@@ -182,6 +182,117 @@ what else the machine was doing.
 
 ---
 
+## Worker idle policy
+
+### Self-waking 1µs timed park — REFUTED: a core per idle circuit *and* millisecond wakes
+
+The worker used to spin 1000 times on an empty queue and then `parkNanos(1µs)`, with no
+producer-side coordination at all — "producers never pay unpark cost". Neither half of that
+sentence survived measurement.
+
+Nothing in the JMH suite could see it: every row there saturates the worker, so the idle policy
+never runs. A standalone probe (process CPU accounting, plus emit-to-receptor latency where the
+receptor stamps its own arrival and the producer never spins) reports both halves. One circuit,
+nothing admitted, 2 vCPU box:
+
+| worker idle policy | idle CPU | delivery after a 0.1 ms gap, p50 / p90 |
+|---|---:|---|
+| spin 1000 → park 1µs (shipped) | **0.95 cores** | 648 µs / 3.8 ms |
+| never park (pure spin) | 0.99 cores | 0.5 µs / 1.1 µs |
+| spin 0 → park 1µs | 1.05 cores | 133 µs / 3.5 ms |
+| spin 0 → park 1 ms | 0.085 cores | 919 µs / 946 µs |
+
+Three findings, and the third is the one that decided it.
+
+- **A 1µs timed park on a virtual thread costs more CPU than spinning.** Compare rows two and
+  three: parking on every idle round *raised* consumption. Each park unmounts a continuation and
+  schedules a timer task, and at microsecond periods that is more work than `pause`.
+- **An idle circuit consumed a core.** For a design whose doctrine is one circuit per logical
+  actor, that is not a tuning defect, it is a deployment ceiling: two idle actors saturate this
+  box.
+- **The self-wake was also the slow one.** Because nothing unparks the worker, an emission into a
+  quiet circuit waits for the timer — and the timer thread competes with the carrier the worker
+  is spinning on, so the wait is 648 µs at the median and 3.8 ms at p90. The design burned a core
+  *and* delivered late. Row four shows the same latency without the core, which is what any
+  longer park buys when no producer wakes anyone.
+
+### Spin, then park until told — the shipped design
+
+The worker still spins (`SPIN_COUNT`, ~26 µs), so a circuit fed faster than the spin lasts never
+parks and its producers never pay anything. When the spin finds nothing the worker publishes
+`parked` and re-checks the queue; a producer reads that flag after its exchange and unparks. The
+pair is a Dekker handshake — the exchange is a full fence and the worker's re-check follows an
+explicit `fullFence` — so an admission cannot be missed by both sides. The 100 ms park timeout is
+a safety net for a wake lost some other way, not the wake mechanism.
+
+A wake that finds nothing re-parks rather than re-spinning, so the safety timeout costs one
+loop iteration rather than a 26 µs spin every 100 ms.
+
+Measured on the same probe:
+
+| | before | after |
+|---|---:|---:|
+| idle CPU, one circuit | 0.95 cores | **0.004 cores** |
+| idle CPU, four circuits | ~4 cores' worth of demand on 2 vCPUs | **0.010 cores** |
+| delivery after 0.1 ms gap, p50 / p90 | 648 µs / 3.8 ms | 48 µs / 592 µs |
+| delivery after 1 ms gap, p50 / p90 | 392 µs / 2.5 ms | 39 µs / **82 µs** |
+| delivery after 5 ms gap, p50 / p90 | 8 µs / 1.9 ms | 39 µs / **62 µs** |
+| back-to-back delivery, p50 | 0.08–0.7 µs | 0.3 µs |
+
+The one regression is the p50 after a *long* quiet period — 8 µs → 39 µs — and it is the honest
+price: a circuit that quiet is now parked, and a wake costs what a wake costs. Everything at p90
+improves by 6–30×, because the old design's median was fast only while it held a core and its
+tail was the timer it depended on.
+
+**Liveness, stressed rather than argued.** With `worker.spin=0` (park on every idle round) and a
+2 s safety timeout, 13,000 admissions across one and three producers were all delivered, and the
+worst delivery was 4.8–12.8 ms — nowhere near the timeout, so no wake was missed. The control
+that never parks at all recorded a *worse* worst case (9.5 ms) on the same box, which is what
+identifies that tail as the environment — G1 and a 2 vCPU cloud VM — rather than the protocol.
+
+The producer pays one byte load and a not-taken branch, on a cache line it already reads —
+`closed` at offset 9 and `parked` at offset 10 of the circuit:
+
+```
+movzbl 0xa(%r11), %r10d ; testl %r10d, %r10d ; je <return>
+```
+
+`SPIN_COUNT` is the CPU/latency dial and is overridable
+(`io.fullerstack.substrates.worker.spin`): raise it to keep a sporadic feed hot at the cost of a
+core, or set it very large to restore the old always-spinning behaviour.
+
+### The park decision reads the producer's head, not just the link
+
+`peek()` alone cannot carry it. A producer publishes in two steps — exchange the head, then link
+the previous node — and only the link is visible to `peek`. Between them the queue looks empty,
+and the producer's own read of `parked` may be reordered ahead of its link on any store-buffered
+machine, x86 included: a release store followed by a load is exactly the pair TSO is allowed to
+reorder. Both sides could then conclude nothing was pending — the worker parks, the producer
+does not wake it — and the emission would wait for the safety timeout.
+
+The head closes it, because its write is the exchange: a locked read-modify-write, globally
+ordered. If a producer's flag read preceded the worker's flag write, that producer's exchange
+preceded it too, so the worker sees `head != tail` and does not park. The check is on the park
+path only and costs the emission path nothing.
+
+### What the wake path costs, and the question it leaves open
+
+Unparking a parked thread on this box, measured in isolation (park, unpark from another thread,
+timestamp the resume):
+
+| worker thread | p50 | p90 | p99 |
+|---|---:|---:|---:|
+| virtual | 41 µs | 401 µs | 2.4 ms |
+| platform | 19 µs | 25 µs | 1.7 ms |
+
+Both are slow in absolute terms — this is a 2 vCPU cloud VM, where waking a descheduled thread is
+expensive — but the *shape* differs: the virtual path's p90 is 16× the platform path's. Now that
+a wake sits on the critical path of a sporadic feed, the worker's thread kind is a live question
+rather than a free choice. It has not been decided here: it needs the same treatment this entry
+gave the park, including what N platform threads cost when N circuits are open.
+
+---
+
 ## Boundaries
 
 ### A per-emission envelope only allocates because it crosses a queue

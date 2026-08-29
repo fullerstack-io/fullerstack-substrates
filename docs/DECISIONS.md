@@ -182,6 +182,55 @@ what else the machine was doing.
 
 ---
 
+## Ring index masks
+
+### The derived-mask rule does NOT generalise to the retention or transit rings — REFUTED
+
+`FsWindow.at` derives its mask as `buffer.length - 1` because that is what lets C2 prove the index
+in range and drop the bounds check; holding the identical number in a field costs a `cmp/jae` per
+element (commit c37ff14). `DelayLine` and `TransitQueueRing` both hold a `mask` field, so applying
+the same rule to them looks like housekeeping. It was built, TCK-verified green, and measured — and
+it buys nothing at either site.
+
+What actually happens is that the guard **changes shape rather than disappearing**. Compiled
+`DelayLine.at`, standalone:
+
+```
+field    add / and(field) / load values / load len / cmpl len,idx / jae   -> 7 insns
+derived  load values / load len / add / leal -1 / and / testl len,len / jbe -> 8 insns
+```
+
+C2 does tie the mask to the array and drop the *index* comparison, but it cannot prove the array
+non-empty — a zero-length array would make the mask `-1` and the index unbounded — so it emits a
+length-zero guard in its place. One fused compare-and-branch either way, plus an extra `leal`.
+
+Inlined into `FsOperators$Rolling.accept`, which is the shape that matters, the fold loop reads
+`and / cmpl len,idx / jae` before and `and / testl len,len / jbe` after: same instruction count,
+same fused pair, the only difference being that the surviving branch is loop-invariant rather than
+index-dependent. Both are never taken and both predict perfectly.
+
+`TransitQueueRing` is the same result with the sign made obvious by size:
+
+| | before | after |
+|---|---|---|
+| `enqueue` | 9 `jae`, 0 `jbe`, 809 insns | 2 `jae`, 6 `jbe`, **823** insns |
+| `drain` | 7 `jae`, 0 `jbe`, 613 insns | 2 `jae`, 4 `jbe`, **619** insns |
+
+Seven index checks became six length guards and the body grew by fourteen instructions. Part of
+that is inherent to the ring: it indexes two parallel arrays, so masking each with its own length
+costs an extra `and` where one shared mask served both.
+
+**Why `FsWindow` is different, which is the transferable part.** There the view's own `length` field
+bounds the loop (`i < length`) and the buffer is a final field of a power-of-two ring, so C2 has
+everything it needs to fold the check away entirely. In the rings the array reference is mutable
+(`TransitQueueRing.grow` replaces both arrays) or the emptiness is simply not provable, and a
+derived mask can only convert an index check into a length check.
+
+**The rule is therefore about what C2 can prove at a particular site, not about where masks live.**
+Do not apply it anywhere else without reading the compiled body first; "it worked in FsWindow" is
+not an argument. Both edits were reverted. TCK was 960/0/0 and 1227/0/0 throughout, so this is a
+performance refutation and nothing more.
+
 ## Worker idle policy
 
 ### Self-waking 1µs timed park — REFUTED: a core per idle circuit *and* millisecond wakes

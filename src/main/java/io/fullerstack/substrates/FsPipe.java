@@ -27,18 +27,40 @@ public final class FsPipe < E > implements Pipe < E > {
   private final Consumer < Object > receiver;
   private final FsCircuit           circuit;
 
+  /// The enclosure a lazily-derived subject will hang from, or null when this pipe derives its
+  /// own from the circuit. Held instead of the subject itself so that an attachment which never
+  /// asks for a subject never mints one — see [#derive].
+  private final FsSubject < ? > parent;
+
   private volatile Subject < Pipe < E > > subject;
 
   /// Conduit pipe constructor — receiver is a channel.
   FsPipe ( FsChannel < E > channel, FsCircuit circuit ) {
     this.receiver = channel;
     this.circuit = circuit;
+    this.parent = null;
   }
 
   /// General constructor — for flow pipes, circuit.pipe(receptor), etc.
   FsPipe ( Consumer < Object > receiver, FsCircuit circuit ) {
     this.receiver = receiver;
     this.circuit = circuit;
+    this.parent = null;
+  }
+
+  /// Materialised-pipe constructor: records the enclosure and mints nothing.
+  ///
+  /// §4.3 puts a materialised pipe's enclosure at the pipe it feeds, and the eager form built
+  /// that subject at attachment whether or not anyone would ever read it — an `FsSubject` plus
+  /// the `FsId` inside it, and an increment of a process-global counter, per attachment. The
+  /// subject is reachable from the returned pipe, so escape analysis cannot remove it. Keeping
+  /// the parent instead defers all of that to the first caller who asks, and the identity that
+  /// results is the same one: [#derive] hangs it from this same parent object, which is what
+  /// §4.3's enclosure walk compares by reference.
+  FsPipe ( Consumer < Object > receiver, FsCircuit circuit, FsSubject < ? > parent ) {
+    this.receiver = receiver;
+    this.circuit = circuit;
+    this.parent = parent;
   }
 
   /// 2.7: named-pipe constructor. Pre-seeds the subject with the given
@@ -48,6 +70,7 @@ public final class FsPipe < E > implements Pipe < E > {
   FsPipe ( Consumer < Object > receiver, FsCircuit circuit, Name name, FsSubject < ? > parent ) {
     this.receiver = receiver;
     this.circuit = circuit;
+    this.parent = null;
     this.subject = (Subject < Pipe < E > >) (Subject < ? >) new FsSubject <> ( name, parent, Pipe.class );
   }
 
@@ -85,6 +108,11 @@ public final class FsPipe < E > implements Pipe < E > {
 
   @SuppressWarnings ( "unchecked" )
   private Subject < Pipe < E > > derive () {
+    // The recorded enclosure leads: a materialised pipe hangs from the pipe it feeds, and
+    // falling through to the circuit's subject instead would flatten the §4.3 path.
+    if ( parent != null ) {
+      return (Subject < Pipe < E > >) (Subject < ? >) new FsSubject <> ( null, parent, Pipe.class );
+    }
     return ( receiver instanceof FsChannel < ? > ch )
       ? (Subject < Pipe < E > >) (Subject < ? >) ch.subject ()
       : (Subject < Pipe < E > >) (Subject < ? >)

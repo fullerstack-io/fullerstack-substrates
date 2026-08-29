@@ -137,7 +137,7 @@ public final class FsFiber < E > implements Fiber < E > {
       // §4.3: a materialized pipe's enclosure is the pipe it feeds, one level
       // deeper, so chained attachments form a fully-qualified nested path.
       return new FsPipe <> ( (Consumer < Object >) (Consumer < ? >) chain, c,
-        null, (FsSubject < ? >) target.subject () );
+        (FsSubject < ? >) target.subject () );
     }
     // This provider's own non-FsPipe carriers (an FsSink channel pipe, say)
     // expose no receiver to submit to, so the chain is driven through emit().

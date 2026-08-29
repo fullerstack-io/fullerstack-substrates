@@ -220,6 +220,63 @@ also turned out to cost no wall-clock for the same class of reason.
 The change is kept for the overflow fix and because it is strictly less work, not for a speed
 claim that did not survive.
 
+## Attachment
+
+### A materialised pipe's subject is derived on demand, not at attachment — 48 B/op
+
+`Flow.pipe(target)` and `Fiber.pipe(target)` return a materialised pipe whose §4.3 enclosure is
+the pipe it feeds. Both built that subject eagerly, at attachment, whether or not anything would
+ever read it: an `FsSubject` (32 B) holding an `FsId` (16 B), the id coming from a process-global
+`AtomicLong.getAndIncrement`. Because the subject is stored into the returned pipe it escapes, so
+no escape analysis can remove it.
+
+`FsPipe` already had the lazy machinery — `subject()` derives under a monitor and caches — so the
+change is to record the *parent* rather than the finished subject, and let `derive()` hang the
+subject from it on first ask. The recorded-enclosure branch must LEAD in `derive()`, or a
+materialised pipe falls through to the circuit's subject as parent and the §4.3 path flattens.
+
+Measured with `-prof gc`, before -> after, every attachment row in the suite:
+
+| row | before | after |
+|---|---:|---:|
+| `FlowOps.pipe_create_map` | 104.00 | **56.00** |
+| `FiberOps.pipe_create_fiber` | 104.00 | **56.00** |
+| `ScanOps.pipe_create_scan` | 112.00 | **64.00** |
+| `RelateOps.pipe_create_relate` | 112.00 | **64.00** |
+| `RunChangeOps.pipe_create_run` / `_change` | 120.00 | **72.00** |
+| `ScanOps.pipe_create_flow_factory` | 152.00 | **104.00** |
+| `FlowOps.pipe_create_fiber_factory` | 152.00 | **104.00** |
+| `WindowOps.pipe_create_window` | 248.00 | **200.00** |
+| `WindowOps.pipe_create_window_duration` | 400.00 | **352.00** |
+
+Exactly 48 on all ten, which is its own check: `FsPipe` gained a field, and had that pushed the
+object into another size class the delta would have read 40. The fourth oop landed in padding the
+object already carried.
+
+**Why this was the riskiest item in the plan, and why it passed.** Deferring the subject changes
+*when* ids are minted, so the global id sequence differs from eager minting even though each
+chain's shape does not. `FlowContractTest` walks nested pipe subjects
+(`map_chainedPipes_nestSubjects`): under lazy derivation, asking the head for its subject forces
+the middle, which forces the tail, so the identical chain is built in the identical order, only
+later. TCK 960/0/0 and 1227/0/0.
+
+While here, `FsFlow.pipe` stopped calling `target.subject()` a second time when it already held
+the value in a local — javap had the duplicate invokeinterface at bci 35 and bci 125.
+
+### Two candidates declined without building them
+
+- **Collapsing `Diff`/`Heartbeat`'s `has` flag into a null check on `prev`.** The invariant is real
+  (`has == (prev != null)` on every reachable path, emissions being non-null per §1.2) and it
+  removes one field load per emission. Declined on this cycle's own evidence: removing a
+  **fourteen-cycle hardware divide** from `Every` moved its row 0.4 ns, inside the error bars. A
+  one-cycle load cannot matter where a divide did not, and it would trade a local invariant for a
+  global one — a user type violating `equals(null) == false` would silently lose its first
+  emission. `Change.has` and `SteadyPredicate.has` are not collapsible in any case: the first has
+  a key function that may legitimately return null, the second starts with a null `prev`.
+- **`Rolling` reading the ring directly instead of through `at()`.** Its author pre-registered the
+  prediction as EXACTLY ZERO — the fixture's combiner is a static method reference that inlines,
+  so C2 already hoists what the change would hoist by hand. A pre-registered zero is a result.
+
 ## Window layout
 
 ### The ring reference belongs to the lease, not to every view — 40 B to 32 B

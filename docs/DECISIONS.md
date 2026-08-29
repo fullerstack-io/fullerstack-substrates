@@ -220,6 +220,80 @@ also turned out to cost no wall-clock for the same class of reason.
 The change is kept for the overflow fix and because it is strictly less work, not for a speed
 claim that did not survive.
 
+## One routing decision, one context check
+
+### Three copies of §5.3 collapsed into one — and the canonical copy was the broken one
+
+`FsPipe.emit`, `FsPort.submit` and `FsCircuit.submit` each carried the same branch: on the worker
+go to transit, otherwise go to ingress. `FsCircuit.submit`'s own javadoc described itself as "the
+same routing decision `FsPipe.emit` makes, factored out" — the duplication was noticed and
+documented years of commits ago, and never actually collapsed.
+
+The three were not identical, which is what duplication buys:
+
+| | null check | close check | routes |
+|---|---|---|---|
+| `FsCircuit.submit` — the "factored out" one | — | **no** | yes |
+| `FsPipe.emit` | yes | yes | yes |
+| `FsPort.submit` | — | yes | yes |
+
+The copy calling itself canonical was the one missing the close check, so a Flow or Fiber terminal
+emitting after close still allocated a `Job` and linked it onto a queue nothing would drain. Not a
+contract breach — §9.1 means nothing admitted after the close marker is dispatched either way —
+but exactly the drift three copies of one rule produce.
+
+There is now one definition, and it carries the close check. **The gate was the compiled body**,
+because `emit` is the hottest path in the system and it now reaches the queue through another
+call: C2 inlines it completely — 896 bytes and 212 instructions before, 888 and 214 after.
+
+### `Pin`'s context guard asked the expensive form of the question — 8x to 280x
+
+§11.6 promises `Pin.get`/`set` with "no queueing, no admission overhead", and `FsPin.guard` asked
+the §11.3 question literally: `cortex().current() != circuit.current()`. Its own javadoc claimed
+that was free — "JIT-hoisted out of hot loops, so the per-access cost converges to a plain field
+read".
+
+It did not. `FsCircuit.onWorker`'s note already recorded why, for a different call site: the
+literal form is six dependent loads — ThreadLocal -> `t.threadLocals` -> `map.table` -> hash &
+mask -> `table[i]` -> weak-ref check -> `e.value` — measured at 16.9% of the emission profile when
+it sat there. That note is why `onWorker()` exists. `FsPin` never got the benefit.
+
+Interleaved A/B/A, `PinOps`' own baseline rows as controls:
+
+| ns/op | new-1 | old-1 | new-2 |
+|---|---:|---:|---:|
+| `get_loop_owner_context` | 0.632 | 5.538 | **0.492** |
+| `set_loop_owner_context` | 0.021 | 5.908 | **0.018** |
+| `get_set_loop_owner_context` | 0.879 | 9.655 | **0.844** |
+| `baseline_field_get_loop` (control) | 0.087 | 0.133 | 0.075 |
+| `baseline_field_set_loop` (control) | 0.021 | 0.020 | 0.018 |
+
+`set` is now **indistinguishable from a plain field store** — 0.018 against a 0.018 baseline. A
+thread-identity compare against a final field hoists out of the loop entirely; a ThreadLocal walk
+cannot, because the compiler has to assume the map can change. The doc's claim was right about
+what should happen and wrong about which construct delivers it.
+
+The `Current` still does the work it is good at, on the cold fault path, where §15.3 wants the
+offending context named rather than described.
+
+### Five queued paths still bypass the rule — OPEN
+
+`FsBasin.drain`, `FsConduit`'s subscribe / close / unsubscribe, and `FsSubscription`'s onClose
+callback all call `submitIngress` unconditionally, so work raised **on the worker** is admitted as
+ingress rather than transit. §11.6 states the rule for the same class of operation — "A call from
+the owning circuit context is transit work (§5.3) and MUST NOT ... jump ahead of previously
+accepted transit work" — and §5.3 makes it general.
+
+`FsBasin.drain` is the one that matters: draining from inside a receptor is the natural pattern,
+and today that drain lands after the current cascade's causal-completion boundary instead of
+within it. The TCK is green, so this is untested rather than caught.
+
+The structural half of the fix is what stops it recurring: `submitIngress` is package-visible, so
+five classes can reach past `submit`, and the rule survives only by convention — which is how it
+drifted. Making `submit` the sole entry and `submitIngress` private to `FsCircuit` (the await and
+close markers that legitimately need raw ingress all live in that class) makes the wrong call
+unreachable rather than merely discouraged.
+
 ## Attachment
 
 ### A materialised pipe's subject is derived on demand, not at attachment — 48 B/op

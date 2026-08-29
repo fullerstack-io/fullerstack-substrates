@@ -1,6 +1,5 @@
 package io.fullerstack.substrates;
 
-import static io.humainary.substrates.api.Substrates.cortex;
 import static java.util.Objects.requireNonNull;
 
 import io.humainary.substrates.api.Substrates.Fault;
@@ -92,17 +91,11 @@ public final class FsPort < E > implements Port < E > {
     } );
   }
 
-  /// Spec §11.6: ops from the worker are transit work, ops from any other
-  /// context are ingress work. After the owning circuit accepts close, ops
-  /// MUST NOT throw and MUST NOT take effect — silently drop, same as
-  /// `FsPipe.emit`.
+  /// Spec §11.6: ops from the worker are transit work, ops from any other context are ingress
+  /// work, and after the owning circuit accepts close they MUST NOT throw and MUST NOT take
+  /// effect. All three are [FsCircuit#submit]'s job — this once carried its own copy of that
+  /// branch, which is one of the places the rule was free to drift.
   private void submit ( Runnable action ) {
-    if ( circuit.closed ) return;
-    FsCircuit.CircuitJob job = new FsCircuit.CircuitJob ( action );
-    if ( circuit.onWorker () ) {
-      circuit.submitTransit ( job, null );
-    } else {
-      circuit.submitIngress ( job, null );
-    }
+    circuit.submit ( new FsCircuit.CircuitJob ( action ), null );
   }
 }

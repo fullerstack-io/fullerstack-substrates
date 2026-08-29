@@ -367,26 +367,22 @@ public final class FsCircuit implements Circuit {
     if ( parked ) LockSupport.unpark ( worker );
   }
 
-  /**
-   * Submit cascade emission from worker thread to transit queue.
-   * Single-threaded — uses shared QChunk buffer for zero-allocation transit.
-   */
-  final void submitTransit ( Consumer < Object > receiver, Object value ) {
-    transit.enqueue ( receiver, value );
-  }
-
-  /**
-   * Submit an emission to this circuit from an unknown thread — the same
-   * routing decision {@link FsPipe#emit} makes, factored out so that
-   * Flow/Fiber terminals reach the right queue too.
-   *
-   * <p>SPEC §5.3: a cascade re-entry raised on this circuit's own worker is
-   * transit work; anything raised from another thread — including another
-   * circuit's worker — is an ingress admission of <em>this</em> circuit. The
-   * transit ring is single-threaded, so routing a foreign-thread emission into
-   * it is a data race, not merely a lost emission.
-   */
+  /// Admits one emission to this circuit — **the** §5.3 routing decision, and the only copy.
+  ///
+  /// A cascade re-entry raised on this circuit's own worker is transit work; anything raised from
+  /// another thread — including another circuit's worker — is an ingress admission of *this*
+  /// circuit. The transit ring is single-threaded, so routing a foreign-thread emission into it
+  /// is a data race, not merely a lost emission.
+  ///
+  /// §9.1: an emission admitted after close never runs, because the close marker is enqueued
+  /// before `closed` is set and the worker stops at it. Dropping here rather than enqueueing is
+  /// therefore the same behaviour, minus a carrier linked onto a queue nothing will drain.
+  ///
+  /// `FsPipe.emit` and `FsPort` both used to carry their own copy of this branch, and the copy
+  /// that called itself canonical was the one missing the close check — which is how three
+  /// copies of one rule drift.
   final void submit ( Consumer < Object > receiver, Object value ) {
+    if ( closed ) return;
     if ( onWorker () ) {
       transit.enqueue ( receiver, value );
     } else {

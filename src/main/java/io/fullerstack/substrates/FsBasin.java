@@ -73,8 +73,10 @@ public final class FsBasin < E > implements Basin < E > {
     if ( ! ( pipe instanceof FsPipe < ? > ) ) {
       throw new Fault ( subject, "drain", "target pipe is not from this runtime provider" );
     }
-    if ( circuit.isClosed () ) return;
-    circuit.submitIngress (
+    // §5.3 routing, §9.1 post-close drop: both are FsCircuit.submit's job. A drain raised on the
+    // worker is transit work, so it stays inside the cascade that asked for it rather than landing
+    // in a later ingress turn — draining from inside a receptor is the natural shape for this.
+    circuit.submit (
       new FsCircuit.CircuitJob ( () -> {
         for ( E value : buffer ) {
           pipe.emit ( value );

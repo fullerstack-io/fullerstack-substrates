@@ -276,23 +276,44 @@ what should happen and wrong about which construct delivers it.
 The `Current` still does the work it is good at, on the cold fault path, where §15.3 wants the
 offending context named rather than described.
 
-### Five queued paths still bypass the rule — OPEN
+### Five queued paths bypassed the rule — FIXED, and it was losing work
 
-`FsBasin.drain`, `FsConduit`'s subscribe / close / unsubscribe, and `FsSubscription`'s onClose
-callback all call `submitIngress` unconditionally, so work raised **on the worker** is admitted as
-ingress rather than transit. §11.6 states the rule for the same class of operation — "A call from
-the owning circuit context is transit work (§5.3) and MUST NOT ... jump ahead of previously
-accepted transit work" — and §5.3 makes it general.
+`FsBasin.drain`, `FsConduit`'s subscribe / close / unsubscribe, and `FsSubscription`'s onClose all
+called `submitIngress` unconditionally, so work raised **on the worker** was admitted as ingress
+rather than transit. §11.6 states the rule for the same class of operation — "A call from the
+owning circuit context is transit work (§5.3) and MUST NOT ... jump ahead of previously accepted
+transit work" — and §7.6.1 makes it observable: "a single caller context that executes
+`subscribe(); emit(X); await()` observes the emission `X` on the new subscriber, by per-caller
+FIFO". For a caller on the worker that did not hold, because the emit was transit and the
+subscribe was ingress.
 
-`FsBasin.drain` is the one that matters: draining from inside a receptor is the natural pattern,
-and today that drain lands after the current cascade's causal-completion boundary instead of
-within it. The TCK is green, so this is untested rather than caught.
+**The symptom was worse than ordering.** A drain raised inside a receptor was appended to ingress
+*behind the await marker* that a caller had already queued, so `await` returned before the drain
+ran — and anything the caller did next, including closing the circuit, happened before the values
+were delivered. §5.5 promises await covers every operation enqueued before the call; this one
+escaped its own barrier.
 
-The structural half of the fix is what stops it recurring: `submitIngress` is package-visible, so
-five classes can reach past `submit`, and the rule survives only by convention — which is how it
-drifted. Making `submit` the sole entry and `submitIngress` private to `FsCircuit` (the await and
-close markers that legitimately need raw ingress all live in that class) makes the wrong call
-unreachable rather than merely discouraged.
+A probe with a competing ingress item admitted while the worker is inside the receptor (the shape
+that discriminates — see below), basin pre-loaded with 1 and 2:
+
+| | delivered before `await()` returned |
+|---|---|
+| before | `[next]` — the drained values never arrived |
+| after | `[1, 2, next]` — cascade work of the admission that raised it |
+
+All five now route through `submit`, and **`submitIngress` is private**. That is the half that
+stops it recurring: the method was package-visible, so five classes could reach past the rule, and
+the rule survived only by convention. The callers left inside `FsCircuit` are the ones for which
+ingress is the specified answer — `pulse`, which rejects a worker caller before it asks, and the
+positional markers, which *are* ingress positions.
+
+**Two probes were wrong before one discriminated**, which is worth recording. The first raced the
+admitting thread and passed on both arms. The second had both operations raised from one receptor
+and also passed on both arms — because the cascade is iterative: the drain job did run first, but
+its forwarded values queue behind work already in transit, so `[after, 1, 2]` is correct under
+either routing. Only a competing *ingress* item, admitted while the worker is inside the receptor,
+separates them. A probe that passes on both arms is not evidence of correctness; it is evidence
+the probe is measuring the wrong thing.
 
 ## Attachment
 

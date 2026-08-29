@@ -137,7 +137,7 @@ public final class FsSubscription implements Subscription {
     // §16.3 also covers the shutdown case: "If the owning circuit has already
     // terminated and cannot accept the cleanup work, the callback is not required
     // to run" — an admission after the close marker is simply never drained.
-    circuit.submitIngress (
+    circuit.submit (
       new FsCircuit.CircuitJob ( () -> {
         try {
           callback.accept ( this );

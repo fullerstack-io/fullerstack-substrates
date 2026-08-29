@@ -264,7 +264,7 @@ public final class FsConduit < E > implements Conduit < E > {
     // pollute ReceptorAdapter.accept's type profile on the hot path.
     // If the conduit is closed by the time this runs on the circuit thread,
     // silently drop per Resource §9.1 queued-operation semantics.
-    circuit.submitIngress (
+    circuit.submit (
       new FsCircuit.CircuitJob ( () -> { if ( !closed ) hub.addSubscriber ( fs ); } ),
       null
     );
@@ -310,7 +310,7 @@ public final class FsConduit < E > implements Conduit < E > {
       }
     }
 
-    circuit.submitIngress (
+    circuit.submit (
       new FsCircuit.CircuitJob ( () -> {
         if ( hub.subscribersList != null ) {
           hub.subscribersList.clear ();
@@ -356,7 +356,7 @@ public final class FsConduit < E > implements Conduit < E > {
   }
 
   private void enqueueUnsubscribe ( FsSubscriber < E > subscriber ) {
-    circuit.submitIngress ( new FsCircuit.CircuitJob ( () -> hub.removeSubscriber ( subscriber ) ), null );
+    circuit.submit ( new FsCircuit.CircuitJob ( () -> hub.removeSubscriber ( subscriber ) ), null );
   }
 
 }

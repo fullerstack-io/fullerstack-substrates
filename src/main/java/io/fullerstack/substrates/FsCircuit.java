@@ -362,7 +362,14 @@ public final class FsCircuit implements Circuit {
   /// through a timer that the spinning carrier itself delayed, so a producer that emitted into a
   /// quiet circuit waited 648µs at the median and 3.8ms at p90. Parking until told costs one
   /// predictable branch here and lets an idle circuit consume nothing.
-  final void submitIngress ( Consumer < Object > receiver, Object value ) {
+  /// **Private on purpose.** Admitting straight to ingress skips the §5.3 routing decision, and
+  /// five classes used to do exactly that — `FsBasin.drain`, `FsConduit`'s subscribe / close /
+  /// unsubscribe, and `FsSubscription`'s onClose — so work raised on the worker was admitted as
+  /// ingress instead of transit. The rule survived only by convention, and convention is what let
+  /// it drift. [#submit] is the way in; the only callers left here are the ones for which ingress
+  /// is the specified answer: `pulse`, which rejects a worker caller before it asks, and the
+  /// positional markers, which ARE ingress positions.
+  private void submitIngress ( Consumer < Object > receiver, Object value ) {
     ingress.enqueue ( receiver, value, false );
     if ( parked ) LockSupport.unpark ( worker );
   }
@@ -564,11 +571,17 @@ public final class FsCircuit implements Circuit {
     awaitImpl ();
   }
 
-  /// Conformance §16.1 #13: await / pulse / closeAwait MUST signal illegal
-  /// context use when called from within the circuit's worker thread.
-  /// Used by callers that need to fail-fast before any side effect runs.
+  /// Conformance §16.1 #13: await / pulse / closeAwait MUST signal illegal context use when
+  /// called from within the circuit's worker thread — a worker waiting on itself is a deadlock,
+  /// so this fails fast before any side effect runs.
+  ///
+  /// Asked as [#onWorker] rather than `cortex.current() == current()`. They are the same
+  /// predicate (§5.7 makes this circuit's `Current` its worker's), but the literal form is six
+  /// dependent loads through a ThreadLocal, and `await` runs this on every call. `FsPin` carried
+  /// the same expensive form for the same reason — habit, not need — and dropping it there took
+  /// `Pin.set` from 5.9 ns to a plain field store.
   void checkExternalCaller ( String op ) {
-    if ( cortex.current () == current () ) {
+    if ( onWorker () ) {
       throw new IllegalStateException (
         "Cannot call Circuit::" + op + " from within a circuit's thread" );
     }

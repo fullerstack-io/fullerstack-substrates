@@ -182,6 +182,44 @@ what else the machine was doing.
 
 ---
 
+## Operators
+
+### `every(n)`: a countdown, and a hardware divide that cost nothing
+
+`Every.accept` was `if (++count % n == 0)`. Two things were wrong with it and only one of them
+was what it looked like.
+
+**The real defect is overflow.** `count` grew without bound, so at 2^31 admissions it wrapped
+negative and the interval's phase shifted by one. At this implementation's rates that is about
+twenty seconds of saturated emission, not a theoretical horizon. A countdown cannot overflow.
+
+**The speed argument was refuted by its own measurement.** `n` is a non-constant field, so C2 had
+nothing to strength-reduce against and emitted the full sequence — a divide-by-zero test, the
+`INT_MIN / -1` special case, then `cltd; idivl`. Confirmed in the compiled body, and `idivl` goes
+2 -> 0 with the countdown. The prediction was ~5 ns of `every_batch`'s 17 ns, since a Zen 3
+32-bit divide is around fourteen cycles and the operator's whole budget over baseline was 5.6 ns.
+
+Measured A/B/A, same session, with two matched controls:
+
+| ns/op | new-1 | old-1 | new-2 |
+|---|---:|---:|---:|
+| `every_batch` | 17.689 ± 1.35 | 18.104 ± 1.31 | 17.760 ± 1.24 |
+| `every_duration_batch` (control) | 41.189 | 41.957 | 41.068 |
+| `baseline_plain_batch` (control) | 12.611 | 12.358 | 12.209 |
+
+**0.4 ns, inside the error bars.** The controls did not move, so the comparison was sound and the
+prediction was simply wrong.
+
+The mechanism of the miss is worth keeping: the divide feeds a branch that `every(2)` makes
+perfectly predictable, so the core speculates past it and the fourteen cycles retire in the shadow
+of the emit-and-hop path that actually bounds the row. **Latency on a dependency chain nothing
+waits on is free.** Counting instructions — even expensive, unmistakable ones — does not predict
+time; only the critical path does. Compare the `awaitImpl` spin, where 10-23% of profile samples
+also turned out to cost no wall-clock for the same class of reason.
+
+The change is kept for the overflow fix and because it is strictly less work, not for a speed
+claim that did not survive.
+
 ## Ring index masks
 
 ### The derived-mask rule does NOT generalise to the retention or transit rings — REFUTED

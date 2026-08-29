@@ -403,15 +403,39 @@ final class FsOperators {
   }
 
   /// Periodic sampling — emit every Nth value.
+  /// Counts down to the next admission that passes, rather than taking a modulus.
+  ///
+  /// The reason is correctness; the speed argument for it was measured and refuted.
+  ///
+  /// `++count % n` let `count` grow without bound, so after 2^31 admissions it wrapped negative
+  /// and the interval's phase shifted by one. That is not a theoretical horizon at this
+  /// implementation's rates — a circuit emitting at 10^8/s reaches it in about twenty seconds.
+  /// A countdown cannot overflow: `FsFiber.every(int)` rejects a non-positive interval before
+  /// this is constructed, so the counter always reloads from at least one.
+  ///
+  /// The modulus also put a **hardware divide on every admission** — `n` is a non-constant field,
+  /// so C2 emitted a divide-by-zero test, the `INT_MIN / -1` special case, then `cltd; idivl`.
+  /// Removing it was expected to be worth about 5 ns of `every_batch`'s 17 ns. It was worth
+  /// **0.4 ns, inside the error bars**: A/B/A measured 17.689 / 18.104 / 17.760 with
+  /// `every_duration_batch` and `baseline_plain_batch` as matched controls, both still.
+  ///
+  /// The divide is fourteen cycles that nothing waits on. It feeds a branch that `every(2)`
+  /// makes perfectly predictable, so the core speculates past it and retires it in the shadow of
+  /// the emit-and-hop path that actually bounds the row. An instruction count is not a time.
   static final class Every < E > implements Consumer < E > {
     final int            n;
     final Consumer < E > d;
-    int count;
+    int remaining;
 
-    Every ( int n, Consumer < E > d ) { this.n = n; this.d = d; }
+    Every ( int n, Consumer < E > d ) { this.n = n; this.d = d; this.remaining = n; }
 
     @Override
-    public void accept ( E v ) { if ( ++count % n == 0 ) d.accept ( v ); }
+    public void accept ( E v ) {
+      if ( --remaining == 0 ) {
+        remaining = n;
+        d.accept ( v );
+      }
+    }
   }
 
   /// Time-based rate limit (2.7) — per spec §6.2.3 `Fiber.every(Duration)`:

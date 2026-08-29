@@ -615,6 +615,16 @@ Until that runs, the choice is open and both implementations stay.
 
 ## Measurement practice
 
+- **A JMH baseline row does not calibrate the emission rows.** Between two runs a day apart, the
+  `PipeOps` emission rows moved ~22% (`async_emit_batch` 11.5 -> 14.0) while `baseline_counter`,
+  pure in-JVM ALU work, moved 7.5%. Reading the baseline as a scale factor would have left a
+  14-point "regression" to explain, and there was none: an interleaved A/B/A against the code from
+  before that day's changes put the old sources at the same ~14 ns, with `baseline_counter` steady
+  to three digits across all three arms. Emission crosses a thread boundary, so it tracks the
+  host's scheduling state, which drifts on its own schedule; a single-threaded baseline cannot see
+  that and cannot correct for it. Only an interleaved comparison can.
+
+
 - **Do not poll the machine during a run.** Interactive commands against the workspace produced
   3× iteration spikes and 5–10× variance, and inverted one result outright.
 - **A capacity or size sweep that looks flat may be hiding a fixed per-call cost.** Check the

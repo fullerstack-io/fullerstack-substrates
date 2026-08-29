@@ -316,6 +316,24 @@ No timing claim is made and none should be. 40 bytes of queued object cost 2.26 
 resolve. The result is 12.5% less allocation per window emission, which is a GC-pressure result,
 not a latency one.
 
+**The regression scare, and what it cost to settle.** Two `-prof gc` runs taken hours apart showed
+the window rows 7-16% slower after the change, which would have outweighed the allocation win
+several times over. It was noise. An interleaved A/B/A against the parent commit:
+
+| ns/op | new-1 | old-1 | new-2 |
+|---|---:|---:|---:|
+| `window_16_batch` | 30.429 | 31.527 | 34.093 |
+| `window_fold_batch` | 82.276 | 79.036 | 91.066 |
+| `window_for_each_batch` | 51.644 | 61.630 | 58.642 |
+| `window_size_batch` | 32.964 | 39.536 | 39.496 |
+
+On every row the two *same-arm* runs differ by more than either differs from the old arm, and the
+sequence drifts monotonically slower across the whole run. The arms cannot be separated. This is
+the third time in one session that a pair of runs taken minutes or hours apart manufactured a
+double-digit effect that an interleaved comparison dissolved — the first killed a mask field, the
+second nearly killed this change. **On this machine a cross-run pair is not evidence, whatever the
+percentage says.**
+
 ## Ring index masks
 
 ### The derived-mask rule does NOT generalise to the retention or transit rings — REFUTED

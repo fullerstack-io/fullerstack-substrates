@@ -213,19 +213,22 @@ public final class FsFlow < I, O > implements Flow < I, O > {
   static final class CountWindow implements Consumer < Object > {
     private final DelayLine           line;
     private final Consumer < Object > d;
-    /// §6.4.1 temporal lease, per materialisation — see [WindowLease].
-    private final WindowLease         lease = new WindowLease ();
+    /// §6.4.1 temporal lease, per materialisation — see [WindowLease]. Built from the line
+    /// rather than beside it: the lease carries the ring every view reads, so it cannot be a
+    /// field initialiser, which would run before the line exists.
+    private final WindowLease         lease;
 
     CountWindow ( int capacity, Consumer < Object > d ) {
-      this.line = DelayLine.of ( capacity );
-      this.d    = d;
+      this.line  = DelayLine.of ( capacity );
+      this.lease = new WindowLease ( line.buffer () );
+      this.d     = d;
     }
 
     @Override
     public void accept ( Object v ) {
       line.append ( v );
       d.accept (
-        new FsWindow <> ( line.buffer (), line.start (), line.size (), false, lease, lease.latch () )
+        new FsWindow <> ( line.start (), line.size (), false, lease, lease.latch () )
       );
     }
   }
@@ -272,12 +275,14 @@ public final class FsFlow < I, O > implements Flow < I, O > {
     private final long                durationNanos;
     private final DelayLine           line;
     private final Consumer < Object > d;
-    /// §6.4.1 temporal lease, per materialisation — see [WindowLease].
-    private final WindowLease         lease = new WindowLease ();
+    /// §6.4.1 temporal lease, per materialisation — see [WindowLease]. Built from the line
+    /// rather than beside it, for the reason given on [CountWindow#lease].
+    private final WindowLease         lease;
 
     DurationWindow ( long durationNanos, int capacity, Consumer < Object > d ) {
       this.durationNanos = durationNanos;
       this.line          = DelayLine.timed ( capacity );
+      this.lease         = new WindowLease ( line.buffer () );
       this.d             = d;
     }
 
@@ -295,7 +300,7 @@ public final class FsFlow < I, O > implements Flow < I, O > {
       line.append ( v, now );
 
       d.accept (
-        new FsWindow <> ( line.buffer (), line.start (), line.size (), false, lease, lease.latch () )
+        new FsWindow <> ( line.start (), line.size (), false, lease, lease.latch () )
       );
     }
   }

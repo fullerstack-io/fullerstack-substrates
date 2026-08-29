@@ -220,6 +220,45 @@ also turned out to cost no wall-clock for the same class of reason.
 The change is kept for the overflow fix and because it is strictly less work, not for a speed
 claim that did not survive.
 
+## Window layout
+
+### The ring reference belongs to the lease, not to every view — 40 B to 32 B
+
+A `Window` is minted per emission and again per restriction, while the ring it views over is a
+property of the *stage*: one materialisation, one `DelayLine`, one `WindowLease`. `FsWindow` was
+carrying its own reference to that one array, which under compact object headers is what pushed
+its fields from 29 bytes to 33 — and 33 pads to 40 where 29 pads to 32. Moving the reference into
+the lease, which every view already holds, takes 8 bytes off every window the circuit emits. The
+lease absorbs it free: 20 bytes padded to 24 becomes 24, and it is allocated once per stage.
+
+Measured with `-prof gc`, before and after, whole numbers:
+
+| row class | before | after |
+|---|---:|---:|
+| single window (13 rows) | 64.00 | **56.00** |
+| derived view (`prefix`/`suffix`/`slice`/`skip`/`trim`) | 104.00 | **88.00** |
+| `filter_then_window` (half the emissions survive) | 44.00 | **40.00** |
+| `fold` / `reduce` (the rest is the benchmark's boxing) | 272.00 | **264.00** |
+| `pipe_create_window` — MATCHED CONTROL | 248.00 | 248.00 |
+| `pipe_create_window_duration` — MATCHED CONTROL | 400.00 | 400.00 |
+
+The derived-view rows fall by 16 rather than 8 because both windows shrink — JFR names
+`FsWindow.view` as a second real 40-byte site. The two attachment rows are the control: they mint
+a lease and a line per operation but no window, and the lease did not grow, so they must not move.
+They did not.
+
+**The risk this carried, and why it did not fire.** `at()` now reaches the ring through one more
+indirection — `this.lease` then `lease.buffer` — which on a sixteen-element traversal would cost
+far more than the 8 bytes are worth if it happened per element. It does not. Both fields are
+final, so C2 hoists them: the compiled `forEach` loads `lease.buffer` and `buffer.length` once
+before the loop and the per-element body is `leal / andl / movl`, unchanged, still with no bounds
+check. That reading was the gate on this change, not the byte count.
+
+No timing claim is made and none should be. 40 bytes of queued object cost 2.26 ns on this box
+(`WindowBoundaryOps`), so 8 bytes is worth about 0.45 ns — below anything this machine can
+resolve. The result is 12.5% less allocation per window emission, which is a GC-pressure result,
+not a latency one.
+
 ## Ring index masks
 
 ### The derived-mask rule does NOT generalise to the retention or transit rings — REFUTED

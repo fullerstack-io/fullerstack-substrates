@@ -49,6 +49,18 @@ final class WindowLease {
     }
   }
 
+  /// The ring every window minted under this lease is a view over.
+  ///
+  /// It lives here rather than in each view because it is a property of the STAGE — one
+  /// materialisation, one line, one lease — while views are minted per emission and per
+  /// restriction. Holding it once takes a compressed oop out of `FsWindow`, whose fields then
+  /// sum to 29 bytes and pad to 32 rather than 33 padding to 40.
+  final Object[] buffer;
+
+  WindowLease ( Object[] buffer ) {
+    this.buffer = buffer;
+  }
+
   /// The context that minted the current window.
   private Thread owner;
 

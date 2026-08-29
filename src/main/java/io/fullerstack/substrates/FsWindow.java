@@ -39,7 +39,6 @@ import static java.util.Objects.requireNonNull;
 @SuppressWarnings ( "unchecked" )
 final class FsWindow < E > implements Window < E > {
 
-  private final Object[] buffer;
   private final int      start;
   private final int      length;
   private final boolean  reversed;
@@ -49,8 +48,7 @@ final class FsWindow < E > implements Window < E > {
   /// whole family of views expires together with the callback that produced the root.
   private final long     generation;
 
-  FsWindow ( Object[] buffer, int start, int length, boolean reversed, WindowLease lease, long generation ) {
-    this.buffer     = buffer;
+  FsWindow ( int start, int length, boolean reversed, WindowLease lease, long generation ) {
     this.start      = start;
     this.length     = length;
     this.reversed   = reversed;
@@ -61,7 +59,7 @@ final class FsWindow < E > implements Window < E > {
   /// A restriction of this window: same buffer, same lease, same generation. Sharing the
   /// stamp is the point — a view must not outlive the callback its root belongs to.
   private FsWindow < E > view ( int start, int length, boolean reversed ) {
-    return new FsWindow <> ( buffer, start, length, reversed, lease, generation );
+    return new FsWindow <> ( start, length, reversed, lease, generation );
   }
 
   /// §6.4.1: every operator entry — on the root window and on every derived
@@ -92,7 +90,8 @@ final class FsWindow < E > implements Window < E > {
   /// carries an extra `cmp / jae` per element. Both loads hoist out of the loop, so the field
   /// saves nothing and costs a range check on every element read. See `docs/DECISIONS.md`.
   private E at ( int idx ) {
-    final int mask = buffer.length - 1;
+    final Object[] buffer = lease.buffer;
+    final int      mask   = buffer.length - 1;
     if ( reversed ) {
       return (E) buffer[ ( start + length - 1 - idx ) & mask ];
     }

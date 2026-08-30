@@ -5,9 +5,9 @@ SPI provider implementation of the [Humainary Substrates API](https://github.com
 | | |
 |---|---|
 | **Version** | 3.0.0-SNAPSHOT |
-| **API** | Substrates 3.0.2 + Serventis 3.0.2 |
+| **API** | Substrates 3.0.5 + Serventis 3.0.5 |
 | **Java** | 26 (Virtual Threads + Preview) |
-| **Conformance** | Substrates TCK **960/960** · Serventis TCK **1227/1227** |
+| **Conformance** | Substrates TCK **970/970** · Serventis TCK **1227/1227** |
 | **Benchmarks** | [perfkit-java](https://github.com/humainary-io/perfkit-java) — 207 methods, 32 classes |
 
 ## Conformance is external

@@ -6,8 +6,8 @@ are](#what-the-local-tests-are-and-are-not).
 
 | Suite | Result |
 |---|---|
-| [`substrates-api-java-tck`](https://github.com/humainary-io/substrates-api-java-tck) 3.0.2 | **960 run · 0 failures · 0 errors** |
-| [`serventis-api-java-tck`](https://github.com/humainary-io/serventis-api-java-tck) 3.0.2 | **1227 run · 0 failures · 0 errors** |
+| [`substrates-api-java-tck`](https://github.com/humainary-io/substrates-api-java-tck) 3.0.5 | **970 run · 0 failures · 0 errors** |
+| [`serventis-api-java-tck`](https://github.com/humainary-io/serventis-api-java-tck) 3.0.5 | **1227 run · 0 failures · 0 errors** |
 
 ```bash
 ./scripts/tck.sh                              # both
@@ -130,6 +130,28 @@ thread whose stack is heap-allocated in chunks, so the leading hypothesis is chu
 under the memory pressure of a shared-JVM full-suite run rather than unbounded recursion. That is a
 hypothesis, not a diagnosis. Anyone touching the dispatch core should try to reproduce it under
 `-XX:+HeapDumpOnOutOfMemoryError` with a larger heap and a repeated full-suite loop.
+
+---
+
+## Documented limits (§4.1, §4.2)
+
+3.0.5 gives names a **depth floor of 16 segments** and requires an implementation that imposes a
+maximum to document it. This one imposes none: depth is an `int` field on `FsName`, not a packed
+encoding, so there is no design ceiling and nothing to declare as a limit.
+
+Measured, by successive extension, with traversal, `path()` and `compareTo` exercised at each depth
+— the operations §4.2 now brings in scope alongside traversal:
+
+| depth | result |
+|---:|---|
+| 16 | the guaranteed floor — accepted |
+| 32 | accepted (the reference implementation's stated maximum) |
+| 64 | accepted, in one operation and by extension |
+| 1 024 | accepted |
+| 8 192 | accepted — `stream()`, `path()` (64 425 chars) and `compareTo` all fine |
+| 65 536 | `OutOfMemoryError` — heap, not a depth rule |
+
+So the practical bound is memory. Portable code should still assume only the guaranteed 16.
 
 ---
 

@@ -106,7 +106,7 @@ class. It has not reproduced and no dump survived.
 
 Recorded rather than dismissed. The test is a stress case (10 threads × 5 000 emissions through 10
 named channels) and the paths it exercises are iterative, not recursive — `drainBatchLoop`,
-`TransitQueueRing.drain` and `FsCircuit.drainLoop` are flat loops. The worker is a **virtual**
+`TransitQueue.drain` and `FsCircuit.drainLoop` are flat loops. The worker is a **virtual**
 thread whose stack is heap-allocated in chunks, so the leading hypothesis is chunk-growth failure
 under the memory pressure of a shared-JVM full-suite run rather than unbounded recursion. That is a
 hypothesis, not a diagnosis. Anyone touching the dispatch core should try to reproduce it under

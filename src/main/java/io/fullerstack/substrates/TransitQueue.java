@@ -20,7 +20,7 @@ import java.util.function.Consumer;
 ///
 /// Single-thread ownership: only the circuit worker thread enqueues and
 /// drains. No memory barriers, no atomics.
-final class TransitQueueRing {
+final class TransitQueue {
 
   // Single-thread alternating enqueue/dequeue keeps simultaneous entries near 1
   // even at 10k-deep cyclic cascades — measured grows=0, currentSize≈1 always.

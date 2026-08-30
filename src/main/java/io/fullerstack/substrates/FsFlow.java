@@ -464,29 +464,25 @@ public final class FsFlow < I, O > implements Flow < I, O > {
           c.submit ( d != null ? d : channel, v );
         } );
       } else {
-        chain = wire ( subject, v -> c.submit ( targetReceiver, v ) );
+        // Same shape as the non-FsPipe fallback below: the chain's terminal step emits into the
+        // target pipe. `wire` drives a Consumer<Object>, so the target is viewed as one.
+        final Pipe < Object > carrier = (Pipe < Object >) (Pipe < ? >) target;
+        chain = wire ( subject, carrier::emit );
       }
       // §4.3: a materialized pipe's enclosure is the pipe it feeds, one level
       // deeper, so chained attachments form a fully-qualified nested path.
       return new FsPipe <> ( (Consumer < Object >) (Consumer < ? >) chain, c,
         (FsSubject < ? >) subject );
     }
-    // This provider's own non-FsPipe carriers (an FsSink channel pipe, say)
-    // expose no receiver to submit to, so the chain is driven through emit().
+    // This provider's own non-FsPipe carriers (an FsSink channel pipe, say) expose no receiver
+    // to submit to, so the chain is driven through emit(). It still belongs to a circuit, and the
+    // chain MUST run on that circuit's worker — returning a pipe that ran it inline here was the
+    // very defect the foreign-target check above exists to prevent (§16.1#1).
+    final FsCircuit owner = ( (FsSink.SinkPipe < ? >) target ).circuit ();
     final Pipe < Object > carrier = (Pipe < Object >) (Pipe < ? >) target;
     chain = wire ( subject, carrier::emit );
-    final Subject < Pipe < I > > nested = (Subject < Pipe < I > >) (Subject < ? >)
-      new FsSubject <> ( null, (FsSubject < ? >) target.subject (), Pipe.class );
-    return new Pipe <> () {
-      @Override
-      public void emit ( @NotNull I emission ) {
-        chain.accept ( emission );
-      }
-      @Override
-      public Subject < Pipe < I > > subject () {
-        return nested;
-      }
-    };
+    return new FsPipe <> ( (Consumer < Object >) (Consumer < ? >) chain, owner,
+      (FsSubject < ? >) subject );
   }
 
   /// 2.7: attach this flow's pipeline before a Cell's update pipe.

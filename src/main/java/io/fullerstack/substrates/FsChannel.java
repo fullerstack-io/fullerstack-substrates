@@ -41,7 +41,6 @@ final class FsChannel < E > implements Receptor < E >, Consumer < Object > {
   }
 
   private final Subject < Pipe < E > > subject;
-  private final FsCircuit              circuit;
   private final FsHub < E >            hub;
 
   /// §10.3 hierarchical routing: this channel's ancestor channels, ordered
@@ -99,7 +98,6 @@ final class FsChannel < E > implements Receptor < E >, Consumer < Object > {
     FsChannel < E >[] ancestors
   ) {
     this.subject = subject;
-    this.circuit = circuit;
     this.hub = hub;
     this.ancestors = ancestors;
     this.stem = ancestors.length != 0;

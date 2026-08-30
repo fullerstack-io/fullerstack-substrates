@@ -5,6 +5,7 @@ import io.humainary.substrates.api.Substrates.Name;
 import io.humainary.substrates.api.Substrates.Provided;
 import io.humainary.substrates.api.Substrates.Queued;
 import io.humainary.substrates.api.Substrates.Subject;
+import io.humainary.substrates.api.Substrates.Pipe;
 import io.humainary.substrates.api.Substrates.Subscription;
 
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -48,8 +49,14 @@ public final class FsSubscription implements Subscription {
   /// User-supplied close callback — fires exactly once when subscription terminates.
   private final Consumer < ? super Subscription > onCloseCallback;
 
+  /// The capability that carries [#terminate]'s callback into the circuit context, issued
+  /// through `Circuit.pipe(Receptor)`. Null when no callback was supplied, which is the common
+  /// case — a subscription that will never fire one builds nothing. The subscription itself is
+  /// the emission, so closing allocates no carrier. See `docs/CAPABILITIES.md`.
+  private final Pipe < Subscription > closures;
+
   /// Circuit reference — needed by closeAwait() to block until the
-  /// queued unsubscribe job has been processed, and to dispatch `onClose`
+  /// queued unsubscribe admission has been processed, and to dispatch `onClose`
   /// into the circuit context.
   private final FsCircuit circuit;
 
@@ -81,6 +88,15 @@ public final class FsSubscription implements Subscription {
     this.circuit = circuit;
     this.detach = detach;
     this.onCloseCallback = onCloseCallback;
+    this.closures = onCloseCallback == null ? null
+      : circuit.< Subscription >pipe ( subscription -> {
+          try {
+            onCloseCallback.accept ( subscription );
+          } catch ( Throwable ignored ) {
+            // §15.4: an onClose callback is external code. Its failure is isolated
+            // here so a sibling subscription's cleanup still runs (§15.4 #2).
+          }
+        } );
   }
 
   /// Returns the subject identity of this subscription. Lazy creation with
@@ -137,17 +153,7 @@ public final class FsSubscription implements Subscription {
     // §16.3 also covers the shutdown case: "If the owning circuit has already
     // terminated and cannot accept the cleanup work, the callback is not required
     // to run" — an admission after the close marker is simply never drained.
-    circuit.submit (
-      new FsCircuit.CircuitJob ( () -> {
-        try {
-          callback.accept ( this );
-        } catch ( Throwable ignored ) {
-          // §15.4: an onClose callback is external code. Its failure is isolated
-          // here so a sibling subscription's cleanup still runs (§15.4 #2).
-        }
-      } ),
-      null
-    );
+    closures.emit ( this );
   }
 
   @Idempotent

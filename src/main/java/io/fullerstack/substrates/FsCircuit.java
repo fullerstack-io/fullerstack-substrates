@@ -161,8 +161,8 @@ public final class FsCircuit implements Circuit {
   // Queue infrastructure
   // ─────────────────────────────────────────────────────────────────────────────
 
-  private final JobQueue         ingress = new JobQueue ();
-  private final TransitQueueRing transit = new TransitQueueRing ();
+  private final IngressQueue         ingress = new IngressQueue ();
+  private final TransitQueue transit = new TransitQueue ();
 
   // ─────────────────────────────────────────────────────────────────────────────
   // Synchronization state
@@ -232,7 +232,7 @@ public final class FsCircuit implements Circuit {
   // ─────────────────────────────────────────────────────────────────────────────
   // Marker classes — DO NOT COLLAPSE.
   //
-  // AwaitMarker, CloseMarker, CircuitJob, and ReceptorAdapter (above) are
+  // AwaitMarker, CloseMarker, and ReceptorAdapter (above) are
   // deliberately separate concrete classes, each with a distinct .accept()
   // body. Each call site in the dispatch chain only ever sees ONE of these
   // class types, which keeps every site monomorphic in the JIT type profile:
@@ -240,7 +240,6 @@ public final class FsCircuit implements Circuit {
   //   ReceptorAdapter.accept → receptor.receive   (user emissions, hot path)
   //   AwaitMarker.accept     → circuit.onAwaitMarker
   //   CloseMarker.accept     → circuit.onCloseMarker
-  //   CircuitJob.accept      → action.run         (subscribe / unsubscribe etc.)
   //
   // Collapsing any of these into a shared base reintroduces a bimorphic (or
   // worse) call-site profile on r.accept(v) in the drain loop. HotSpot then
@@ -285,15 +284,6 @@ public final class FsCircuit implements Circuit {
     @Override public void accept ( Object o ) { circuit.onCloseMarker ( o ); }
   }
 
-  /// Generic one-shot circuit job — wraps a Runnable for ingress dispatch.
-  /// Used by FsConduit subscribe/unsubscribe and similar circuit-thread-only work.
-  /// Distinct compiled body keeps the action.run() call site separate from
-  /// ReceptorAdapter.accept's receptor.receive() call site.
-  static final class CircuitJob implements Consumer < Object > {
-    final Runnable action;
-    CircuitJob ( Runnable action ) { this.action = action; }
-    @Override public void accept ( Object o ) { action.run (); }
-  }
 
   /// Pulse probe — single-use diagnostic carrier (spec §5.7, 2.4).
   /// Stamps `dequeued` on the worker thread and unparks the caller.
@@ -406,7 +396,7 @@ public final class FsCircuit implements Circuit {
   }
 
   /**
-   * Drain all queued cascade emissions. Delegates to TransitQueueRing.
+   * Drain all queued cascade emissions. Delegates to TransitQueue.
    */
   boolean drainTransit () {
     return transit.drain ();
@@ -490,7 +480,7 @@ public final class FsCircuit implements Circuit {
 
   private void drainLoop () {
     // Hoist final field to local — guarantees register allocation.
-    final JobQueue q = ingress;
+    final IngressQueue q = ingress;
 
     for ( ; ; ) {
 
@@ -499,7 +489,7 @@ public final class FsCircuit implements Circuit {
 
       if ( didWork ) continue;
 
-      // shouldExit is set by close marker (runs as ingress job on this thread).
+      // shouldExit is set by close marker (runs as ingress admission on this thread).
       // Check here after drain confirms empty — no work left, safe to exit.
       if ( shouldExit ) return;
 
@@ -519,7 +509,7 @@ public final class FsCircuit implements Circuit {
       // Dekker half of the wake protocol in `submitIngress`, and the re-check is
       // `quiescent()` rather than `peek()` because a producer between its exchange and its
       // link is invisible to `peek` while its own read of this flag may already have happened
-      // — see JobQueue#quiescent. The fence makes the store-then-load ordering explicit rather
+      // — see IngressQueue#quiescent. The fence makes the store-then-load ordering explicit rather
       // than resting on x86's, and costs nothing a park does not already cost.
       parked = true;
       VarHandle.fullFence ();
@@ -727,7 +717,7 @@ public final class FsCircuit implements Circuit {
   }
 
   /**
-   * Inject a marker job into the ingress queue.
+   * Inject a marker admission into the ingress queue.
    */
   private void marker ( Consumer < Object > callback ) {
     if ( closed ) return;
@@ -775,7 +765,7 @@ public final class FsCircuit implements Circuit {
     checkExternalCaller ( "closeAwait" );
     close ();
     // await() routes to awaitClosed() once `closed` is set, which joins the worker
-    // thread — that's exactly the "close job fully executed" guarantee.
+    // thread — that's exactly the "close admission fully executed" guarantee.
     await ();
   }
 
@@ -828,8 +818,10 @@ public final class FsCircuit implements Circuit {
   public < E > Sink < E > sink ( @NotNull Pipe < Capture < E > > endpoint ) {
     requireNonNull ( endpoint );
     requireOpen ( "sink" );
-    // SPEC §1307 — endpoint must be a runtime-provided implementation.
-    if ( ! ( endpoint instanceof FsPipe < ? > ) ) {
+    // SPEC §1307 — endpoint must be a runtime-provided implementation. By provider, not by
+    // concrete class: a Sink channel is provider-supplied and is a legal endpoint, so a sink may
+    // feed another sink. Only `emit` is used on it.
+    if ( FsOperators.foreign ( endpoint ) ) {
       throw new Fault ( subject, "sink", "endpoint pipe is not from this runtime provider" );
     }
     return new FsSink <> ( (FsSubject < ? >) subject, subject.name (), this, endpoint );
@@ -847,7 +839,7 @@ public final class FsCircuit implements Circuit {
     if ( ! ( name instanceof FsName ) ) {
       throw new Fault ( subject, "sink", "name is not from this runtime provider" );
     }
-    if ( ! ( endpoint instanceof FsPipe < ? > ) ) {
+    if ( FsOperators.foreign ( endpoint ) ) {
       throw new Fault ( subject, "sink", "endpoint pipe is not from this runtime provider" );
     }
     return new FsSink <> ( (FsSubject < ? >) subject, name, this, endpoint );
@@ -882,8 +874,9 @@ public final class FsCircuit implements Circuit {
     if ( interval.isZero () || interval.isNegative () ) {
       throw new IllegalArgumentException ( "interval must be strictly positive" );
     }
-    // SPEC §15.1 provider mismatch — target pipe must come from our provider.
-    if ( ! ( target instanceof FsPipe < ? > ) ) {
+    // SPEC §15.1 provider mismatch — target pipe must come from our provider. By provider, not
+    // by concrete class, so a ticker may tick into a Sink channel. Only `emit` is used on it.
+    if ( FsOperators.foreign ( target ) ) {
       throw new Fault ( subject, "ticker", "target pipe is not from this runtime provider" );
     }
     return new FsTicker ( (FsSubject < ? >) subject, name, this, interval, target );
@@ -977,7 +970,9 @@ public final class FsCircuit implements Circuit {
     requireNonNull ( targets );
     List < Pipe < ? super E > > snapshot = List.copyOf ( targets );
     for ( Pipe < ? super E > target : snapshot ) {
-      if ( ! ( target instanceof FsPipe < ? > ) ) {
+      // By provider, not by concrete class — fanOut only calls `emit`, so a Sink channel is a
+      // legal fan-out target.
+      if ( FsOperators.foreign ( target ) ) {
         throw new Fault ( subject, "pipe", "target pipe is not from this runtime provider" );
       }
     }

@@ -5,7 +5,8 @@ import io.humainary.substrates.api.Substrates.NotNull;
 import io.humainary.substrates.api.Substrates.Pool;
 import io.humainary.substrates.api.Substrates.Provided;
 
-import java.util.HashMap;
+import java.util.IdentityHashMap;
+import java.util.Map;
 import java.util.function.Function;
 
 import static java.util.Objects.requireNonNull;
@@ -20,21 +21,38 @@ import static java.util.Objects.requireNonNull;
 /// - If the function throws, the **same exception** is re-thrown on every
 ///   subsequent `get(name)` for that name without re-invoking the function.
 ///
-/// ## Allocation strategy — three-state lazy storage
+/// `Cortex.pool(fn)` is this type too, over an identity source: a root pool is a derivation that
+/// transforms a name into a value, so there is no separate root implementation.
 ///
-/// Most derived pools see at most one name (the pool is created at the
-/// moment of first lookup and often discarded afterwards). The cache is
-/// arranged as a state machine that allocates only when needed:
+/// This is the **only** pool implementation. `Conduit` and `Sink` do not write their own storage:
+/// they obtain one from `Cortex.pool(Function)`, the prescribed factory, and so land here too.
 ///
-/// - **EMPTY**: pool freshly constructed; only `source`/`fn` set.
-/// - **SINGLE**: one entry resolved; held inline as `(firstName, firstValue)`.
-///   No map allocated.
-/// - **MULTI**: a second distinct name forced promotion to a `HashMap`.
+/// ## Three states
 ///
-/// All transitions and cache reads are serialised on the pool's monitor.
-/// Most derived pools never leave SINGLE, so the synchronized cost is
-/// uncontended (~3 ns) and the only allocations are the pool object
-/// itself and the wrapper produced by the user function.
+/// Most pools only ever see one name — a derived pool is typically created at the moment of a
+/// lookup and discarded after it — so no map is allocated until a second distinct name arrives:
+///
+/// - **EMPTY** — nothing resolved; neither the entry nor the map exists.
+/// - **SINGLE** — one entry, held inline as `(last, cached)`. No map.
+/// - **MULTI** — a second distinct name promotes to an [IdentityHashMap], and the inline pair
+///   stays live as the one-entry cache in front of it.
+///
+/// ## Concurrency
+///
+/// A reader takes no lock. `get` used to be `synchronized` outright, which put a monitor in front
+/// of every channel resolution once `Conduit` and `Sink` started sharing this.
+///
+/// - The inline entry publishes **cached-then-last**, with `last` volatile. That release/acquire
+///   pair is what makes the lock-free fast path sound: a reader seeing a `last` sees the `cached`
+///   written before it, and can never pair one entry's name with another's value.
+/// - [#overflow] is volatile and replaced, never mutated, so a reader holding the old map stays
+///   consistent.
+/// - Resolution is serialised on this pool's monitor and re-checks after acquiring it, so the
+///   function runs **at most once per name** however many callers race — which is what §10.1's
+///   exactly-once rests on.
+/// - The function may re-enter [#get] for other names: a hierarchical conduit channel
+///   materialises its ancestors that way. The monitor is reentrant and every publish re-reads the
+///   field, so entries added by the recursion survive the outer publish.
 @Provided
 final class FsDerivedPool < T, S > implements Pool < T > {
 
@@ -49,14 +67,14 @@ final class FsDerivedPool < T, S > implements Pool < T > {
   private final Pool < S >                          source;
   private final Function < ? super S, ? extends T > fn;
 
-  // Inline single-entry cache (state SINGLE). Both fields plain — accessed
-  // only under `synchronized(this)` so plain stores/reads are safe.
-  private Name   firstName;
-  private Object firstValue;
+  /// The inline entry — the whole of state SINGLE, and the one-entry cache in state MULTI.
+  /// Written cached-first; `last` is volatile so the pair publishes as one. See above.
+  private Object        cached;
+  private volatile Name last;
 
-  // Multi-entry cache (state MULTI), allocated lazily on the second distinct
-  // name. Plain HashMap is fine — all access is under `synchronized(this)`.
-  private HashMap < Name, Object > overflow;
+  /// Resolved outcomes by name — a value, [#NULL_RESULT], or a [CachedFailure]. Allocated on the
+  /// second distinct name and replaced on every insert.
+  private volatile Map < Name, Object > overflow;
 
   FsDerivedPool ( Pool < S > source, Function < ? super S, ? extends T > fn ) {
     this.source = source;
@@ -65,51 +83,66 @@ final class FsDerivedPool < T, S > implements Pool < T > {
 
   @NotNull
   @Override
-  public synchronized T get ( @NotNull Name name ) {
-    // §15.2 absence violation: a required argument is never optional. Checked
-    // before the inline-entry compare, which would otherwise read `null ==
-    // firstName` as a cache hit on a freshly constructed pool and hand back null.
+  public T get ( @NotNull Name name ) {
+    // §15.2 absence violation: a required argument is never optional. Checked before the store is
+    // consulted, whose inline entry is null on a fresh pool and would read a null name as a hit.
     requireNonNull ( name, "name must not be null" );
-    // SINGLE — fast match on the inline entry. Names are interned so `==` is
-    // the canonical comparison.
-    if ( name == firstName ) return unwrap ( firstValue, name );
 
-    // MULTI — overflow map exists; look up there.
-    HashMap < Name, Object > m = overflow;
-    if ( m != null ) {
-      Object cached = m.get ( name );
-      if ( cached != null ) return unwrap ( cached, name );
-      Object computed = computeAndWrap ( name );
-      m.put ( name, computed );
-      return unwrap ( computed, name );
+    if ( name == last ) return unwrap ( cached, name );
+
+    final Map < Name, Object > map = overflow;
+    if ( map != null ) {
+      final Object hit = map.get ( name );
+      if ( hit != null ) return unwrap ( remember ( name, hit ), name );
     }
 
-    // EMPTY → SINGLE: this is the first entry.
-    if ( firstName == null ) {
-      Object result = computeAndWrap ( name );
-      firstValue = result;
-      firstName  = name;
-      return unwrap ( result, name );
-    }
-
-    // SINGLE → MULTI: a second distinct name forces map promotion. Preserve
-    // the inline entry inside the new map. We deliberately keep `firstName`
-    // populated as well so that the fast path above continues to short-circuit
-    // for the dominant first-name lookup pattern.
-    m = new HashMap <> ( 4 );
-    m.put ( firstName, firstValue );
-    Object result = computeAndWrap ( name );
-    m.put ( name, result );
-    overflow = m;
-    return unwrap ( result, name );
+    return unwrap ( resolve ( name ), name );
   }
 
-  /// Wraps the user function so we can cache sentinels for null results and
-  /// thrown exceptions — both of which the spec requires us to memoise so
-  /// the function isn't re-invoked.
-  private Object computeAndWrap ( Name name ) {
+  /// Resolves one name, at most once. Serialised so racing callers cannot both invoke the
+  /// function, which is §10.1's exactly-once requirement.
+  private synchronized Object resolve ( Name name ) {
+
+    if ( name == last ) return cached;
+
+    final Map < Name, Object > seen = overflow;
+    if ( seen != null ) {
+      final Object hit = seen.get ( name );
+      if ( hit != null ) return remember ( name, hit );
+    }
+
+    final Object outcome = compute ( name );
+
+    // Re-read rather than reusing `seen`: the function may have resolved names of its own.
+    final Map < Name, Object > current = overflow;
+
+    if ( current == null && last == null ) {
+      // EMPTY → SINGLE. No map: the inline entry is the whole pool.
+      return remember ( name, outcome );
+    }
+
+    final Map < Name, Object > next =
+      current == null ? new IdentityHashMap <> ( 4 ) : new IdentityHashMap <> ( current );
+    if ( current == null ) next.put ( last, cached );
+    next.put ( name, outcome );
+    overflow = next;
+
+    return remember ( name, outcome );
+  }
+
+  /// Publishes the inline entry — value first, then the volatile name that releases it.
+  private Object remember ( Name name, Object outcome ) {
+    cached = outcome;
+    last   = name;
+    return outcome;
+  }
+
+  /// Wraps the user function so a null result and a thrown exception can both be cached — the
+  /// spec requires each to be memoised rather than re-invoked. Runs under the store's monitor,
+  /// once per name.
+  private Object compute ( Name name ) {
     try {
-      T result = fn.apply ( source.get ( name ) );
+      final T result = fn.apply ( source.get ( name ) );
       return result != null ? result : NULL_RESULT;
     } catch ( RuntimeException ex ) {
       return new CachedFailure ( ex );

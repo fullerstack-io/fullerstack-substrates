@@ -12,7 +12,7 @@ The spec is language-independent. These are our Java 26 projection choices:
 |---|---|---|
 | Execution context | Virtual thread (one per circuit) | Lightweight, no platform thread exhaustion |
 | Ingress queue | Custom `IngressQueue` (wait-free MPSC linked list of `QChunk`) | ~13ns emit, no CAS contention on producers |
-| Transit queue | Custom `TransitQueueRing` (single-threaded power-of-2 ring) | Zero indirection on cascade hot path, automatic growth |
+| Transit queue | Custom `TransitQueue` (single-threaded power-of-2 ring) | Zero indirection on cascade hot path, automatic growth |
 | Per-emission operators | `FsFiber` (immutable, reusable, 35+ ops) | Spec §6 — Fiber is the per-emission processing recipe |
 | Memory ordering | `VarHandle` release/acquire (not volatile) | Cheaper than volatile for parked flag checks |
 | False sharing | `@Contended` on `QChunk.claimed` | Isolate producer's atomic from consumer's cache line |
@@ -31,7 +31,7 @@ FsCortexProvider (SPI entry point)
         └── FsCircuit (dual-queue sequential execution engine)
               ├── IngressQueue (wait-free MPSC — external emissions)
               │     └── QChunk (128-slot interleaved [receiver, value] array)
-              ├── TransitQueueRing (single-threaded power-of-2 ring; cascade FIFO)
+              ├── TransitQueue (single-threaded power-of-2 ring; cascade FIFO)
               ├── FsConduit (channel factory + subscriber management)
               │     ├── FsHub (subscriber list + version counter)
               │     ├── FsChannel (per-name dispatch — split: dispatch vs cascadeDispatch)
@@ -153,7 +153,7 @@ if (circuit.transitHasWork()) {
 }
 ```
 
-### TransitQueueRing — single-threaded ring
+### TransitQueue — single-threaded ring
 
 Cascading emissions (from within subscriber callbacks) go to the transit ring. No atomics — only the circuit thread accesses it. Two parallel arrays addressed by `head & mask` / `tail & mask`:
 
@@ -201,7 +201,7 @@ The circuit thread runs a spin-then-park loop:
 
 ```java
 private void drainLoop() {
-  final JobQueue q = ingress;
+  final IngressQueue q = ingress;
 
   for (;;) {
     if (q.drainBatch(this)) continue;      // drain ingress + interleaved transit
@@ -234,7 +234,7 @@ final void submitIngress(Consumer<Object> receiver, Object value) {
 
 **Park until told:** the worker spins, then publishes `parked` and parks; a producer that admits work reads that flag after its exchange and unparks the worker. The pair is a Dekker handshake, so no admission can be left unnoticed, and the timeout is only a safety net for a wake that was somehow missed. The worker used to self-wake on a 1µs `parkNanos` with no producer-side coordination at all: measured, that cost 0.95 cores per *idle* circuit and delivered an emission into a quiet circuit in 648µs at the median and 3.8ms at p90, because the timer that had to wake it competed with the carrier it was spinning on. The producer now pays one byte load and a not-taken branch on a cache line it already reads (`closed` and `parked` are adjacent). See `docs/DECISIONS.md`.
 
-**Callback isolation (spec §15.4):** `IngressQueue.drainBatchLoop` and `TransitQueueRing.drain` each wrap their `r.accept(v)` dispatch in a `try { … } catch (Throwable ignored) { }` so an uncaught client-callback exception cannot terminate the worker. `FsChannel`'s multi-consumer dispatch lambda wraps each sibling receptor invocation the same way — a throwing receptor doesn't block siblings on the same channel from receiving the emission (§16.1 #14). The subscriber callback in `FsChannel.rebuild` is similarly guarded and records an empty consumer list on throw so the callback is never retried for that subscription/channel pair (§16.1 #15).
+**Callback isolation (spec §15.4):** `IngressQueue.drainBatchLoop` and `TransitQueue.drain` each wrap their `r.accept(v)` dispatch in a `try { … } catch (Throwable ignored) { }` so an uncaught client-callback exception cannot terminate the worker. `FsChannel`'s multi-consumer dispatch lambda wraps each sibling receptor invocation the same way — a throwing receptor doesn't block siblings on the same channel from receiving the emission (§16.1 #14). The subscriber callback in `FsChannel.rebuild` is similarly guarded and records an empty consumer list on throw so the callback is never retried for that subscription/channel pair (§16.1 #15).
 
 ### Marker class split — JIT monomorphism
 
@@ -660,7 +660,7 @@ This avoids locking during subscription changes — the spec's "eventual consist
 |---|---|---|
 | `QChunk.CAPACITY` | 128 | Slots per ingress chunk (receiver+value pairs); tuned 64→128 from a sweep |
 | `QChunk.ARRAY_LEN` | 256 | Array length (128 × 2 for interleaving) |
-| `TransitQueueRing.INITIAL_CAP` | 8 | Initial transit ring capacity (grows by doubling). Cyclic cascades alternate enqueue/dequeue on one thread, so steady-state max simultaneous entries ≈ 1; an 8-slot start covers any realistic multi-submit fiber without growth |
+| `TransitQueue.INITIAL_CAP` | 8 | Initial transit ring capacity (grows by doubling). Cyclic cascades alternate enqueue/dequeue on one thread, so steady-state max simultaneous entries ≈ 1; an 8-slot start covers any realistic multi-submit fiber without growth |
 | `FsCircuit.SPIN_COUNT` | 1000 | Worker spin iterations before parking (~5µs with `Thread.onSpinWait`) |
 | `FsCircuit.SPIN_COUNT` | 1000 | Worker spin before parking (~26µs). A circuit fed faster than this never parks. Override: `io.fullerstack.substrates.worker.spin` |
 | `FsCircuit.AWAIT_SPIN_COUNT` | 50 | Awaiter spin before parking. A marker on a running worker fires in ~100ns, so a short budget catches it; behind a drain no budget catches it. 50 and 1000 measure the same on every row, 0 is 6-7x worse on tight awaits. Override: `io.fullerstack.substrates.await.spin` |

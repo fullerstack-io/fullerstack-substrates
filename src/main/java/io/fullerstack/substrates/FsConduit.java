@@ -19,7 +19,6 @@ import io.humainary.substrates.api.Substrates.Subscriber;
 import io.humainary.substrates.api.Substrates.Subscription;
 
 import java.util.ArrayList;
-import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -43,12 +42,23 @@ public final class FsConduit < E > implements Conduit < E > {
   final FsHub < E >                      hub;
   private final Subject < Conduit < E > > subject;
 
-  /// Channels by name — copy-on-write for thread-safe reads.
-  private volatile Map < Name, FsChannel < E > > channels;
+  /// The three lifecycle capabilities, issued by the owning circuit through
+  /// `Circuit.pipe(Receptor)` and built once. Each operation is an emission whose value is the
+  /// part that varies — the subscriber joining, the subscriber leaving, the hub being cleared —
+  /// so none of them allocates a carrier per call. See `docs/CAPABILITIES.md`.
+  ///
+  /// The conduit still holds its circuit: unlike these three, `await`, `isClosed` and
+  /// `checkExternalCaller` are lifecycle authority and no pipe confers them.
+  private final Pipe < FsSubscriber < E > > subscribes;
+  private final Pipe < FsSubscriber < E > > unsubscribes;
+  private final Pipe < FsHub < E > >        clears;
 
-  /// Last lookup cache.
-  private Name              lastLookupName;
-  private FsChannel < E >   lastLookupChannel;
+  /// Channels by name — the `Pool<Pipe<E>>` half of this type.
+  ///
+  /// Obtained from `Cortex.pool(Function)`, the API's prescribed factory for a name-keyed pool,
+  /// rather than written here. This type had its own copy-on-write map plus one-entry cache, and
+  /// so did [FsSink]; both were the storage `Pool` already provides. See `docs/CAPABILITIES.md`.
+  private final Pool < FsChannel < E > > channels = cortex ().pool ( this::materialize );
 
   /// Closed flag — set by `close()`. Subscribe jobs check this on the
   /// circuit thread and silently drop (per Resource §9.1 queued-drop semantics).
@@ -76,6 +86,10 @@ public final class FsConduit < E > implements Conduit < E > {
     this.stem    = routing == Routing.STEM;
     this.hub     = new FsHub <> ();
     this.subject = (Subject < Conduit < E > >) (Subject < ? >) new FsSubject <> ( name, parent, Conduit.class );
+
+    this.subscribes   = circuit.pipe ( subscriber -> { if ( !closed ) hub.addSubscriber ( subscriber ); } );
+    this.unsubscribes = circuit.pipe ( hub::removeSubscriber );
+    this.clears       = circuit.pipe ( FsConduit::clear );
   }
 
   @Override
@@ -83,25 +97,20 @@ public final class FsConduit < E > implements Conduit < E > {
     return subject;
   }
 
+  /// Clear receptor — runs on the circuit worker when the conduit closes.
+  private static < E > void clear ( FsHub < E > hub ) {
+    if ( hub.subscribersList != null ) {
+      hub.subscribersList.clear ();
+      hub.subscriberVersion++;
+    }
+  }
+
   // ─── Pool<Pipe<E>> ───
 
   @NotNull
   @Override
   public Pipe < E > get ( @NotNull Name name ) {
-    Name last = lastLookupName;
-    if ( last != null && name == last ) {
-      return lastLookupChannel.pipe;
-    }
-    Map < Name, FsChannel < E > > map = channels;
-    if ( map != null ) {
-      FsChannel < E > cached = map.get ( name );
-      if ( cached != null ) {
-        lastLookupName = name;
-        lastLookupChannel = cached;
-        return cached.pipe;
-      }
-    }
-    return createChannel ( name ).pipe;
+    return channels.get ( name ).pipe;
   }
 
   @NotNull
@@ -136,15 +145,6 @@ public final class FsConduit < E > implements Conduit < E > {
     return new FsDerivedPool <> ( this, p -> fsFiber.pipe ( p ) );
   }
 
-  private FsChannel < E > createChannel ( Name name ) {
-    synchronized ( this ) {
-      FsChannel < E > channel = materialize ( name );
-      lastLookupName = name;
-      lastLookupChannel = channel;
-      return channel;
-    }
-  }
-
   /// Materialises the channel for `name` — and, under §10.3 hierarchical
   /// routing, every ancestor channel on its dispatch path first.
   ///
@@ -172,24 +172,15 @@ public final class FsConduit < E > implements Conduit < E > {
   /// looks anything up. Per-pipe conduits build no chain at all.
   ///
   /// Caller must hold this conduit's monitor; recurses once per ancestor level.
+  /// Builds one channel — the pool owns storage, re-check and publication.
   private FsChannel < E > materialize ( Name name ) {
-    if ( channels == null ) {
-      channels = new IdentityHashMap <> ();
-    }
-    FsChannel < E > cached = channels.get ( name );
-    if ( cached != null ) return cached;
 
-    FsChannel < E >[] ancestors = stem ? ancestorChain ( name ) : FsChannel.none ();
+    final FsChannel < E >[] ancestors = stem ? ancestorChain ( name ) : FsChannel.none ();
 
-    FsSubject < Pipe < E > > pipeSubject = new FsSubject <> ( name, (FsSubject < ? >) subject, Pipe.class );
+    final FsSubject < Pipe < E > > pipeSubject =
+      new FsSubject <> ( name, (FsSubject < ? >) subject, Pipe.class );
 
-    FsChannel < E > channel = new FsChannel <> ( pipeSubject, circuit, hub, ancestors );
-
-    Map < Name, FsChannel < E > > newMap = new IdentityHashMap <> ( channels );
-    newMap.put ( name, channel );
-    channels = newMap;
-
-    return channel;
+    return new FsChannel <> ( pipeSubject, circuit, hub, ancestors );
   }
 
   /// Builds the leaf-first ancestor chain for `name`: its direct parent, then
@@ -200,7 +191,7 @@ public final class FsConduit < E > implements Conduit < E > {
     Optional < Name > enclosure = name.enclosure ();
     if ( enclosure.isEmpty () ) return FsChannel.none ();
 
-    FsChannel < E > parent = materialize ( enclosure.get () );
+    FsChannel < E > parent = channels.get ( enclosure.get () );
     FsChannel < E >[] above = parent.ancestors;
 
     FsChannel < E >[] chain = (FsChannel < E >[]) new FsChannel[above.length + 1];
@@ -260,21 +251,17 @@ public final class FsConduit < E > implements Conduit < E > {
     trackSubscription ( subscription );
     fs.trackSubscription ( subscription );
 
-    // Use CircuitJob (distinct class) so subscribe/unsubscribe lambdas don't
-    // pollute ReceptorAdapter.accept's type profile on the hot path.
-    // If the conduit is closed by the time this runs on the circuit thread,
-    // silently drop per Resource §9.1 queued-operation semantics.
-    circuit.submit (
-      new FsCircuit.CircuitJob ( () -> { if ( !closed ) hub.addSubscriber ( fs ); } ),
-      null
-    );
+    // The subscriber is the emission; the receptor is fixed and built once. If the conduit is
+    // closed by the time this runs on the circuit thread, silently drop per Resource §9.1
+    // queued-operation semantics.
+    subscribes.emit ( fs );
 
     return subscription;
   }
 
   /// Closes the conduit. Sets the closed flag so any pending or future
   /// subscribe jobs are silently dropped on the circuit thread, and queues
-  /// a job to release the subscriber list. Idempotent (Resource §9.1).
+  /// a admission to release the subscriber list. Idempotent (Resource §9.1).
   /// §9.1 open-required guard. Rejects if either this conduit or its owning
   /// circuit has accepted close — circuit-closed leaves work undrainable, so
   /// the conduit is effectively closed too.
@@ -310,15 +297,7 @@ public final class FsConduit < E > implements Conduit < E > {
       }
     }
 
-    circuit.submit (
-      new FsCircuit.CircuitJob ( () -> {
-        if ( hub.subscribersList != null ) {
-          hub.subscribersList.clear ();
-          hub.subscriberVersion++;
-        }
-      } ),
-      null
-    );
+    clears.emit ( hub );
   }
 
   @Idempotent
@@ -356,7 +335,7 @@ public final class FsConduit < E > implements Conduit < E > {
   }
 
   private void enqueueUnsubscribe ( FsSubscriber < E > subscriber ) {
-    circuit.submit ( new FsCircuit.CircuitJob ( () -> hub.removeSubscriber ( subscriber ) ), null );
+    unsubscribes.emit ( subscriber );
   }
 
 }

@@ -1,5 +1,11 @@
 # Decisions
 
+> **Naming note (2026-08-30).** Entries below were written under the original type names. The
+> queues now carry the spec's own vocabulary (§5.3): `JobQueue` → **`IngressQueue`**,
+> `TransitQueueRing` → **`TransitQueue`**, `Job` → **`Admission`**. `TransitJobQueue` was deleted —
+> it was never wired, and the entry recording it as OPEN is resolved by that deletion. Verdicts are
+> left as they were reached.
+
 Designs that were built, measured, and rejected — and the findings that outlived them.
 
 Source javadoc explains what the code *does*. This file records what we *tried*, what it cost,

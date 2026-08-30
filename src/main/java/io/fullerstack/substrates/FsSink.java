@@ -11,8 +11,6 @@ import io.humainary.substrates.api.Substrates.Sink;
 import io.humainary.substrates.api.Substrates.State;
 import io.humainary.substrates.api.Substrates.Subject;
 
-import java.util.IdentityHashMap;
-import java.util.Map;
 import java.util.function.Function;
 
 import static io.humainary.substrates.api.Substrates.cortex;
@@ -35,18 +33,23 @@ public final class FsSink < E > implements Sink < E > {
   private final Pipe < Capture < E > > endpoint;
   private final Subject < Sink < E > > subject;
 
-  /// Channels by name — copy-on-write for thread-safe reads, matching FsConduit.
-  private volatile Map < Name, Pipe < E > > channels;
-
-  /// Last-lookup cache.
-  private Name        lastLookupName;
-  private Pipe < E >  lastLookupPipe;
+  /// Channels by name — the `Pool<Pipe<E>>` half of this type.
+  ///
+  /// Obtained from `Cortex.pool(Function)`, the API's prescribed factory, rather than written
+  /// here. See [FsConduit] and `docs/CAPABILITIES.md`.
+  private final Pool < Pipe < E > > channels = cortex ().pool ( this::materialize );
 
   @SuppressWarnings ( "unchecked" )
   public FsSink ( FsSubject < ? > parent, Name name, FsCircuit circuit,
                   Pipe < Capture < E > > endpoint ) {
     this.circuit  = circuit;
-    this.endpoint = endpoint;
+    // A pipe is owned by its circuit and emits to its circuit — including this sink's channels,
+    // whose captures must therefore land on *this* circuit before going anywhere else. Normalising
+    // the endpoint through `Circuit.pipe(Pipe)` is what the spec calls "the usual same-circuit pipe
+    // optimization": a same-circuit endpoint comes back as-is, and a foreign one is wrapped in a
+    // pipe owned here that forwards to it. Held raw, a cross-circuit endpoint meant a channel
+    // emission bypassed this circuit entirely.
+    this.endpoint = circuit.pipe ( endpoint );
     this.subject  = (Subject < Sink < E > >) (Subject < ? >) new FsSubject <> ( name, parent, Sink.class );
   }
 
@@ -60,20 +63,7 @@ public final class FsSink < E > implements Sink < E > {
   @NotNull
   @Override
   public Pipe < E > get ( @NotNull Name name ) {
-    Name last = lastLookupName;
-    if ( last != null && name == last ) {
-      return lastLookupPipe;
-    }
-    Map < Name, Pipe < E > > map = channels;
-    if ( map != null ) {
-      Pipe < E > cached = map.get ( name );
-      if ( cached != null ) {
-        lastLookupName = name;
-        lastLookupPipe = cached;
-        return cached;
-      }
-    }
-    return createChannel ( name );
+    return channels.get ( name );
   }
 
   @NotNull
@@ -82,36 +72,19 @@ public final class FsSink < E > implements Sink < E > {
     return new FsDerivedPool <> ( this, fn );
   }
 
-  private synchronized Pipe < E > createChannel ( Name name ) {
-    if ( channels == null ) {
-      channels = new IdentityHashMap <> ();
-    }
-    Pipe < E > cached = channels.get ( name );
-    if ( cached != null ) {
-      lastLookupName = name;
-      lastLookupPipe = cached;
-      return cached;
-    }
+  /// Builds one channel pipe — the pool owns storage, re-check and publication.
+  private Pipe < E > materialize ( Name name ) {
 
-    FsSubject < Pipe < E > > pipeSubject =
+    final FsSubject < Pipe < E > > pipeSubject =
       new FsSubject <> ( name, (FsSubject < ? >) subject, Pipe.class );
 
-    Pipe < E > pipe = new SinkPipe <> ( pipeSubject, endpoint, circuit );
-
-    Map < Name, Pipe < E > > newMap = new IdentityHashMap <> ( channels );
-    newMap.put ( name, pipe );
-    channels = newMap;
-
-    lastLookupName = name;
-    lastLookupPipe = pipe;
-
-    return pipe;
+    return new SinkPipe <> ( pipeSubject, endpoint, circuit );
   }
 
   /// Sink channel pipe. On emit, mints a Capture and forwards to the endpoint.
   /// The endpoint's own pipe semantics handle queuing — this side just builds
   /// the carrier.
-  private static final class SinkPipe < E > implements Pipe < E > {
+  static final class SinkPipe < E > implements Pipe < E > {
 
     private final Subject < Pipe < E > > subject;
     private final Pipe < Capture < E > > endpoint;
@@ -125,26 +98,27 @@ public final class FsSink < E > implements Sink < E > {
 
     @Override
     public void emit ( @NotNull E emission ) {
-      // Capture.current() per spec §392-414:
-      //   - for a value emitted on a transit cascade inside the circuit worker,
-      //     the circuit's own context (== Circuit#current())
-      //   - for a value admitted from outside the circuit (external thread,
-      //     or another circuit's worker), the caller's context
-      // Thread identity distinguishes the two cases. cortex().current() is
-      // per-thread, so it gives the caller's context for external threads and
-      // the worker's thread context otherwise; we explicitly substitute
-      // circuit.current() on the cascade path so it coincides with the
-      // circuit identity as the spec requires.
-      Subject < Current > current = circuit.onWorker ()
-        ? circuit.current ().subject ()
-        : cortex ().current ().subject ();
-      State state = cortex ().state ();
-      endpoint.emit ( new SinkCapture <> ( emission, subject, current, state ) );
+      // §11.1: `current()` is the caller's context for a value admitted from outside the circuit,
+      // and the circuit's own for one emitted from within circuit processing. Both are already
+      // `cortex().current()`: it is per-thread, and `workerLoop` binds this circuit's Current to
+      // its worker as its first act, so on the worker the two are the same object. This once
+      // branched on `circuit.onWorker()` to substitute `circuit.current()` — re-deriving by hand
+      // a decision the runtime had already made, and getting the same answer either way.
+      endpoint.emit ( new SinkCapture <> (
+        emission, subject, cortex ().current ().subject (), cortex ().state () ) );
     }
 
     @Override
     public Subject < Pipe < E > > subject () {
       return subject;
+    }
+
+    /// The circuit that owns this channel. `Flow.pipe`/`Fiber.pipe` need it to honour their
+    /// "on that pipe's circuit" contract, and a sink channel is the one pipe this provider mints
+    /// that is not an [FsPipe] — it must stamp its Capture before the queue hop, which is what
+    /// gives §11.1 the *caller's* context for an external emission.
+    FsCircuit circuit () {
+      return circuit;
     }
   }
 

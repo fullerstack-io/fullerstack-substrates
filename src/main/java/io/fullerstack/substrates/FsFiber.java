@@ -132,28 +132,21 @@ public final class FsFiber < E > implements Fiber < E > {
           c.submit ( d != null ? d : channel, v );
         } );
       } else {
-        chain = materialise ( v -> c.submit ( targetReceiver, v ) );
+        chain = materialise ( target::emit );
       }
       // §4.3: a materialized pipe's enclosure is the pipe it feeds, one level
       // deeper, so chained attachments form a fully-qualified nested path.
       return new FsPipe <> ( (Consumer < Object >) (Consumer < ? >) chain, c,
         (FsSubject < ? >) target.subject () );
     }
-    // This provider's own non-FsPipe carriers (an FsSink channel pipe, say)
-    // expose no receiver to submit to, so the chain is driven through emit().
+    // This provider's own non-FsPipe carriers (an FsSink channel pipe, say) expose no receiver
+    // to submit to, so the chain is driven through emit(). It still belongs to a circuit, and the
+    // chain MUST run on that circuit's worker — returning a pipe that ran it inline here was the
+    // very defect the foreign-target check above exists to prevent (§16.1#1).
+    final FsCircuit owner = ( (FsSink.SinkPipe < ? >) target ).circuit ();
     chain = materialise ( target::emit );
-    final Subject < Pipe < E > > nested = (Subject < Pipe < E > >) (Subject < ? >)
-      new FsSubject <> ( null, (FsSubject < ? >) target.subject (), Pipe.class );
-    return new Pipe <> () {
-      @Override
-      public void emit ( @NotNull E emission ) {
-        chain.accept ( emission );
-      }
-      @Override
-      public Subject < Pipe < E > > subject () {
-        return nested;
-      }
-    };
+    return new FsPipe <> ( (Consumer < Object >) (Consumer < ? >) chain, owner,
+      (FsSubject < ? >) target.subject () );
   }
 
   // ─────────────────────────────────────────────────────────────────────────────

@@ -22,8 +22,11 @@ import java.util.concurrent.TimeUnit;
 /// (no burst of catch-up ticks), but the sequence remains gap-free.
 ///
 /// Scheduling runs on the circuit's shared [java.util.concurrent.ScheduledExecutorService].
-/// Each tick calls `target.emit(seq)` which goes through normal pipe
-/// routing — same-circuit targets land on transit, cross-circuit on ingress.
+/// A tick emits into a pipe owned by the circuit, whose receptor forwards to the target. The
+/// scheduler is the ticker's private machinery, and `Capture.current()` says circuit-internal
+/// mechanisms are attributed to the owning circuit "not the ticker's scheduling thread" — so the
+/// value has to reach the target *from the worker*. Emitting to the target straight off the
+/// scheduler stamped every capture with the scheduler thread's context.
 @Provided
 @Tenure ( Tenure.ANCHORED )
 final class FsTicker implements Ticker {
@@ -31,6 +34,11 @@ final class FsTicker implements Ticker {
   private final Subject < Ticker >    subject;
   private final FsCircuit             circuit;
   private final Pipe < ? super Long > target;
+
+  /// The circuit-owned pipe a tick is emitted into; its receptor forwards to [#target] on the
+  /// worker, which is what attributes the emission to the circuit rather than to the scheduler.
+  private final Pipe < Long >         ticks;
+
   private final long                  intervalNanos;
 
   /// Volatile because close() may read it from any thread while the
@@ -53,6 +61,7 @@ final class FsTicker implements Ticker {
     this.subject       = (Subject < Ticker >) (Subject < ? >) s;
     this.circuit       = circuit;
     this.target        = target;
+    this.ticks         = circuit.pipe ( ( Long sequence ) -> target.emit ( sequence ) );
     this.intervalNanos = interval.toNanos ();
     this.anchorNanos   = System.nanoTime ();
     this.seq           = -1L;
@@ -69,7 +78,7 @@ final class FsTicker implements Ticker {
     if ( closed || circuit.isClosed () ) return;
     final long s = ++seq;
     try {
-      target.emit ( s );
+      ticks.emit ( s );
     } catch ( Throwable ignored ) {
       // SPEC §15.4 — external callback failure isolated. Ticker keeps ticking.
     }

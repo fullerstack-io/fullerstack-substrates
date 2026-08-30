@@ -457,20 +457,16 @@ public final class FsName implements Name {
   }
 
   /// Maps each segment via the mapper and joins with '.'.
-  /// Required because Name.path(Function) is abstract.
+  ///
+  /// `Name.path(Function)` is abstract — its mapper takes the segment `String` where `Extent`'s
+  /// takes the extent — so only the adaptation is ours. The walk is `Extent`'s, which folds from
+  /// the root iteratively as of 3.0.5, §4.2 having brought every operation reached through the
+  /// hierarchy into scope rather than traversal alone. This was a recursive parent walk, and it
+  /// threw `StackOverflowError` on a 20 000-segment name where `foldTo` and `stream` did not.
   @Override
   public CharSequence path ( Function < ? super String, ? extends CharSequence > mapper ) {
-    StringBuilder sb = new StringBuilder ();
-    appendMappedPath ( sb, mapper );
-    return sb;
-  }
-
-  private void appendMappedPath ( StringBuilder sb, Function < ? super String, ? extends CharSequence > mapper ) {
-    if ( parent != null ) {
-      parent.appendMappedPath ( sb, mapper );
-      sb.append ( FULLSTOP );
-    }
-    sb.append ( mapper.apply ( segment ) );
+    Objects.requireNonNull ( mapper );
+    return Name.super.path ( name -> mapper.apply ( name.part () ), String.valueOf ( FULLSTOP ) );
   }
 
   @Override

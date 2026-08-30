@@ -136,22 +136,33 @@ hypothesis, not a diagnosis. Anyone touching the dispatch core should try to rep
 ## Documented limits (§4.1, §4.2)
 
 3.0.5 gives names a **depth floor of 16 segments** and requires an implementation that imposes a
-maximum to document it. This one imposes none: depth is an `int` field on `FsName`, not a packed
-encoding, so there is no design ceiling and nothing to declare as a limit.
+maximum to document it. This one imposes none — depth is an `int` field on `FsName`, not a packed
+encoding — so the bound is memory.
 
-Measured, by successive extension, with traversal, `path()` and `compareTo` exercised at each depth
-— the operations §4.2 now brings in scope alongside traversal:
+**That claim was briefly false, and the checking is the point.** §4.2 extends depth from traversal
+to *every operation reached through the hierarchy*, and two of ours were recursive parent walks:
+`FsName.path(Function)` and `FsSubject.path()`. Each threw `StackOverflowError` on a 20 000-segment
+name where `foldTo` and `stream` returned normally — one method with a ceiling far below the
+type's, which is exactly the shape 3.0.5 removed upstream when it rewrote `Extent.foldTo`
+iteratively.
+
+Both overrides are gone rather than reimplemented. `Extent.path(mapper, separator)` already folds
+from the root iteratively and everything funnels into it, so `FsSubject` inherits the default
+outright and `FsName` supplies only the signature adaptation `Name.path(Function)` requires. The
+optimisation they were written for — avoiding an `Optional` per level — was against an
+implementation upstream no longer has.
+
+Measured after the change, by successive extension:
 
 | depth | result |
 |---:|---|
-| 16 | the guaranteed floor — accepted |
+| 16 | the guaranteed floor — accepted, built in one operation and by extension |
 | 32 | accepted (the reference implementation's stated maximum) |
-| 64 | accepted, in one operation and by extension |
-| 1 024 | accepted |
-| 8 192 | accepted — `stream()`, `path()` (64 425 chars) and `compareTo` all fine |
+| 8 192 | `stream()`, `path()` (64 425 chars) and `compareTo` all fine |
+| 20 000 | every walk iterative — `stream`, `foldTo`, `path()`, `path(char)`, `path(Function)` |
 | 65 536 | `OutOfMemoryError` — heap, not a depth rule |
 
-So the practical bound is memory. Portable code should still assume only the guaranteed 16.
+Pinned by `ExtentDepthTest`. Portable code should still assume only the guaranteed 16.
 
 ---
 

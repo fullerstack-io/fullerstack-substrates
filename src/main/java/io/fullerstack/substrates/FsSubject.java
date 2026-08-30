@@ -178,25 +178,11 @@ public final class FsSubject < S extends Substrate < S > > implements Subject < 
     return "Subject[name=" + name () + ",type=" + type.getSimpleName () + ",id=" + id + "]";
   }
 
-  /// Optimized path() — walks parent chain directly instead of
-  /// using default Extent.foldTo() which allocates Optional per level.
-  @Override
-  public CharSequence path () {
-    if ( parent == null ) {
-      return part ();
-    }
-    StringBuilder sb = new StringBuilder ();
-    buildPath ( sb );
-    return sb;
-  }
-
-  private void buildPath ( StringBuilder sb ) {
-    if ( parent != null ) {
-      parent.buildPath ( sb );
-      sb.append ( '/' );
-    }
-    sb.append ( part () );
-  }
+  // path() is not overridden. It was, as a recursive parent walk that avoided the Optional the
+  // old default allocated per level — but 3.0.5 rewrote Extent.foldTo iteratively for exactly the
+  // depth reason §4.2 now states, so the override only served to give this one method a lower
+  // ceiling than the rest of the type. The inherited default is path() -> path('/') ->
+  // path(Extent::part, "/") -> foldTo, and costs us nothing to take.
 
   @Override
   public String toString () {

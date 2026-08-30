@@ -12,14 +12,18 @@ SPI provider implementation of the [Humainary Substrates API](https://github.com
 
 ## Conformance is external
 
-This project has **no tests and no benchmarks of its own**. Both are Humainary's, run
-against this provider by Maven coordinate exactly as they would be against any other.
+**Conformance is measured by Humainary's TCKs, not by anything here.** They are run against
+this provider by Maven coordinate exactly as they would be against any other.
 
 That is a deliberate change from earlier versions, and it was worth making. The in-house
 suite was 657 tests, all green — while the upstream TCK failed 68 and errored 3. Not a
 contradiction, but the mechanism: tests written by the same process, from the same reading,
 at the same time as the code measure self-consistency rather than conformance. Several
 asserted the bugs outright.
+
+`src/test/java` holds 25 tests that claim nothing about conformance. Each exists because a
+defect was found **that the TCK passes straight through**, and each is kept only because
+reintroducing that defect makes it fail. Benchmarks remain entirely Humainary's.
 
 ```bash
 ./scripts/tck.sh                 # both TCKs against this provider
@@ -51,8 +55,8 @@ asserted the bugs outright.
 ## Build
 
 ```bash
-mvn clean install        # builds; there are no tests to run
-./scripts/tck.sh         # conformance
+mvn clean install        # builds and runs the local regression tests
+./scripts/tck.sh         # conformance — the measure that counts
 ```
 
 ## Usage
@@ -120,15 +124,21 @@ circuit.close();
 
 Each circuit runs on a single virtual thread with two internal queues:
 
-- **IngressQueue** — wait-free MPSC for external emissions, backed by a 128-slot `QChunk`
-- **TransitQueueRing** — single-threaded power-of-2 ring for cascading emissions, drained to
+- **IngressQueue** — wait-free MPSC for external emissions; one `Admission` per emission,
+  published by an atomic head exchange and a release store
+- **TransitQueue** — single-threaded power-of-2 ring for cascading emissions, drained to
   exhaustion before the next ingress item
 
 That priority is what §5.3 calls **causal completion**: every cascading effect of one
 emission resolves before the next external emission is admitted, without locks.
 
+Components hold the capability the circuit issued them rather than the circuit itself — a
+`Pipe` to emit, a `Pool` to resolve channels by name — which is what keeps the routing rule
+in one place. See [Capabilities](docs/CAPABILITIES.md).
+
 See [Architecture](docs/ARCHITECTURE.md) for VarHandle memory ordering, false-sharing
-prevention, the QChunk layout, and the §5.8 stimulus-time and §6.4.1 Window-lease designs.
+prevention, the ingress carrier layout, and the §5.8 stimulus-time and §6.4.1 Window-lease
+designs.
 
 ## Measurement
 

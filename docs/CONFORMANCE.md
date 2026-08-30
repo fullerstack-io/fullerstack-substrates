@@ -1,7 +1,8 @@
 # Conformance
 
-Conformance is defined by Humainary's published TCKs, not by anything in this repository.
-There are no tests here to disagree with them.
+Conformance is defined by Humainary's published TCKs, not by anything in this repository. The
+tests that do live here assert nothing about conformance — see [What the local tests
+are](#what-the-local-tests-are-and-are-not).
 
 | Suite | Result |
 |---|---|
@@ -18,7 +19,7 @@ installed is not under test**. `scripts/tck.sh` installs first for that reason.
 
 ---
 
-## Why there are no tests here
+## Why there is no in-house conformance suite
 
 The in-house suite was 657 tests and every one passed — while the upstream TCK failed 68 and
 errored 3. That is not a contradiction, it is the mechanism. Tests written by the same process,
@@ -36,7 +37,31 @@ A test authored from the implementation's behaviour can only ever confirm it.
 **What was given up.** The deleted suite also held things no API-level TCK reaches: internal
 invariants (`QChunkTest`, `AwaitBarrierTest`, `FsCircuitMarkerInvariantTest`) and six annotation
 contract tests asserting that `@NotNull`, `@Idempotent`, `@Identity`, `@New`, `@Queued` and
-`@Tenure` mean what they claim. Those properties are now unguarded. Recoverable from `febe60d`.
+`@Tenure` mean what they claim. Those properties are still unguarded. Recoverable from `febe60d`.
+
+---
+
+## What the local tests are, and are not
+
+`src/test/java` holds 25 tests. None of them asserts a spec requirement, and none is a substitute
+for the TCK. Every one exists because a **defect was found that the TCK passes straight through**,
+and each is held to a rule the deleted suite was not:
+
+> A regression test is only kept if reintroducing the defect makes it fail.
+
+That was checked for each — the bug was put back, the test failed, the bug was removed again. A
+test written from the implementation's behaviour can only confirm it; a test written from a
+demonstrated defect, and shown to fail without the fix, cannot.
+
+| suite | what it pins |
+|---|---|
+| `SinkChannelTest` | a sink channel is accepted wherever a provider pipe is; every usage pattern in the `Sink`/`Capture` javadoc |
+| `FlowFiberAttachmentTest` | `Flow`/`Fiber` stages run on the target pipe's circuit, across six target shapes |
+| `CaptureProvenanceTest` | all three `Capture#current()` cases — caller, emitting circuit, owning circuit for a ticker |
+| `TransitCapacityTest` | ring growth *during* a drain, and cascade order across a doubling |
+
+The TCK passed unchanged before and after every defect these cover, which is the argument for
+their existence and the limit of their claim.
 
 ---
 
@@ -71,12 +96,6 @@ MUST. Upstream should say "the most-recently-written entry".
 ## Known gaps, not covered by any TCK test
 
 Real, deliberate, and stated so they are not mistaken for conformance.
-
-**`FsFlow.pipe` / `FsFiber.pipe` run the operator chain on the caller's thread** for this
-provider's own non-`FsPipe` carriers — today only `FsSink`'s `SinkPipe`, which exposes no receiver
-to submit to. That is a §16.1 #1 confinement violation, pre-existing and untested. The
-provider-mismatch check deliberately uses package identity rather than `instanceof FsPipe` so this
-shape keeps working rather than being misreported as a foreign provider.
 
 **`FsRegistrar.register(Pipe)` unwraps `FsPipe.receiver()` and invokes it directly**, bypassing
 `Pipe.emit` and its routing decision. For a same-circuit target that is the intended fast path; for
@@ -114,8 +133,31 @@ hypothesis, not a diagnosis. Anyone touching the dispatch core should try to rep
 
 ---
 
+## Known gaps, added
+
+**The transit ring never shrinks.** `TransitQueue` doubles on demand and keeps its high-water mark
+for the life of the circuit: one 5 000-element fan-out leaves 8 192 slots across two arrays, about
+128 KB, retained. Allocation profiling reports garbage rather than retention, so nothing currently
+measures it. It matters in proportion to how many circuits a process runs.
+
+---
+
 ## Closed since the 3.0.2 conformance pass
 
+- **§16.1 #1 confinement in `Flow.pipe`/`Fiber.pipe`** — for this provider's own non-`FsPipe`
+  carrier (a `Sink` channel) the operator chain ran on the *caller's* thread, mutating `scan`
+  slots and `window` rings off-worker. It now attaches to the target's circuit like every other
+  shape. Pinned by `FlowFiberAttachmentTest`.
+- **Six provider guards rejected a `Sink` channel** as "not from this runtime provider" —
+  `instanceof FsPipe` used where package identity was meant, so a sink channel could not receive
+  from a `Port`, a `Basin` drain, a fan-out list or a `Ticker`, nor serve as another sink's
+  endpoint. Pinned by `SinkChannelTest`.
+- **§11.1 ticker provenance** — a tick emitted to its target from the scheduler thread, so every
+  `Capture` carried the scheduler's context where the accessor names the owning circuit
+  explicitly. Ticks now emit into a circuit-owned pipe. Pinned by `CaptureProvenanceTest`.
+- **A cross-circuit sink endpoint bypassed the sink's own circuit** — the endpoint was held raw,
+  so a capture went straight to the far circuit off the calling thread. It is now normalised
+  through `circuit.pipe(endpoint)`.
 - **§5.8 stimulus time** — the last TCK failure. Time-aware operators now share one reading per
   ingress chain, so a sleeping transit hop cannot age a time-bounded window.
 - **§6.4.1 Window lease** — was a bare `Thread`, re-latched per emission, and so could not see a

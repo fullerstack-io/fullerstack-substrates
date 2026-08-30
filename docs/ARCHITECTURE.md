@@ -11,11 +11,11 @@ The spec is language-independent. These are our Java 26 projection choices:
 | Spec Concept | Our Implementation | Why |
 |---|---|---|
 | Execution context | Virtual thread (one per circuit) | Lightweight, no platform thread exhaustion |
-| Ingress queue | Custom `IngressQueue` (wait-free MPSC linked list of `QChunk`) | ~13ns emit, no CAS contention on producers |
+| Ingress queue | Custom `IngressQueue` (wait-free MPSC, intrusive-linked `Admission` per emission) | ~13ns emit, no CAS contention on producers |
 | Transit queue | Custom `TransitQueue` (single-threaded power-of-2 ring) | Zero indirection on cascade hot path, automatic growth |
 | Per-emission operators | `FsFiber` (immutable, reusable, 35+ ops) | Spec §6 — Fiber is the per-emission processing recipe |
 | Memory ordering | `VarHandle` release/acquire (not volatile) | Cheaper than volatile for parked flag checks |
-| False sharing | `@Contended` on `QChunk.claimed` | Isolate producer's atomic from consumer's cache line |
+| False sharing | Padding hierarchy of `int` fields around `head`/`tail` | `@Contended` is inert without `-XX:-RestrictContended`; measured 20.5ns unpadded vs 13.5ns padded |
 | Name interning | `ConcurrentHashMap` with hierarchical parent links | O(1) identity comparison via reference equality |
 | Subject identity | `AtomicLong` counter (~5ns vs UUID's ~300ns) | Simple, fast, no collision risk in single JVM |
 | Slot storage | Immutable `record` (Name + value + type) | Compact, no synchronization needed |
@@ -30,7 +30,7 @@ FsCortexProvider (SPI entry point)
   └── FsCortex (entry point — creates circuits, scopes, names, states, slots, flows, fibers)
         └── FsCircuit (dual-queue sequential execution engine)
               ├── IngressQueue (wait-free MPSC — external emissions)
-              │     └── QChunk (128-slot interleaved [receiver, value] array)
+              │     └── Admission (one per emission; carries receiver, value, marker flag, next)
               ├── TransitQueue (single-threaded power-of-2 ring; cascade FIFO)
               ├── FsConduit (channel factory + subscriber management)
               │     ├── FsHub (subscriber list + version counter)
@@ -41,8 +41,9 @@ FsCortexProvider (SPI entry point)
               ├── FsCell (2.7 — circuit-owned single-slot state; receptor-pipe + volatile)
               ├── FsPin (2.9 — circuit-owned, owner-context-guarded state handle;
               │          immediate get/set on the worker thread, ISE elsewhere)
-              ├── FsPort (2.9 — circuit-owned queued mutation handle without read;
-              │           emit/replace/update via CircuitJob submission)
+              ├── FsPort (2.9 — circuit-owned queued mutation handle without read; holds three
+              │           circuit-issued pipes, so replace/update/emit emit the value, the
+              │           function and the target rather than wrapping each in a carrier)
               ├── FsFlow (type-changing composition: map / scan / window / flow / fiber / pipe —
               │           uniform Wrap[] storage; 2.6/2.7 adds scan, window(int), window(Duration, int),
               │           flow(Function<Subject, Flow>))
@@ -56,14 +57,19 @@ FsCortexProvider (SPI entry point)
               ├── FsSubscriber (emission observer with lazy callback)
               │     └── FsSubscription (subscriber lifecycle handle)
               │           └── FsRegistrar (Consumer<Object> registration during callback)
-              ├── FsTap (source emission transformation; tap(Function|Flow|Fiber))
               ├── FsTicker (2.8 — circuit-owned periodic emitter; grid-anchored fixed-rate
               │             schedule, gap-free Long sequence, bounded catch-up; backed by
               │             a lazy single-thread daemon ScheduledExecutorService shared
               │             across all tickers on the circuit, shut down on circuit close)
-              ├── FsWindow (2.6 — strided view over a rolling buffer; restriction ops share buffer)
-              └── FsBasin (3.0 — bounded buffered emission capture; replaced FsReservoir,
-                            which 3.0 removed along with Tap/Source.tap)
+              ├── FsWindow (2.6 — strided view over a DelayLine ring; restriction ops share buffer)
+              │     └── WindowLease (§6.4.1 (context, generation) lease; owns the ring reference)
+              ├── FsSink (2.10 — capture-producing pool of channels; endpoint normalised through
+              │           circuit.pipe(...) so a capture lands on this circuit before crossing)
+              └── FsBasin (3.0 — bounded buffered emission capture, DelayLine-backed; replaced
+                            FsReservoir, which 3.0 removed along with Tap/Source.tap)
+
+DelayLine (worker-confined power-of-2 ring behind delay / rolling / window / basin)
+Recipe (immutable operator recipe shared by FsFiber and FsFlow)
 
 FsName (hierarchical dot-notation names with interning)
 FsSubject (identity: Id + Name + State + Type)
@@ -89,69 +95,89 @@ The performance-critical core. Spec requirements:
 - **Stack safe** — even deeply cascading chains don't overflow the stack
 - **Wait-free producer** — callers never block when emitting
 
-### QChunk — the ingress storage unit
+### Admission — the ingress carrier
 
-`IngressQueue` stores emissions in `QChunk` — a 128-slot array with interleaved `[receiver, value]` layout:
+`IngressQueue` mints one `Admission` per emission, carrying its own `next` link:
 
 ```java
-final class QChunk {
-  static final int CAPACITY  = 128;
-  static final int ARRAY_LEN = CAPACITY << 1;  // 256
-
-  final    Object[] slots = new Object[ARRAY_LEN];  // [r0,v0,r1,v1,...]
-  volatile QChunk   next;                           // link to next chunk
-
-  @Contended
-  volatile int claimed;                             // ingress: atomic getAndAdd
-  QChunk freeNext;                                  // free list link
+final class Admission {
+  Consumer<Object> receiver;   // the receptor this emission delivers to
+  Object           value;      // the emission; null for a marker
+  boolean          marker;     // await/close barrier rather than user work
+  Admission        next;       // NOT volatile — ordering comes from the access mode
 }
 ```
 
-**Why interleaved?** Receiver and value land in adjacent positions for spatial cache locality. No wrapper object per emission — the chunk IS the storage.
+**Why one node per emission, and not a batched chunk?** A chunked alternative — one node holding
+128 entries in an interleaved `Object[]` — was built and rejected. It allocated a third as much,
+but receivers had to be read back out of an untyped array, making every dispatch an interface
+cast; perfasm found that secondary supertype check to be the hottest instruction in the drain. A
+typed `Admission` field is a *class*, so there is no check and dispatch is `invokevirtual`.
 
-**Why 128?** Tuned from a benchmark sweep. Doubling capacity halves the per-chunk-transition overhead (release-store fence on `next`, free-list pop) at the cost of slightly larger chunks. On the cyclic deep-cascade benchmark, 128 won.
+**Why nothing is recycled here.** A carrier that crosses the thread boundary cannot be: a producer
+can claim a node the consumer has already freed, which is an ABA that lost emissions and left
+`await` parked forever. Worker-confined carriers can be recycled — `TransitQueue` holds its
+`(receiver, value)` pairs inline in two parallel arrays and mints no node at all.
+
+**Why `next` is not `volatile`.** Ordering comes from the access mode at the point of use, not the
+declaration: the producer publishes with `NEXT.setRelease` and the consumer reads with
+`NEXT.getAcquire`. A modifier would force a StoreLoad fence on every plain store — measured at
+40.89% of one profile against 8.22% once removed.
 
 ### IngressQueue — wait-free MPSC
 
-External threads enqueue emissions via atomic `getAndAdd` on the chunk's `claimed` counter:
+Producers publish in two steps: one atomic exchange of the head, then the release store that
+commits it.
 
 ```java
-public void enqueue(Consumer<Object> receiver, Object value) {
-  QChunk chunk = tail;                                    // volatile read
-  int slot = (int) QChunk.CLAIMED.getAndAdd(chunk, 1);   // wait-free claim
-  if (slot < QChunk.CAPACITY) {
-    int base = slot << 1;
-    chunk.slots[base + 1] = value;                        // plain store (value first)
-    QChunk.SLOTS.setRelease(chunk.slots, base, receiver); // release store (commit)
-  } else {
-    enqueueSlow(receiver, value, chunk);                  // cold path: 1 in 64 emits
-  }
+void enqueue ( Consumer<Object> receiver, Object value, boolean marker ) {
+  final Admission admission = new Admission ();
+  admission.receiver = receiver;
+  admission.value    = value;
+  admission.marker   = marker;
+  final Admission prev = (Admission) HEAD.getAndSet ( this, admission );  // wait-free
+  NEXT.setRelease ( prev, admission );                                     // commit
 }
 ```
 
 **Key properties:**
-- `getAndAdd` always succeeds — no CAS retry loop, true wait-free
-- Receiver written with `setRelease` — acts as commit signal for the consumer
-- Value written before receiver — consumer sees value when it sees receiver
-- When chunk fills (every 128th emit), a new chunk is linked or recycled from a Treiber stack free list
-- `@Contended` on `tail` and `freeHead` prevents false sharing with consumer reads
+- `getAndSet` always succeeds — no CAS retry loop, genuinely wait-free
+- Fields are written before the exchange, which is a full fence; the consumer reaches the node
+  only through an acquire load of `next`, so the release carries them across
+- FIFO across producers, by exchange order
+- The consumer walks from a stub, so `tail` always points at an already-consumed node and the
+  node after it is next to run
 
-**Consumer drain** processes committed slots with interleaved transit drain:
+**Two reads, for two different questions.** `peek()` is `NEXT.getAcquire(tail)` — non-null when
+something is committed, used by the worker's spin. `quiescent()` additionally requires
+`head == tail`, and is read only when the worker is about to park.
+
+The difference is load-bearing. A producer publishes in two steps and only the second is visible
+to `peek`; between them the queue *looks* empty, and the producer's read of the worker's `parked`
+flag can be reordered ahead of its link on any store-buffered machine. Both sides could then
+conclude "nothing to do" about the same emission — the worker parks and the producer does not wake
+it. The head closes that: its write is the exchange, a locked read-modify-write and globally
+ordered, so if a producer's flag read preceded the worker's flag write then that producer's
+exchange did too, and the worker sees `head != tail` and does not park.
+
+**Consumer drain** runs every committed admission, interleaving transit after each:
 
 ```java
-// Simplified — actual code handles chunk transitions and markers
-Consumer<Object> r = (Consumer<Object>) QChunk.SLOTS.getAcquire(slots, base);
-if (r == null) break;  // not yet committed
-Object v = slots[base + 1];
-slots[base] = null;     // clear for GC
-slots[base + 1] = null;
-r.accept(v);            // execute emission
+Admission t = tail;
+Admission j = (Admission) NEXT.getAcquire ( t );
+if ( j == null ) return false;          // nothing committed
 
-// Depth-first: drain all transit work before next ingress slot
-if (circuit.transitHasWork()) {
-  do {} while (circuit.drainTransit());
-}
+do {
+  t.next = null;                        // unlink the consumed node for GC
+  t = j;
+  run ( t, circuit );                   // dispatch, then drain transit to empty
+  j = (Admission) NEXT.getAcquire ( t );
+} while ( j != null );
+tail = t;
 ```
+
+Causal completion (§5.3): each admission's transit cascade is drained to empty before the next
+ingress admission runs.
 
 ### TransitQueue — single-threaded ring
 
@@ -254,10 +280,12 @@ Markers and circuit jobs go through their own concrete classes — distinct type
 ```java
 static final class AwaitMarker  implements Consumer<Object> { /* await marker */ }
 static final class CloseMarker  implements Consumer<Object> { /* close marker */ }
-static final class CircuitJob   implements Consumer<Object> { /* one-shot Runnable */ }
+static final class PulseProbe   implements Consumer<Object> { /* §5.7 round-trip probe */ }
 ```
 
-The drain loop splits the call site: an `isMarker()` identity check (compares against the two pre-allocated marker references) routes markers through a separate cold path (`fireMarker`) so they keep their own type profile. `CircuitJob` is used by `FsConduit` for `subscribe`/`unsubscribe` and similar circuit-thread-only work, again avoiding lambda capture pollution at `ReceptorAdapter.accept`.
+The drain loop splits the call site: an `isMarker()` identity check (compares against the two pre-allocated marker references) routes markers through a separate cold path (`fireMarker`) so they keep their own type profile.
+
+A fourth class, `CircuitJob`, used to wrap a `Runnable` for `FsConduit`'s subscribe/unsubscribe and for `FsPort`/`FsBasin`/`FsSubscription`. It is gone: each of those queued work whose only varying part *is* a value, so they now emit that value into a pipe the circuit issued them — the subscriber joining, the function to apply, the drain target. See [Capabilities](CAPABILITIES.md).
 
 **Why all this?** Multiple lambda classes flowing through a single virtual call would cause bimorphic or megamorphic dispatch and class_check traps. Splitting by purpose keeps each call site monomorphic — C2 can devirtualise and inline.
 
@@ -658,8 +686,6 @@ This avoids locking during subscription changes — the spec's "eventual consist
 
 | Constant | Value | Description |
 |---|---|---|
-| `QChunk.CAPACITY` | 128 | Slots per ingress chunk (receiver+value pairs); tuned 64→128 from a sweep |
-| `QChunk.ARRAY_LEN` | 256 | Array length (128 × 2 for interleaving) |
 | `TransitQueue.INITIAL_CAP` | 8 | Initial transit ring capacity (grows by doubling). Cyclic cascades alternate enqueue/dequeue on one thread, so steady-state max simultaneous entries ≈ 1; an 8-slot start covers any realistic multi-submit fiber without growth |
 | `FsCircuit.SPIN_COUNT` | 1000 | Worker spin iterations before parking (~5µs with `Thread.onSpinWait`) |
 | `FsCircuit.SPIN_COUNT` | 1000 | Worker spin before parking (~26µs). A circuit fed faster than this never parks. Override: `io.fullerstack.substrates.worker.spin` |
@@ -670,7 +696,7 @@ This avoids locking during subscription changes — the spec's "eventual consist
 
 `Circuit.pulse()` (Substrates 2.4) returns an `Optional<Pulse>` snapshot of a no-op probe's round-trip through the ingress queue, exposing four timestamps (start / enqueued / dequeued / stop) for supervisory observers. See `FsCircuit.pulse()` and the `PulseProbe` inner class — the spec-level diagnostic surface. We previously carried a `CircuitStats` record with internal queue/drain counters; that has been removed since `Pulse` provides representative timing without polluting the per-emission hot path with counter writes.
 
-The marker classes `AwaitMarker`, `CloseMarker`, `CircuitJob`, and `ReceptorAdapter` must remain distinct concrete classes — collapsing any of these into a shared base reintroduces a bimorphic call-site profile on `r.accept(v)` in the drain loop. This used to be guarded by `FsCircuitMarkerInvariantTest`, which was deleted with the in-house suite; **no TCK covers it**, so the invariant is now documentation only. See [Conformance](CONFORMANCE.md) for the rest of what that trade gave up.
+The marker classes `AwaitMarker`, `CloseMarker`, `PulseProbe`, and `ReceptorAdapter` must remain distinct concrete classes — collapsing any of these into a shared base reintroduces a bimorphic call-site profile on `r.accept(v)` in the drain loop, measured at ~22 ns → 30+ on `async_emit_batch_await`. This used to be guarded by `FsCircuitMarkerInvariantTest`, deleted with the in-house suite; **no TCK covers it and neither do the local regression tests**, so the invariant remains documentation only. See [Conformance](CONFORMANCE.md).
 
 ## Performance
 

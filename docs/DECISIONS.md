@@ -12,13 +12,88 @@ Source javadoc explains what the code *does*. This file records what we *tried*,
 and why it lost, so a rejected design is not rediscovered as a good idea. Each entry names the
 mechanism, not just the number: a timing without a mechanism is not a finding.
 
-All figures from a 2 vCPU workspace, JDK 26, G1, compact object headers off. Allocation counts
-are exact. Timings carry ±5–11% on this hardware and are quoted only where the mechanism, rather
+All figures from a 2 vCPU workspace, JDK 26, G1. Compact object headers were **off** for entries
+before 2026-08-29 and **on** from the 2026-08-29 optimisation run onward — object sizes are not
+comparable across that line. Allocation counts are exact. Timings carry ±5–11% on this hardware and are quoted only where the mechanism, rather
 than the magnitude, carries the argument.
 
 ---
 
 ## Ingress queue
+
+## Capabilities over factories — 2026-08-30
+
+### A component holds what it was issued, not what issued it — ADOPTED
+
+`FsPort` held an entire `FsCircuit` to make one call. So did `FsBasin`, and `FsChannel` held one it
+never read after construction. The rule now: hold a `Pipe` if you only emit, a `Pool<Pipe<E>>` if
+you get-or-create pipes by name, and the circuit only for lifecycle authority (`await`,
+`isClosed`, `checkExternalCaller`, `requireOpen`), context identity (`current`, `onWorker`), or
+lazy per-name construction.
+
+This is capability narrowing, and the same move as `ab3b3f6` one level up: that commit made
+`submitIngress` private because five classes reached past the §5.3 routing rule, which survived
+only by convention. A component holding a circuit *can* call `close()` or `pulse()`; one holding a
+pipe can queue an emission and nothing else.
+
+### `CircuitJob` deleted — the work's varying part is the value — CONFIRMED, exact
+
+Seven sites wrote `submit ( new CircuitJob ( () -> … ), null )`, allocating a carrier to hold work
+while passing `null` in the slot that was already there to carry it. Each became an emission whose
+value is the part that varies: the new value for `replace`, the caller's own function for
+`update`, the target for `emit` and for `drain`, the subscriber for subscribe/unsubscribe.
+
+`-prof gc`, against `PortOps.baseline_empty_pipe_batch` at 24.00 B/op:
+
+| row | before | after |
+|---|---:|---:|
+| `replace_batch` | 56.00 | **24.01** |
+| `update_batch` | 56.00 | **24.01** |
+| `emit_batch` | 56.00 | **24.01** |
+| `update_arg_batch` | 64.00 | **40.01** |
+
+Three of four now allocate nothing beyond what the caller already holds. The prediction was −16
+B/op per row (dropping the 16-byte `CircuitJob`); the result was −32 on three of them, because the
+surviving lambda no longer captures `this` either. `update_arg` keeps one capture: two things vary
+per call and an emission carries one.
+
+### `FsDerivedPool` is the only pool — the monitor was the reason it wasn't — ADOPTED
+
+`Conduit` and `Sink` are `Pool<Pipe<E>>` by declaration, and both had written the same storage: a
+one-entry cache, a copy-on-write `IdentityHashMap`, a `synchronized` create. `FsDerivedPool` was
+rejected as a shared base because its `get` was `synchronized` outright — ~3 ns against a conduit
+lookup measured at 1.032 ns cached.
+
+Removing that was the whole fix. `FsDerivedPool` now holds the three-state EMPTY/SINGLE/MULTI cache
+itself, lock-free on read, with the monitor only on resolution — which is also what §10.1's
+exactly-once rests on. Both types then obtain their pool from `Cortex.pool(Function)`, the
+prescribed factory. An intermediate `FsNamePool` was written and deleted: it was a second
+implementation of a thing the API already names.
+
+**The inline entry needed safe publication.** It publishes cached-then-`last` with `last` volatile.
+`FsDerivedPool` previously synchronized every read and so had no race; moving it to a lock-free
+path meant the pair had to publish as one, or a reader could see one entry's name beside another's
+value. A volatile *read* costs nothing on x86 beyond forbidding a reordering.
+
+### Four `FsSink` defects, none TCK-covered — FIXED
+
+A sink channel is the one pipe this provider mints that is not an `FsPipe`: it stamps its `Capture`
+before the queue hop, which is what gives §11.1 the caller's context for an external emission.
+TCK-enforced — `SinkContractTest.current_externalEmission_identifiesCallerContext` fails the moment
+the channel queues first. That single difference leaked four ways; see `CAPABILITIES.md` §4.
+
+The TCK passes unchanged before and after all four, so `src/test/java` now carries regression tests
+for them, each verified by reintroducing the defect it guards.
+
+### Queue vocabulary follows §5.3 — ADOPTED
+
+`JobQueue` → `IngressQueue`, `TransitQueueRing` → `TransitQueue`, `Job` → `Admission`. The fields
+were already named `ingress` and `transit`; the types were not, and `Job` implied work-to-run,
+which stopped being true when `CircuitJob` went. `TransitJobQueue` was deleted, resolving the OPEN
+entry below: it was never wired, tied on time, and lost on allocation to the ring.
+
+---
+
 
 ### Chunked MPSC — `IngressQueue` + `QChunk` (superseded 2026-08-27)
 

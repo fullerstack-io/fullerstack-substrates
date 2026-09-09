@@ -11,7 +11,13 @@
 #   ./scripts/tck.sh serventis        # Serventis only
 #   ./scripts/tck.sh substrates CellContractTest   # one contract class
 #
-# Expected: Substrates 960/0/0, Serventis 1227/0/0.
+# Expected at API 3.0.7, TCKs at tag 3.0.7:
+#   Substrates 974/0/0, Serventis 1227/0/0.
+#
+# Read the console "Tests run:" total, not a sum of the surefire XML reports: the
+# XML total reads 966 for Substrates because FiberContractTest's five @Nested
+# classes share eight method names and the aggregate report counts each once.
+# See docs/CONFORMANCE.md, "The 3.0.7 conformance run".
 #
 set -uo pipefail
 

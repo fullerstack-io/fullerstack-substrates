@@ -8,6 +8,13 @@ on:
       - '**'
   workflow_dispatch:
 
+env:
+  # The Humainary release this provider is built and measured against. Every upstream
+  # repository is cloned at THIS tag — never at HEAD, which moves ahead of the version
+  # in pom.xml and has broken this workflow before. Bump it with the two
+  # *-api.version properties in pom.xml; the guard step below fails if they diverge.
+  HUMAINARY_TAG: '3.0.7'
+
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -26,19 +33,34 @@ jobs:
           distribution: 'temurin'
           cache: maven
 
-      # Clone Humainary APIs OUTSIDE the workspace so the editorconfig
-      # plugin (and any other workspace-walking tool) does not descend
-      # into upstream's source tree. The artifacts land in ~/.m2 and are
-      # picked up by our build from there.
-      - name: Clone and install Humainary Substrates API
+      - name: Check the pinned tag matches pom.xml
         run: |
-          git clone https://github.com/humainary-io/substrates-api-java.git "$RUNNER_TEMP/substrates-api-java"
-          mvn -f "$RUNNER_TEMP/substrates-api-java/pom.xml" clean install -DskipTests
+          for prop in substrates-api serventis-api; do
+            v=$(sed -n "s|.*<${prop}\.version>\(.*\)</${prop}\.version>.*|\1|p" pom.xml)
+            if [ "$v" != "$HUMAINARY_TAG" ]; then
+              echo "::error::pom.xml <${prop}.version> is '$v' but HUMAINARY_TAG is '$HUMAINARY_TAG'"
+              exit 1
+            fi
+          done
+          echo "pinned at $HUMAINARY_TAG"
 
-      - name: Clone and install Humainary Serventis API
+      # Clone the Humainary repositories OUTSIDE the workspace so the editorconfig
+      # plugin (and any other workspace-walking tool) does not descend into upstream's
+      # source tree. The artifacts land in ~/.m2 and are picked up by our build there.
+      #
+      # specs-api-java installs FIRST: since 3.0.2 both APIs depend on it for the
+      # @SpecDoc / @SpecRef traceability annotations. Omitting it is what failed every
+      # run from 2026-08-26 with
+      #   Could not find artifact io.humainary.specs:humainary-specs-api:jar:3.0.2
+      - name: Clone and install the Humainary APIs
         run: |
-          git clone https://github.com/humainary-io/serventis-api-java.git "$RUNNER_TEMP/serventis-api-java"
-          mvn -f "$RUNNER_TEMP/serventis-api-java/pom.xml" clean install -DskipTests
+          set -euo pipefail
+          for repo in specs-api-java substrates-api-java serventis-api-java; do
+            echo "==> $repo @ $HUMAINARY_TAG"
+            git clone --depth 1 --branch "$HUMAINARY_TAG" \
+              "https://github.com/humainary-io/$repo.git" "$RUNNER_TEMP/$repo"
+            mvn -B -f "$RUNNER_TEMP/$repo/pom.xml" clean install -DskipTests
+          done
 
       - name: Build and publish to GitHub Packages
         run: mvn -B clean deploy -DskipTests

@@ -6,8 +6,8 @@ are](#what-the-local-tests-are-and-are-not).
 
 | Suite | Result |
 |---|---|
-| [`substrates-api-java-tck`](https://github.com/humainary-io/substrates-api-java-tck) 3.0.5 | **970 run · 0 failures · 0 errors** |
-| [`serventis-api-java-tck`](https://github.com/humainary-io/serventis-api-java-tck) 3.0.5 | **1227 run · 0 failures · 0 errors** |
+| [`substrates-api-java-tck`](https://github.com/humainary-io/substrates-api-java-tck) 3.0.7 | **974 run · 0 failures · 0 errors** |
+| [`serventis-api-java-tck`](https://github.com/humainary-io/serventis-api-java-tck) 3.0.7 | **1227 run · 0 failures · 0 errors** |
 
 ```bash
 ./scripts/tck.sh                              # both
@@ -16,6 +16,53 @@ are](#what-the-local-tests-are-and-are-not).
 
 The TCK resolves the provider from the local Maven repository, so **an edit that has not been
 installed is not under test**. `scripts/tck.sh` installs first for that reason.
+
+---
+
+## The 3.0.7 conformance run
+
+Recorded here because this is the provider's repository; until now the only written record of a
+run lived in the repository that happened to trigger it.
+
+| | |
+|---|---|
+| **Date** | 2026-09-08 |
+| **Provider** | `io.fullerstack:fullerstack-substrates:3.0.0-SNAPSHOT`, built against Substrates/Serventis **3.0.7** |
+| **Substrates TCK** | `substrates-api-java-tck` at tag **3.0.7** — **974 run · 0 failures · 0 errors** |
+| **Serventis TCK** | `serventis-api-java-tck` at tag **3.0.7** — **1227 run · 0 failures · 0 errors** |
+| **Local suite** | `mvn -o -nsu clean test` — **29 run · 0 failures · 0 errors**, 5 classes |
+| **Source changes** | **none** — `src/main` compiled unchanged at 3.0.7 |
+
+```bash
+mvn -o -nsu clean install -DskipTests            # the jar under test
+cd ../substrates-api-java-tck && ./mvnw -o -nsu test \
+  -Dsubstrates.spi.groupId=io.fullerstack \
+  -Dsubstrates.spi.artifactId=fullerstack-substrates \
+  -Dsubstrates.spi.version=3.0.0-SNAPSHOT
+```
+
+**Read 974, not 966.** Surefire's aggregate XML report undercounts this suite by eight.
+`FiberContractTest` splits into five `@Nested` classes and eight method names appear in more than
+one of them — `above_greaterValues_passesOnlyMatches`, `below_lesserValues_passesOnlyMatches`,
+`clamp_outsideValues_coercesIntoRange`, `deadband_insideAndOutsideValues_dropsInclusiveBand`,
+`max_belowAtAboveBound_passesAtOrBelow`, `min_belowAtAboveBound_passesAtOrAbove`,
+`pipe_nullTarget_throwsNullPointerException`, `range_insideAndOutsideValues_passesInclusiveInterval`.
+`TEST-…FiberContractTest.xml` carries `tests="176"` over 184 `<testcase>` elements, so summing the
+`tests` attribute across the 33 report files gives 966 while 974 cases actually ran. The console
+`Tests run:` total and the per-class lines both agree on 974; the eight are executed and passing,
+not skipped. Any tool that totals the XML attribute will report the low number.
+
+**What 3.0.5 → 3.0.7 changed.** §9.1 attributes a fault to the rejecting guard; §10.4 states that a
+bank is not closed by its circuit closing; source-retention `@New(conditional)` annotations; one
+`default` `Spliterator` on `Extent`; six added TCK tests. Serventis is version pins only. None of
+it moved this implementation — the bump is `pom.xml` and this sentence.
+
+The figures this file and `scripts/tck.sh` carried before today — **970** and **960** — disagreed
+with each other, so at most one could have been right. 960 is explained: six fewer tests at 3.0.5
+puts the console total at 968, and 968 − 8 is exactly the XML-attribute reading — so `tck.sh` was
+almost certainly quoting the undercount (unverified — checking 3.0.5 out to confirm was out of
+scope). 970 has no such account and was not re-measured when it was written. Only the 974 above is
+a measured number.
 
 ---
 
@@ -43,7 +90,7 @@ contract tests asserting that `@NotNull`, `@Idempotent`, `@Identity`, `@New`, `@
 
 ## What the local tests are, and are not
 
-`src/test/java` holds 25 tests. None of them asserts a spec requirement, and none is a substitute
+`src/test/java` holds 29 tests across 5 classes. None asserts a spec requirement, and none is a substitute
 for the TCK. Every one exists because a **defect was found that the TCK passes straight through**,
 and each is held to a rule the deleted suite was not:
 
@@ -59,6 +106,7 @@ demonstrated defect, and shown to fail without the fix, cannot.
 | `FlowFiberAttachmentTest` | `Flow`/`Fiber` stages run on the target pipe's circuit, across six target shapes |
 | `CaptureProvenanceTest` | all three `Capture#current()` cases — caller, emitting circuit, owning circuit for a ticker |
 | `TransitCapacityTest` | ring growth *during* a drain, and cascade order across a doubling |
+| `ExtentDepthTest` | that every walk reached through the name hierarchy is iterative, to 20 000 segments |
 
 The TCK passed unchanged before and after every defect these cover, which is the argument for
 their existence and the limit of their claim.

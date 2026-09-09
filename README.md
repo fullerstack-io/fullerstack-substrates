@@ -5,10 +5,10 @@ SPI provider implementation of the [Humainary Substrates API](https://github.com
 | | |
 |---|---|
 | **Version** | 3.0.0-SNAPSHOT |
-| **API** | Substrates 3.0.5 + Serventis 3.0.5 |
+| **API** | Substrates 3.0.7 + Serventis 3.0.7 |
 | **Java** | 26 (Virtual Threads + Preview) |
-| **Conformance** | Substrates TCK **970/970** · Serventis TCK **1227/1227** |
-| **Benchmarks** | [perfkit-java](https://github.com/humainary-io/perfkit-java) — 207 methods, 32 classes |
+| **Conformance** | Substrates TCK **974/974** · Serventis TCK **1227/1227** |
+| **Benchmarks** | [perfkit-java](https://github.com/humainary-io/perfkit-java) — 246 `@Benchmark` methods, 33 classes |
 
 ## Conformance is external
 
@@ -21,7 +21,7 @@ contradiction, but the mechanism: tests written by the same process, from the sa
 at the same time as the code measure self-consistency rather than conformance. Several
 asserted the bugs outright.
 
-`src/test/java` holds 25 tests that claim nothing about conformance. Each exists because a
+`src/test/java` holds 29 tests that claim nothing about conformance. Each exists because a
 defect was found **that the TCK passes straight through**, and each is kept only because
 reintroducing that defect makes it fail. Benchmarks remain entirely Humainary's.
 
@@ -35,7 +35,7 @@ reintroducing that defect makes it fail. Benchmarks remain entirely Humainary's.
 
 1. **Java 26** via [SDKMAN](https://sdkman.io/):
    ```bash
-   sdk install java 26.ea.35-open && sdk use java 26.ea.35-open
+   sdk install java 26-oracle && sdk use java 26-oracle
    ```
 
 2. **The Humainary repositories** (not on Maven Central). The APIs are required to build;
@@ -43,14 +43,17 @@ reintroducing that defect makes it fail. Benchmarks remain entirely Humainary's.
    ```bash
    for r in substrates-api-java serventis-api-java specs-api-java \
             substrates-api-java-tck serventis-api-java-tck perfkit-java; do
-     git clone https://github.com/humainary-io/$r.git
+     git clone --branch 3.0.7 https://github.com/humainary-io/$r.git
    done
    for r in specs-api-java substrates-api-java serventis-api-java; do
      ( cd $r && mvn clean install -DskipTests )
    done
    ```
+   Clone at the **tag** matching `substrates-api.version` in `pom.xml` (3.0.7), not `HEAD` —
+   upstream `main` moves ahead of the version this provider is built and measured against.
    `specs-api-java` installs first: as of 3.0.2 the APIs depend on it for the
-   `@SpecDoc` / `@SpecRef` traceability annotations.
+   `@SpecDoc` / `@SpecRef` traceability annotations, and a build that skips it fails with
+   `Could not find artifact io.humainary.specs:humainary-specs-api`.
 
 ## Build
 

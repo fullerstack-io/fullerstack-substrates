@@ -6,8 +6,8 @@ are](#what-the-local-tests-are-and-are-not).
 
 | Suite | Result |
 |---|---|
-| [`substrates-api-java-tck`](https://github.com/humainary-io/substrates-api-java-tck) 3.0.7 | **974 run · 0 failures · 0 errors** |
-| [`serventis-api-java-tck`](https://github.com/humainary-io/serventis-api-java-tck) 3.0.7 | **1227 run · 0 failures · 0 errors** |
+| [`substrates-api-java-tck`](https://github.com/humainary-io/substrates-api-java-tck) 3.1.2 | **992 run · 0 failures · 0 errors** |
+| [`serventis-api-java-tck`](https://github.com/humainary-io/serventis-api-java-tck) 3.1.2 | **1227 run · 0 failures · 0 errors** |
 
 ```bash
 ./scripts/tck.sh                              # both
@@ -16,6 +16,42 @@ are](#what-the-local-tests-are-and-are-not).
 
 The TCK resolves the provider from the local Maven repository, so **an edit that has not been
 installed is not under test**. `scripts/tck.sh` installs first for that reason.
+
+---
+
+## The 3.1.2 conformance run
+
+| | |
+|---|---|
+| **Date** | 2026-09-14 |
+| **Provider** | `io.fullerstack:fullerstack-substrates:3.0.0-SNAPSHOT`, built against Substrates/Serventis **3.1.2** |
+| **Substrates TCK** | `substrates-api-java-tck` at tag **3.1.2** — **992 run · 0 failures · 0 errors** (974 at 3.0.7; 18 tests added) |
+| **Serventis TCK** | `serventis-api-java-tck` at tag **3.1.2** — **1227 run · 0 failures · 0 errors** (unchanged) |
+| **Local suite** | `mvn -o -nsu clean test` — **29 run · 0 failures · 0 errors** |
+| **Source changes** | `FsCircuit`: five methods 3.1 made abstract — `conduit(Name)`, `conduit(Name, Routing)`, `bank(Routing)`, `basin(Name, int)`, `pipe(Name)`; `FsBasin`: a named constructor. Nothing else moved. |
+
+**What 3.0.7 → 3.1.2 changed.** One idea, applied across the circuit factories: the class token is a
+**type witness only** — "used only for inference and is not retained" — so every factory gains a
+witness-free form and the class-token forms become `default` methods that delegate to it. William's
+stated reason is a parameterized emission type such as `Basin<Capture<E>>`, "which a class token
+cannot express"; that is the shape a recorder capturing over a sink builds, so the witness-free
+form is the one such a caller needs. This provider mirrors the API's own direction: the witness-free
+forms are the real implementations and the token forms check the token for `null` (the TCK requires
+it) and delegate. Also: a **named basin** (`basin(Name, int)`), a **named discarding pipe**
+(`pipe(Name)`, defined by the spec as the empty-target-list form and implemented as exactly that
+call), tighter lifecycle prose (providers document whether pre-close work drains or is dropped;
+`subscribe` validates synchronously), and one new ordering test —
+`close_nestedScopes_closesOwnResourcesBeforeDescendants` — which `FsScope.close` already satisfied.
+Serventis 3.1.2 re-pins to Substrates 3.1.2 and changes spelling; its TCK is unchanged.
+
+**State, Subject and Capture did not move.** Checked specifically, because the question came up:
+§8 is byte-identical between 3.0.7 and 3.1.2, `Subject` still exposes state through a getter only,
+`Capture.state()` is still the provider's measures, and no `emit(E, State)` exists. This provider's
+subjects and captures still publish the empty state, which the spec permits ("the default is the
+empty state") and the TCK does not test either way. A prototype of 2026-09-14 that folded emitted
+State into a subject and stamped it into captures was reverted the same day: publishing is the
+provider's by the API's words, but the write route was not, and the consumer can mint its own
+capture through the API instead (Custodis `DECISIONS-v0.8.md`).
 
 ---
 

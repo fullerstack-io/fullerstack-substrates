@@ -5,9 +5,9 @@ SPI provider implementation of the [Humainary Substrates API](https://github.com
 | | |
 |---|---|
 | **Version** | 3.0.0-SNAPSHOT |
-| **API** | Substrates 3.0.7 + Serventis 3.0.7 |
+| **API** | Substrates 3.1.2 + Serventis 3.1.2 |
 | **Java** | 26 (Virtual Threads + Preview) |
-| **Conformance** | Substrates TCK **974/974** · Serventis TCK **1227/1227** |
+| **Conformance** | Substrates TCK **992/992** · Serventis TCK **1227/1227** |
 | **Benchmarks** | [perfkit-java](https://github.com/humainary-io/perfkit-java) — 246 `@Benchmark` methods, 33 classes |
 
 ## Conformance is external
@@ -43,13 +43,13 @@ reintroducing that defect makes it fail. Benchmarks remain entirely Humainary's.
    ```bash
    for r in substrates-api-java serventis-api-java specs-api-java \
             substrates-api-java-tck serventis-api-java-tck perfkit-java; do
-     git clone --branch 3.0.7 https://github.com/humainary-io/$r.git
+     git clone --branch 3.1.2 https://github.com/humainary-io/$r.git
    done
    for r in specs-api-java substrates-api-java serventis-api-java; do
      ( cd $r && mvn clean install -DskipTests )
    done
    ```
-   Clone at the **tag** matching `substrates-api.version` in `pom.xml` (3.0.7), not `HEAD` —
+   Clone at the **tag** matching `substrates-api.version` in `pom.xml` (3.1.2), not `HEAD` —
    upstream `main` moves ahead of the version this provider is built and measured against.
    `specs-api-java` installs first: as of 3.0.2 the APIs depend on it for the
    `@SpecDoc` / `@SpecRef` traceability annotations, and a build that skips it fails with

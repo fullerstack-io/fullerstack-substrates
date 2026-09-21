@@ -1,6 +1,7 @@
 package io.fullerstack.substrates;
 
 import io.humainary.substrates.api.Substrates.Basin;
+import io.humainary.substrates.api.Substrates.Name;
 import io.humainary.substrates.api.Substrates.Fault;
 import io.humainary.substrates.api.Substrates.NotNull;
 import io.humainary.substrates.api.Substrates.Pipe;
@@ -50,7 +51,13 @@ public final class FsBasin < E > implements Basin < E > {
   /// circuit's name (null name delegates to the parent subject), with a
   /// fresh Id so distinct basins keep distinct identities.
   FsBasin ( FsSubject < ? > parent, FsCircuit circuit, int capacity ) {
-    this.subject  = (Subject < Basin < E > >) (Subject < ? >) new FsSubject <> ( null, parent, Basin.class );
+    this ( null, parent, circuit, capacity );
+  }
+
+  /// 3.1: the named form. A null name inherits the parent's, which is how the
+  /// unnamed form takes the owning circuit's name.
+  FsBasin ( Name name, FsSubject < ? > parent, FsCircuit circuit, int capacity ) {
+    this.subject  = (Subject < Basin < E > >) (Subject < ? >) new FsSubject <> ( name, parent, Basin.class );
     this.capacity = capacity;
     this.buffer   = DelayLine.of ( capacity );
     this.feed     = circuit.pipe ( this::append );

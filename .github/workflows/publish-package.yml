@@ -13,7 +13,7 @@ env:
   # repository is cloned at THIS tag — never at HEAD, which moves ahead of the version
   # in pom.xml and has broken this workflow before. Bump it with the two
   # *-api.version properties in pom.xml; the guard step below fails if they diverge.
-  HUMAINARY_TAG: '3.0.7'
+  HUMAINARY_TAG: '3.1.2'
 
 jobs:
   publish:

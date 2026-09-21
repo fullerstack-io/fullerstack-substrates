@@ -783,14 +783,38 @@ public final class FsCircuit implements Circuit {
     return new FsConduit <> ( (FsSubject < ? >) subject, subject.name (), this );
   }
 
+  /// 3.1: the witness-free named form is the real one. The API makes the class-token
+  /// overloads `default` methods that delegate here, because "the class is used only
+  /// for inference and is not retained" — a conduit whose emission type is itself
+  /// parameterized (`Conduit<Capture<E>>`) cannot name that type with a class literal,
+  /// so the form that carries no token is the one every other form must reduce to.
+  @New
+  @NotNull
+  @Override
+  public < E > Conduit < E > conduit ( @NotNull Name name ) {
+    requireNonNull ( name );
+    requireOpen ( "conduit" );
+    return new FsConduit <> ( (FsSubject < ? >) subject, name, this );
+  }
+
+  /// 3.1: the class token is a type witness only — checked for null, as the TCK
+  /// requires, and otherwise not consulted.
   @New
   @NotNull
   @Override
   public < E > Conduit < E > conduit ( @NotNull Name name, @NotNull Class < E > type ) {
-    requireNonNull ( name );
     requireNonNull ( type );
+    return conduit ( name );
+  }
+
+  @New
+  @NotNull
+  @Override
+  public < E > Conduit < E > conduit ( @NotNull Name name, @NotNull Routing routing ) {
+    requireNonNull ( name );
+    requireNonNull ( routing );
     requireOpen ( "conduit" );
-    return new FsConduit <> ( (FsSubject < ? >) subject, name, this );
+    return new FsConduit <> ( (FsSubject < ? >) subject, name, this, routing );
   }
 
   @New
@@ -798,11 +822,8 @@ public final class FsCircuit implements Circuit {
   @Override
   public < E > Conduit < E > conduit ( @NotNull Name name, @NotNull Class < E > type,
                                        @NotNull Routing routing ) {
-    requireNonNull ( name );
     requireNonNull ( type );
-    requireNonNull ( routing );
-    requireOpen ( "conduit" );
-    return new FsConduit <> ( (FsSubject < ? >) subject, name, this, routing );
+    return conduit ( name, routing );
   }
 
   // ===================================================================================
@@ -886,14 +907,22 @@ public final class FsCircuit implements Circuit {
   // Factory Methods - Bank (2.5)
   // ===================================================================================
 
+  /// 3.1: witness-free form; see [#conduit(Name)] for why it is the real one.
+  @New
+  @NotNull
+  @Override
+  public < E > Bank < Conduit < E > > bank ( @NotNull Routing routing ) {
+    requireNonNull ( routing );
+    requireOpen ( "bank" );
+    return new FsBank <> ( (FsSubject < ? >) subject, cortex ().name ( "bank" ), this, routing );
+  }
+
   @New
   @NotNull
   @Override
   public < E > Bank < Conduit < E > > bank ( @NotNull Class < E > type, @NotNull Routing routing ) {
     requireNonNull ( type );
-    requireNonNull ( routing );
-    requireOpen ( "bank" );
-    return new FsBank <> ( (FsSubject < ? >) subject, cortex ().name ( "bank" ), this, routing );
+    return bank ( routing );
   }
 
   // ===================================================================================
@@ -908,6 +937,15 @@ public final class FsCircuit implements Circuit {
     // Equivalent to circuit.pipe(Receptor.NOOP) but without the wrapper.
     requireOpen ( "pipe" );
     return newPipe ( v -> { /* no-op */ } );
+  }
+
+  /// 3.1: the named discarding pipe. The spec defines it as "equivalent to supplying
+  /// an empty target list", so it IS that call rather than a second implementation of it.
+  @New
+  @NotNull
+  @Override
+  public < E > Pipe < E > pipe ( @NotNull Name name ) {
+    return pipe ( name, List.of () );
   }
 
   /// 3.0: target widened to `Pipe<? super E>` — a `Pipe<Number>` hop can carry
@@ -1111,6 +1149,23 @@ public final class FsCircuit implements Circuit {
     }
     requireOpen ( "basin" );
     return new FsBasin <> ( (FsSubject < ? >) subject, this, capacity );
+  }
+
+  /// 3.1: the named form binds `name` to the basin's subject; the unnamed form above
+  /// keeps the owning circuit's name, which is what a null name in [FsBasin] yields.
+  @New
+  @NotNull
+  @Override
+  public < E > Basin < E > basin ( @NotNull Name name, int capacity ) {
+    requireNonNull ( name );
+    if ( ! ( name instanceof FsName ) ) {
+      throw new Fault ( subject, "basin", "name is not from this runtime provider" );
+    }
+    if ( capacity < 1 ) {
+      throw new IllegalArgumentException ( "basin capacity must be >= 1: " + capacity );
+    }
+    requireOpen ( "basin" );
+    return new FsBasin <> ( name, (FsSubject < ? >) subject, this, capacity );
   }
 
   // ===================================================================================

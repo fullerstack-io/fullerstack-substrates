@@ -14,6 +14,13 @@ env:
   # in pom.xml and has broken this workflow before. Bump it with the two
   # *-api.version properties in pom.xml; the guard step below fails if they diverge.
   HUMAINARY_TAG: '3.1.2'
+  # Upstream publishes each release as a squashed commit on main and does not tag it;
+  # main has since moved to 3.3.0. Each repository is fetched at the commit the family
+  # was upgraded against on 2026-09-14, so a later upstream commit cannot change what
+  # this provider is built and measured against. Bump these with HUMAINARY_TAG.
+  HUMAINARY_SPECS_SHA: '5ffbd941691fc71b36f76a0f380ec1b3744cb793'
+  HUMAINARY_SUBSTRATES_SHA: '366a7d5f9c488ae776ff041702b7c21e8ceea5cf'
+  HUMAINARY_SERVENTIS_SHA: '64f0b9a39399b06d23ccd69238949b30a9fc9f90'
 
 jobs:
   publish:
@@ -55,11 +62,24 @@ jobs:
       - name: Clone and install the Humainary APIs
         run: |
           set -euo pipefail
-          for repo in specs-api-java substrates-api-java serventis-api-java; do
-            echo "==> $repo @ $HUMAINARY_TAG"
-            git clone --depth 1 --branch "$HUMAINARY_TAG" \
-              "https://github.com/humainary-io/$repo.git" "$RUNNER_TEMP/$repo"
-            mvn -B -f "$RUNNER_TEMP/$repo/pom.xml" clean install -DskipTests
+          # Pinned commits, in dependency order: specs first (both APIs declare it as provided).
+          for pair in "specs-api-java=$HUMAINARY_SPECS_SHA" \
+                      "substrates-api-java=$HUMAINARY_SUBSTRATES_SHA" \
+                      "serventis-api-java=$HUMAINARY_SERVENTIS_SHA"; do
+            repo="${pair%%=*}"; sha="${pair#*=}"
+            echo "==> $repo @ $HUMAINARY_TAG ($sha)"
+            dir="$RUNNER_TEMP/$repo"
+            git init -q "$dir"
+            git -C "$dir" remote add origin "https://github.com/humainary-io/$repo.git"
+            git -C "$dir" fetch -q --depth 1 origin "$sha"
+            git -C "$dir" checkout -q FETCH_HEAD
+            # Upstream versions through a <revision> property (${revision} in <version>).
+            v=$(sed -n 's|.*<revision>\(.*\)</revision>.*|\1|p' "$dir/pom.xml" | head -1)
+            if [ "$v" != "$HUMAINARY_TAG" ]; then
+              echo "::error::$repo at $sha declares revision '$v', not $HUMAINARY_TAG"
+              exit 1
+            fi
+            mvn -B -f "$dir/pom.xml" clean install -DskipTests
           done
 
       - name: Build and publish to GitHub Packages

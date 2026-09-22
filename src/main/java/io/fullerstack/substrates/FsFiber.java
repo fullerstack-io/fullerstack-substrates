@@ -77,16 +77,23 @@ public final class FsFiber < E > implements Fiber < E > {
 
   /// Returns a pipe that processes emissions through this fiber before reaching `target`.
   ///
-  /// Each call materialises a fresh consumer chain with independent stateful state.
-  /// The fiber chain runs on the circuit thread (after dequeue). When target is
-  /// a same-circuit FsPipe wrapping an FsChannel, the terminal submits
-  /// {@code channel.cascadeDispatch} (the pre-built dispatch consumer) to transit —
-  /// bypassing the channel's version check on the cascade hot path. Per spec
-  /// §5.4.1 + §7.6.2, subscriber changes can't interleave with cascade drains,
-  /// so the dispatch is guaranteed stable mid-cascade. STEM propagation is
-  /// folded into dispatch during rebuild, so dispatch alone is correct.
+  /// Each call materialises a fresh consumer chain with independent stateful state. The chain
+  /// runs on the target's circuit (after dequeue), and its terminal is `target.emit(v)` in
+  /// substance: the value is submitted to that circuit with the target's own receiver, so a
+  /// conduit channel performs its dispatch — and the §7.6.2 version check that selects the
+  /// recipients — at the position where it processes the emission. §7.6.1 puts selection at
+  /// exactly that position ("it selects as recipients the registered pipes of exactly those
+  /// subscriptions effective at that position"), and a subscribe or close raised inside a
+  /// cascade is transit work that "takes effect within the current cascade" (§7.6.1, §5.3).
   ///
-  /// For non-channel receivers, submit the receiver directly.
+  /// The former terminal submitted the channel's dispatch consumer as assembled at its last
+  /// rebuild, on the reading that subscriber state cannot change mid-cascade. Under 3.3.0 it
+  /// can, so a topology change queued between the terminal and the delivery — one raised in the
+  /// same callback, on either side of the emit — was missed for that emission: a late
+  /// subscriber heard nothing, a closed one kept firing. §6.1 licenses a cascade fast path
+  /// only where it preserves the public ordering; that one did not, and no check at the
+  /// terminal's own position can, because the change may still be ahead of the delivery in
+  /// transit. The cost of the check is priced in docs/CONFORMANCE.md.
   @New
   /// 2.7: attach this fiber's operator chain in front of a Cell's update pipe.
   /// Delegates to the standard `pipe(Pipe)` form with `cell.pipe()` as target.
@@ -127,10 +134,9 @@ public final class FsFiber < E > implements Fiber < E > {
       final FsCircuit c = fp.circuit ();
       final Consumer < Object > targetReceiver = fp.receiver ();
       if ( targetReceiver instanceof FsChannel < ? > channel ) {
-        chain = materialise ( v -> {
-          Consumer < Object > d = channel.cascadeDispatch;
-          c.submit ( d != null ? d : channel, v );
-        } );
+        // The channel itself, never a dispatch consumer captured at its last rebuild: the
+        // version check has to run where the emission is processed (§7.6.1, §7.6.2).
+        chain = materialise ( v -> c.submit ( channel, v ) );
       } else {
         chain = materialise ( target::emit );
       }

@@ -34,7 +34,7 @@ FsCortexProvider (SPI entry point)
               ├── TransitQueue (single-threaded power-of-2 ring; cascade FIFO)
               ├── FsConduit (channel factory + subscriber management)
               │     ├── FsHub (subscriber list + version counter)
-              │     ├── FsChannel (per-name dispatch — split: dispatch vs cascadeDispatch)
+              │     ├── FsChannel (per-name dispatch — version-checked on every delivery, §7.6.1)
               │     │     └── FsPipe (async emission carrier — emit only)
               │     └── FsDerivedPool (derived view: pool(Function), pool(Flow), pool(Fiber))
               ├── FsBank (2.5 — closeable name-indexed conduit factory)
@@ -56,7 +56,8 @@ FsCortexProvider (SPI entry point)
               │                includes 2.7 EveryTime for time-based rate limiting)
               ├── FsSubscriber (emission observer with lazy callback)
               │     └── FsSubscription (subscriber lifecycle handle)
-              │           └── FsRegistrar (Consumer<Object> registration during callback)
+              │           └── FsRegistrar (Consumer<Object> registration during callback: a receptor
+              │                 inline, a pipe as an Admit submitted to its own circuit — §5.3)
               ├── FsTicker (2.8 — circuit-owned periodic emitter; grid-anchored fixed-rate
               │             schedule, gap-free Long sequence, bounded catch-up; backed by
               │             a lazy single-thread daemon ScheduledExecutorService shared
@@ -638,24 +639,19 @@ Carryover operators (state classes shared with `FsFlow`):
 
 ### `FsFlow` — type transformation
 
-`FsFlow<I,O>` provides only the type-changing surface: `map`, `flow`, `fiber`, `pipe`. `flow.fiber(fiber)` attaches a fiber at the output side; `flow.pipe(target)` materialises the chain into a new pipe whose terminal submits directly to the target's transit queue, bypassing the channel's version check on the cascade hot path (per spec §5.4.1 + §7.6.2 — subscriber state cannot change mid-cascade).
+`FsFlow<I,O>` provides only the type-changing surface: `map`, `flow`, `fiber`, `pipe`. `flow.fiber(fiber)` attaches a fiber at the output side; `flow.pipe(target)` materialises the chain into a new pipe whose terminal submits the value to the target's circuit with the target's own receiver — `target.emit(v)` in substance — so a conduit channel runs its dispatch, and the §7.6.2 version check, at the position where it processes the emission (§7.6.1). Until 3.3.0 the terminal submitted the channel's pre-built `cascadeDispatch` consumer instead, on the reading that subscriber state cannot change mid-cascade; 3.3.0 §7.6.1 says it can, and that shortcut missed any subscribe or close raised in the same callback.
 
 Both flow and fiber state are safe without synchronization because all processing runs on the circuit's single thread.
 
-## Lazy Rebuild — the `dispatch` / `cascadeDispatch` split
+## Lazy Rebuild — one dispatch path, version-checked at the position of delivery
 
-When a subscriber is added or removed from a conduit, the change is not applied immediately. Instead, the conduit's hub version counter increments. On the next ingress emission, each channel checks if its cached subscriber list is stale (version mismatch) and rebuilds if needed.
+When a subscription is added or removed on a conduit, the change is not applied to any channel immediately. The registration or close job increments the conduit's hub version counter at its own position in the circuit's processing order — behind the cascade if it was submitted from a caller context, inside it if it was raised from a callback (§5.3, §7.6.1 consequence 3). On its next delivery each channel compares its `builtVersion` with the hub's (one int compare in `FsChannel.receive`) and rebuilds if they differ.
 
-Each named pipe in a conduit is fronted by an `FsChannel`. Channels expose two pre-built `Consumer<Object>` references after rebuild:
+Each named pipe in a conduit is fronted by an `FsChannel`, which is the receiver every emission addressed to that name is submitted with — from `conduit.get(name)`'s pipe, from a fiber/flow terminal aimed at that pipe, from a registered pipe's `Admit`. After rebuild the channel holds one pre-built `Consumer<Object>`, **`dispatch`** — receptors only, no STEM walk — used by `receive()` after the version check and by `dispatchStem` when walking ancestors (so an ancestor's STEM walk is not retriggered; each ancestor is version-checked in that walk, §10.2).
 
-- **`dispatch`** — receptors only, no STEM walk. Used by ingress `receive()` (which adds the version check + STEM externally) and by `dispatchStem` when walking ancestors (so an ancestor's STEM walk is not retriggered).
-- **`cascadeDispatch`** — receptors + STEM (if applicable). Submitted directly to transit by fiber/flow terminals to bypass the channel's version check on the cascade hot path.
+There is deliberately no second, check-free consumer for the transit side. Until 3.3.0 the channel also published `cascadeDispatch` (receptors + STEM, as built at the last rebuild) and `FsFlow.pipe`/`FsFiber.pipe` submitted it directly, on the reading that "no subscriber-state change can interleave during a cascade". 3.3.0 §7.6.1 selects recipients as "exactly those subscriptions effective at that position" — the position at which the channel processes the emission — and a subscribe or close raised inside a cascade "takes effect within the current cascade", so a change could sit in transit ahead of the delivery and the captured consumer missed it (a late subscriber heard nothing, a closed one kept firing). The check has to run where the emission is processed, which is what submitting the channel itself does; its cost is priced in `CONFORMANCE.md`.
 
-The cascade-side bypass is sound by spec: §5.4.1 relation 3 + §7.6.2 guarantee that no subscriber-state change can interleave during a cascade — the version check therefore only needs to fire on ingress arrival, not on every transit step. `FsFlow.pipe(target)` and `FsFiber.pipe(target)` detect a same-circuit `FsPipe` whose receiver is an `FsChannel` and submit `channel.cascadeDispatch` straight to the transit ring.
-
-For non-STEM channels, `cascadeDispatch == dispatch`. For STEM channels, `cascadeDispatch` wraps `dispatch` with the ancestor walk.
-
-This avoids locking during subscription changes — the spec's "eventual consistency" model. A subscriber added between two emissions will see the second emission but not the first.
+This avoids locking during subscription changes — the spec's "eventual consistency" model (§7.6.2): a subscription registered between two emissions sees the second and not the first, whichever context registered it.
 
 ## Thread Safety Summary
 

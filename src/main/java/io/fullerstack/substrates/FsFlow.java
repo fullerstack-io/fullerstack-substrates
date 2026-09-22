@@ -429,11 +429,14 @@ public final class FsFlow < I, O > implements Flow < I, O > {
     } ) );
   }
 
-  /// When target is a same-circuit FsPipe, the flow's terminal submits to
-  /// transit directly — bypassing target.emit's checks. If target's receiver
-  /// is an FsChannel, submit channel.dispatch instead of channel itself,
-  /// skipping the channel's version check on the cascade hot path (spec
-  /// §5.4.1 + §7.6.2 — subscriber state cannot change mid-cascade).
+  /// When target is an FsPipe, the flow's terminal submits to the target's circuit with the
+  /// target's own receiver — `target.emit(v)` in substance. A conduit channel therefore runs
+  /// its dispatch, and the §7.6.2 version check that selects the recipients, at the position
+  /// where it processes the emission, which is where §7.6.1 puts selection; a subscribe or
+  /// close raised inside the cascade is transit and takes effect there (§7.6.1, §5.3). The
+  /// former terminal submitted `channel.cascadeDispatch`, the consumer of the channel's last
+  /// rebuild, and so missed any topology change still ahead of the delivery in transit — see
+  /// the twin note on [FsFiber#pipe(Pipe)].
   @New
   @NotNull
   @Override
@@ -457,12 +460,9 @@ public final class FsFlow < I, O > implements Flow < I, O > {
       final FsCircuit c = fp.circuit ();
       final Consumer < Object > targetReceiver = fp.receiver ();
       if ( targetReceiver instanceof FsChannel < ? > channel ) {
-        // Submit channel.cascadeDispatch directly — receptors + STEM, no
-        // version check. Falls back to channel before first rebuild.
-        chain = wire ( subject, v -> {
-          Consumer < Object > d = channel.cascadeDispatch;
-          c.submit ( d != null ? d : channel, v );
-        } );
+        // The channel itself, never a dispatch consumer captured at its last rebuild: the
+        // version check has to run where the emission is processed (§7.6.1, §7.6.2).
+        chain = wire ( subject, v -> c.submit ( channel, v ) );
       } else {
         // Same shape as the non-FsPipe fallback below: the chain's terminal step emits into the
         // target pipe. `wire` drives a Consumer<Object>, so the target is viewed as one.

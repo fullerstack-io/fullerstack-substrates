@@ -16,19 +16,30 @@ import java.util.function.Consumer;
 ///
 /// Cortex → Circuit → Conduit → **Channel** → Pipe → Receptor
 ///
-/// The channel has two roles:
-/// - **Ingress receiver**: implements Consumer<Object>. Stored in the
-///   ingress queue. On dequeue, checks version and dispatches.
-/// - **Dispatch builder**: after rebuild, sets the dispatch Consumer
-///   which is used directly on the transit hot path. `cascadeDispatch`
-///   already includes STEM propagation if applicable, so transit
-///   cascades can call it directly without going through the
-///   channel — bypassing the version check (which the spec guarantees
-///   is stable mid-cascade per §5.4.1 + §7.6.2).
+/// The channel is the receiver of every emission addressed to its name, on
+/// ingress and on transit alike: it implements Consumer<Object>, it is what
+/// `conduit.get(name)`'s pipe and every fiber/flow terminal aimed at that pipe
+/// submit, and on dequeue [#receive] checks the hub version and dispatches.
+/// The check runs at the position where the emission is processed because
+/// that is where §7.6.1 selects the recipients — "exactly those subscriptions
+/// effective at that position" — and a subscribe or close raised inside a
+/// cascade is transit that takes effect within the cascade (§5.3, §7.6.1,
+/// §7.6.2). There is no second, check-free dispatch path for transit: one
+/// existed (a `cascadeDispatch` consumer captured at the last rebuild and
+/// submitted by the terminals) and it missed every topology change still
+/// ahead of the delivery in transit.
 ///
 /// The dispatch is Consumer<Object> throughout — same type as the
-/// transit queue, the flow chain, and the registrar's stored receivers.
-/// No lambda wrappers on the hot path.
+/// transit queue, the flow chain, and the registrar's stored consumers.
+/// A registered receptor is invoked during the walk; a registered pipe is
+/// stored as one [FsRegistrar.Admit] and *submitted* to its own circuit
+/// (§5.3 — transit behind the cascade's accepted work, or ingress to a
+/// foreign owner), never invoked here. See [FsRegistrar#register(Pipe)].
+///
+/// Subscriber state is memoised per **subscription** (§7.3 "exactly once per
+/// subscription/channel pair"), so a subscription closed and re-made from the
+/// same subscriber is a fresh pair: its callback runs again and the old pair's
+/// registrations leave the dispatch list.
 final class FsChannel < E > implements Receptor < E >, Consumer < Object > {
 
   /// Shared empty ancestor chain. Every per-pipe-routed channel and every
@@ -64,32 +75,23 @@ final class FsChannel < E > implements Receptor < E >, Consumer < Object > {
   /// read instead of a field read plus an array-length load.
   private final boolean stem;
 
-  /// The constant `cascadeDispatch` of a hierarchical channel. Held in a field
-  /// so a rebuild does not allocate a fresh method reference; null for per-pipe
-  /// channels, whose cascade dispatch is the receptor consumer itself.
-  private final Consumer < Object > stemCascade;
-
   /// The upstream pipe — what conduit.get(name) returns.
   final FsPipe < E > pipe;
 
-  /// Downstream dispatch — receptors only, no STEM. Used by ingress receive()
-  /// (which adds the version check) and by dispatchStem when walking ancestors
-  /// (an ancestor must not trigger its own STEM walk — the chain is already
-  /// flattened, so walking again would double-deliver at every level above).
+  /// Downstream dispatch — receptors only, no STEM. Used by [#receive] (after
+  /// the version check) and by dispatchStem when walking ancestors (an ancestor
+  /// must not trigger its own STEM walk — the chain is already flattened, so
+  /// walking again would double-deliver at every level above).
   Consumer < Object > dispatch;
-
-  /// Transit-side cascade dispatch — receptors + STEM (if applicable).
-  /// Submitted directly to transit by fiber/flow terminals to bypass the
-  /// version check on the cascade hot path. For per-pipe channels this is
-  /// the same reference as `dispatch`. For hierarchical channels it is
-  /// [#stemCascade], which fires this channel's receptors then walks the chain.
-  Consumer < Object > cascadeDispatch;
 
   /// Version this channel was last built at.
   int builtVersion = -1;
 
-  /// Per-subscriber receptor registrations — lazy, circuit-thread only.
-  Map < FsSubscriber < E >, List < Consumer < Object > > > subscriberReceptors;
+  /// Per-subscription registrations — lazy, circuit-thread only. Keyed by the
+  /// subscription (the §7.3 pair), not the subscriber: the entry is what says
+  /// "this channel has rebuilt for this subscription", and it leaves with the
+  /// subscription's roster entry, never with the subscriber.
+  Map < FsSubscription, List < Consumer < Object > > > subscriberReceptors;
 
   FsChannel (
     Subject < Pipe < E > > subject,
@@ -101,7 +103,6 @@ final class FsChannel < E > implements Receptor < E >, Consumer < Object > {
     this.hub = hub;
     this.ancestors = ancestors;
     this.stem = ancestors.length != 0;
-    this.stemCascade = this.stem ? this::cascade : null;
     this.pipe = new FsPipe <> ( this, circuit );
   }
 
@@ -117,13 +118,15 @@ final class FsChannel < E > implements Receptor < E >, Consumer < Object > {
     receive ( (E) o );
   }
 
-  // ─── Dispatch (ingress path — version check) ───
+  // ─── Dispatch (every path — version check) ───
   //
-  // Called only from the ingress drain. The version check fires here because
-  // an ingress emission may follow a subscriber change (which is itself
-  // queued in ingress order). Per §5.4.1 relation 3 + §7.6.2, no subscriber
-  // change can interleave during a cascade, so transit-side dispatch goes
-  // straight to `cascadeDispatch` and skips this method entirely.
+  // Called from the ingress drain and from the transit drain alike. The check
+  // is one int compare against the hub, and it has to be here rather than at
+  // any earlier point: §7.6.1 selects the recipients "effective at that
+  // position", the position at which the channel processes the emission, and
+  // under 3.3.0 a registration or close job can sit anywhere in transit ahead
+  // of this delivery — including one raised in the same callback that emitted
+  // it (§5.3 "Transit is FIFO over every kind of operation it carries").
 
   @Override
   public void receive ( E emission ) {
@@ -171,37 +174,30 @@ final class FsChannel < E > implements Receptor < E >, Consumer < Object > {
     }
   }
 
-  /// Transit-side entry point for a hierarchical channel — [#receive] without
-  /// the version check (§5.4.1 + §7.6.2: subscriber state cannot change
-  /// mid-cascade, and this channel was rebuilt before the cascade began).
-  @SuppressWarnings ( "unchecked" )
-  private void cascade ( Object emission ) {
-    dispatchStem ( (E) emission );
-  }
-
   // ─── Rebuild (cold path) ───
 
   @SuppressWarnings ( "unchecked" )
   private void rebuild () {
-    FsSubscriber < E >[] currentSubs = hub.ensureSnapshot ();
+    FsSubscription[] currentSubs = hub.ensureSnapshot ();
 
     if ( subscriberReceptors == null ) {
       subscriberReceptors = new IdentityHashMap <> ();
     }
 
-    Set < FsSubscriber < E > > activeSet = Collections.newSetFromMap ( new IdentityHashMap <> () );
-    for ( FsSubscriber < E > sub : currentSubs ) {
+    Set < FsSubscription > activeSet = Collections.newSetFromMap ( new IdentityHashMap <> () );
+    for ( FsSubscription sub : currentSubs ) {
       activeSet.add ( sub );
     }
 
     subscriberReceptors.keySet ().removeIf ( sub -> !activeSet.contains ( sub ) );
 
-    for ( FsSubscriber < E > subscriber : currentSubs ) {
-      if ( !subscriberReceptors.containsKey ( subscriber ) ) {
+    for ( FsSubscription subscription : currentSubs ) {
+      // §7.3 step 3: rebuild when the pipe "has not yet rebuilt for this subscription".
+      if ( !subscriberReceptors.containsKey ( subscription ) ) {
         FsRegistrar < E > registrar = new FsRegistrar <> ();
         try {
-          subscriber.activate ( subject, registrar );
-          subscriberReceptors.put ( subscriber, registrar.consumers () );
+          ( (FsSubscriber < E >) subscription.subscriber ).activate ( subject, registrar );
+          subscriberReceptors.put ( subscription, registrar.consumers () );
         } catch ( Throwable ignored ) {
           // §15.4 #3: "A failing subscriber callback is still considered
           // consumed for that subscription/channel pair: registration calls
@@ -209,7 +205,7 @@ final class FsChannel < E > implements Receptor < E >, Consumer < Object > {
           // MUST NOT be retried for that subscription/channel pair." So keep
           // whatever the callback managed to register before it threw — and
           // still record an entry, which is what suppresses the retry.
-          subscriberReceptors.put ( subscriber, registrar.consumers () );
+          subscriberReceptors.put ( subscription, registrar.consumers () );
         }
       }
     }
@@ -224,7 +220,7 @@ final class FsChannel < E > implements Receptor < E >, Consumer < Object > {
     // which is randomized per JVM start. Iterating in registration order keeps
     // dispatch deterministic across runs.
     List < Consumer < Object > > all = new ArrayList <> ();
-    for ( FsSubscriber < E > sub : currentSubs ) {
+    for ( FsSubscription sub : currentSubs ) {
       List < Consumer < Object > > list = subscriberReceptors.get ( sub );
       if ( list != null ) all.addAll ( list );
     }
@@ -243,13 +239,6 @@ final class FsChannel < E > implements Receptor < E >, Consumer < Object > {
         }
       };
     }
-
-    // What transit cascade terminals submit. A hierarchical channel always
-    // publishes its stem walk, even with no receptors of its own — an ancestor
-    // may have some. A per-pipe channel publishes the receptor consumer
-    // directly, and null (no receptors) sends the terminal down its fallback
-    // path of submitting the channel itself.
-    cascadeDispatch = stem ? stemCascade : dispatch;
 
     builtVersion = hub.subscriberVersion;
   }

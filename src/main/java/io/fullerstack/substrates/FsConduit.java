@@ -44,14 +44,18 @@ public final class FsConduit < E > implements Conduit < E > {
 
   /// The three lifecycle capabilities, issued by the owning circuit through
   /// `Circuit.pipe(Receptor)` and built once. Each operation is an emission whose value is the
-  /// part that varies — the subscriber joining, the subscriber leaving, the hub being cleared —
-  /// so none of them allocates a carrier per call. See `docs/CAPABILITIES.md`.
+  /// part that varies — the subscription joining, the subscription leaving, the hub being
+  /// cleared — so none of them allocates a carrier per call. See `docs/CAPABILITIES.md`.
+  ///
+  /// The unit carried is the **subscription**, not the subscriber: §7.5 makes each subscribe
+  /// "an independent subscription instance" and §7.3 keys the callback on the
+  /// subscription/channel pair, so the roster [FsHub] keeps is a roster of subscriptions.
   ///
   /// The conduit still holds its circuit: unlike these three, `await`, `isClosed` and
   /// `checkExternalCaller` are lifecycle authority and no pipe confers them.
-  private final Pipe < FsSubscriber < E > > subscribes;
-  private final Pipe < FsSubscriber < E > > unsubscribes;
-  private final Pipe < FsHub < E > >        clears;
+  private final Pipe < FsSubscription > subscribes;
+  private final Pipe < FsSubscription > unsubscribes;
+  private final Pipe < FsHub < E > >    clears;
 
   /// Channels by name — the `Pool<Pipe<E>>` half of this type.
   ///
@@ -87,8 +91,21 @@ public final class FsConduit < E > implements Conduit < E > {
     this.hub     = new FsHub <> ();
     this.subject = (Subject < Conduit < E > >) (Subject < ? >) new FsSubject <> ( name, parent, Conduit.class );
 
-    this.subscribes   = circuit.pipe ( subscriber -> { if ( !closed ) hub.addSubscriber ( subscriber ); } );
-    this.unsubscribes = circuit.pipe ( hub::removeSubscriber );
+    // §7.6.1: a subscription's window runs from the point its registration job EXECUTES to the point
+    // its close job executes — both positions in the circuit's processing order, neither the moment
+    // the caller called close(). A close raised on the worker (transit) can execute before the
+    // caller's add job (ingress): the remove then runs against an empty roster, and the add would
+    // install a subscription whose close job has already run and can never be retired again. So the
+    // add job asks whether the RETIRE JOB has executed (`retired`, set on the worker), not whether
+    // close was accepted (`isClosed`, set on the caller): `subscribe(); emit(X); close(); emit(Y)`
+    // from one caller has the add job execute ahead of the retire job, and X must be delivered.
+    this.subscribes   = circuit.pipe ( subscription -> {
+      if ( !closed && !subscription.isRetired () ) hub.addSubscription ( subscription );
+    } );
+    this.unsubscribes = circuit.pipe ( subscription -> {
+      subscription.retired ();
+      hub.removeSubscription ( subscription );
+    } );
     this.clears       = circuit.pipe ( FsConduit::clear );
   }
 
@@ -246,15 +263,15 @@ public final class FsConduit < E > implements Conduit < E > {
     }
 
     FsSubscription subscription = new FsSubscription ( subscriber.subject ().name (),
-      (FsSubject < ? >) subject, circuit, s -> retire ( s, fs ), onClose );
+      (FsSubject < ? >) subject, circuit, fs, s -> retire ( s, fs ), onClose );
 
     trackSubscription ( subscription );
     fs.trackSubscription ( subscription );
 
-    // The subscriber is the emission; the receptor is fixed and built once. If the conduit is
+    // The subscription is the emission; the receptor is fixed and built once. If the conduit is
     // closed by the time this runs on the circuit thread, silently drop per Resource §9.1
     // queued-operation semantics.
-    subscribes.emit ( fs );
+    subscribes.emit ( subscription );
 
     return subscription;
   }
@@ -331,11 +348,10 @@ public final class FsConduit < E > implements Conduit < E > {
       if ( subscriptions != null ) subscriptions.remove ( subscription );
     }
     subscriber.untrackSubscription ( subscription );
-    enqueueUnsubscribe ( subscriber );
-  }
-
-  private void enqueueUnsubscribe ( FsSubscriber < E > subscriber ) {
-    unsubscribes.emit ( subscriber );
+    // §7.5: close "removes all pipes registered by this subscription" — this subscription's
+    // roster entry is what the job deletes; the *other* subscriptions of the same subscriber
+    // keep theirs.
+    unsubscribes.emit ( subscription );
   }
 
 }

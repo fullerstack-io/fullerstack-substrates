@@ -46,6 +46,11 @@ public final class FsSubscription implements Subscription {
   /// subscription there. Runs for exactly one caller — the one that wins the latch.
   private final Consumer < FsSubscription > detach;
 
+  /// The subscriber this subscription was made from. §7.3 keys the callback on the
+  /// subscription/channel *pair*, so the channel-side memo is keyed by this subscription
+  /// (see [FsHub], [FsChannel]) and must be able to reach the callback from it.
+  final FsSubscriber < ? > subscriber;
+
   /// User-supplied close callback — fires exactly once when subscription terminates.
   private final Consumer < ? super Subscription > onCloseCallback;
 
@@ -64,28 +69,20 @@ public final class FsSubscription implements Subscription {
   /// check-then-set would let two racing closers both fire the callback.
   private final AtomicBoolean closed = new AtomicBoolean ();
 
-  /// Creates a new subscription with lazy subject creation.
-  ///
-  /// @param name    the name for the subscription subject
-  /// @param parent  the parent subject for hierarchy
-  /// @param circuit the owning circuit, used for [#closeAwait()]
-  /// @param detach  retires the registration when the subscription terminates
-  FsSubscription ( Name name, FsSubject < ? > parent, FsCircuit circuit, Consumer < FsSubscription > detach ) {
-    this ( name, parent, circuit, detach, null );
-  }
-
   /// Creates a new subscription with lazy subject creation and an onClose callback.
   ///
   /// @param name            the name for the subscription subject
   /// @param parent          the parent subject for hierarchy
   /// @param circuit         the owning circuit, used for [#closeAwait()]
+  /// @param subscriber      the subscriber this subscription was made from
   /// @param detach          retires the registration when the subscription terminates
   /// @param onCloseCallback user-supplied callback fired exactly once on termination, or null
-  FsSubscription ( Name name, FsSubject < ? > parent, FsCircuit circuit, Consumer < FsSubscription > detach,
-                   Consumer < ? super Subscription > onCloseCallback ) {
+  FsSubscription ( Name name, FsSubject < ? > parent, FsCircuit circuit, FsSubscriber < ? > subscriber,
+                   Consumer < FsSubscription > detach, Consumer < ? super Subscription > onCloseCallback ) {
     this.name = name;
     this.parent = parent;
     this.circuit = circuit;
+    this.subscriber = subscriber;
     this.detach = detach;
     this.onCloseCallback = onCloseCallback;
     this.closures = onCloseCallback == null ? null
@@ -130,6 +127,19 @@ public final class FsSubscription implements Subscription {
   /// Whether this subscription has accepted close, by any of the three routes.
   boolean isClosed () {
     return closed.get ();
+  }
+
+  /// Whether the retire job has EXECUTED on the circuit worker — the close end of the §7.6.1 window
+  /// in processing order, as distinct from `isClosed`, which is the caller having accepted close.
+  /// Worker-confined: written by the conduit's unsubscribe job and read by its subscribe job.
+  private boolean retired;
+
+  void retired () {
+    retired = true;
+  }
+
+  boolean isRetired () {
+    return retired;
   }
 
   /// The single termination path, shared by explicit close, subscriber close and

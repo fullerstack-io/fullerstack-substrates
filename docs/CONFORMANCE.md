@@ -6,8 +6,8 @@ are](#what-the-local-tests-are-and-are-not).
 
 | Suite | Result |
 |---|---|
-| [`substrates-api-java-tck`](https://github.com/humainary-io/substrates-api-java-tck) 3.3.0 | **1067 run · 0 failures · 0 errors** |
-| [`serventis-api-java-tck`](https://github.com/humainary-io/serventis-api-java-tck) 3.3.0 | **1227 run · 0 failures · 0 errors** |
+| [`substrates-api-java-tck`](https://github.com/humainary-io/substrates-api-java-tck) 3.6.0 | **1074 run · 0 failures · 0 errors** |
+| [`serventis-api-java-tck`](https://github.com/humainary-io/serventis-api-java-tck) 3.6.0 | **1337 run · 0 failures · 0 errors** |
 
 ```bash
 ./scripts/tck.sh                              # both
@@ -16,6 +16,70 @@ are](#what-the-local-tests-are-and-are-not).
 
 The TCK resolves the provider from the local Maven repository, so **an edit that has not been
 installed is not under test**. `scripts/tck.sh` installs first for that reason.
+
+---
+
+## The 3.6.0 conformance run
+
+| | |
+|---|---|
+| **Date** | 2026-10-04 |
+| **Provider** | `io.fullerstack:fullerstack-substrates:3.0.0-SNAPSHOT`, built against Substrates/Serventis **3.6.0** |
+| **Substrates TCK** | `substrates-api-java-tck` at **3.6.0** (upstream `main` commit `6cc78fa`, tagged 3.6.0 locally) — **1074 run · 0 failures · 0 errors** |
+| **Serventis TCK** | `serventis-api-java-tck` at **3.6.0** (`19e65d5`) — **1337 run · 0 failures · 0 errors** |
+| **Baseline before the changes** | 1074 run · **1 failure** — `SubscriberContractTest.register_fromHelperThreadDuringCallback_throwsIllegalState` |
+
+**What 3.3.0 → 3.6.0 changed.** The Java Substrates API did not change (`@SpecDoc` URLs and two
+`@SpecRef` additions). The specification made three clauses normative. §6.3: a receptor registration
+MUST be invoked directly during dispatch and a pipe registration MUST be emitted to, its delivery
+following the pipe's own contract — what this provider has done since the 3.3.0 run. §6.4: a
+callback-scoped object is illegal from any execution context but the circuit context that issued it,
+including a helper the callback starts while still running, and a `Registrar` MUST detect that; a
+`Window` handed to one callback MUST NOT validate again in a later one. §5.1: a replay log MUST record
+stimulus time, and `chance` reproduces under replay "only where the implementation documents a way to
+seed that source". Serventis 3.6.0 is additive (four instruments, a `KIND` map on three); the
+Serventis kit now depends on the Substrates kit's test jar, which `scripts/tck.sh both` installs.
+
+**The one kit failure — `FsRegistrar` checked only that its callback had not returned.** A helper
+thread started inside the callback saw `closed == false` and registered. `FsRegistrar` now records
+the thread that constructed it — the owning worker, in `FsChannel`'s rebuild — and `register` throws
+`IllegalStateException` for any other thread before it reads `closed`, since a foreign thread's read
+of that plain field proves nothing. Cold path: one `Thread.currentThread()` per `register` call.
+
+**Not a kit failure, found by reading §5.1 — `chance` could not be replayed.** It drew from
+`ThreadLocalRandom`, which cannot be seeded, and nothing documented it. It now draws from a SplitMix64
+state owned by each operator (the generator `ThreadLocalRandom` itself uses), started from the
+provider seed mixed with the operator's construction ordinal. **The documented way to seed it:**
+
+- Run with `-Dio.fullerstack.substrates.seed=<decimal long>`. A malformed value fails at first use
+  rather than silently drawing another seed.
+- Unset, the provider draws a seed once per JVM and publishes it back under the same property, so a
+  run can record the value that replays it.
+- A replay reproduces every `chance` decision when it runs with the same seed, constructs its
+  `chance` operators in the same order (each `Fiber.pipe` materialisation of a fiber holding a
+  `chance` takes the next ordinal), and its circuits process the same ingress in the same order. Each
+  operator runs on its pipe's worker, so its draws are consumed in that circuit's processing order.
+  Constructing `chance` pipes concurrently from several threads makes the ordinal assignment, and so
+  the replay, depend on thread timing.
+
+`ChanceReplayTest` holds this: same seed and ordinal give the same decisions; a run replayed in a fresh
+JVM under its seed reproduces exactly, and under another seed does not; an unseeded run's published
+seed replays it. Measured with `-XX:+UseCompactObjectHeaders`, 3 forks × 5 iterations, `-prof gc`:
+
+| perfkit row | before | after |
+|---|---|---|
+| `FiberOps.chance_batch` | 29.6 ± 2.3 ns/op · 24.0 B/op | 30.1 ± 3.7 ns/op · 24.0 B/op |
+| `FiberOps.guard_batch` (code unchanged — the noise floor) | 26.2 ± 2.0 ns/op | 30.0 ± 4.9 ns/op |
+
+Predicted cost-neutral (the same mixing arithmetic, a field read and write in place of the per-thread
+lookup); measured no change distinguishable from this machine's run-to-run noise, which moved the
+untouched reference row further than the changed one. No allocation was added.
+
+**Known SHOULD not met.** §6.4 makes detection of a callback-scoped object used from a foreign context
+mandatory for `Registrar` only. `FsWindow` already mints a fresh, generation-stamped view per callback,
+so no window is revived in a later one; it does not detect use from a helper thread while its callback
+is still running. Doing so puts a thread comparison on every window operator entry, so it waits on a
+measurement of that cost.
 
 ---
 

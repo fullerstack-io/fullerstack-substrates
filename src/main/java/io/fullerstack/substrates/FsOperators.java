@@ -5,13 +5,14 @@ import io.humainary.substrates.api.Substrates.Fault;
 import io.humainary.substrates.api.Substrates.Pipe;
 import io.humainary.substrates.api.Substrates.Receptor;
 
+import java.security.SecureRandom;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.Objects;
-import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiPredicate;
 import java.util.function.BinaryOperator;
 import java.util.function.Consumer;
@@ -355,15 +356,81 @@ final class FsOperators {
 
   // ─── 2.3 operators ──────────────────────────────────────────────────────────
 
+  /// `chance(p)`: passes each emission with probability `p`, from a seeded source replay can reproduce.
+  ///
+  /// §5.1 (3.6.0): "replay reproduces its decisions only where the implementation documents a way to
+  /// seed that source". The source was `ThreadLocalRandom`, which cannot be seeded, so no replay of a
+  /// circuit holding a `chance` could reproduce what it passed. Each operator now owns a SplitMix64
+  /// state — the generator `ThreadLocalRandom` and `SplittableRandom` themselves use — so its draws
+  /// are a pure function of its starting state and the emissions it has seen.
+  ///
+  /// The starting state is [#SEED] mixed with the operator's construction ordinal. A replay that
+  /// runs with the same seed and builds its `chance` operators in the same order draws the same
+  /// sequence for each, and an operator only ever runs on its pipe's worker (§5.3), so the order in
+  /// which it consumes its draws is the circuit's processing order. The state is a plain field for
+  /// the same reason: one worker reads and writes it.
+  ///
+  /// The seed is `-Dio.fullerstack.substrates.seed=<long>`. Unset, one is drawn once per JVM and
+  /// published back under that property, so a run can record the value that would replay it.
   static final class Chance < E > implements Consumer < E > {
+
+    /// The system property that seeds every `chance` operator in this JVM.
+    static final String SEED_PROPERTY = "io.fullerstack.substrates.seed";
+
+    /// The provider seed, fixed at class initialisation. A malformed property fails loudly: a run
+    /// that asked for a seed and silently got another could never be replayed.
+    static final long SEED = seed ();
+
+    /// Construction ordinal, shared by every `chance` operator in the JVM. Read once per operator, at
+    /// materialisation — cold.
+    private static final AtomicLong ORDINAL = new AtomicLong ();
+
+    /// SplitMix64 increment: the odd golden-ratio constant `SplittableRandom` uses.
+    private static final long GAMMA = 0x9E3779B97F4A7C15L;
+
     final double         p;
     final Consumer < E > d;
+    private long         state;
 
-    Chance ( double p, Consumer < E > d ) { this.p = p; this.d = d; }
+    Chance ( double p, Consumer < E > d ) {
+      this ( p, d, ORDINAL.getAndIncrement () );
+    }
+
+    /// Package-private so a test can pin the ordinal and show the draws depend on it and the seed
+    /// alone.
+    Chance ( double p, Consumer < E > d, long ordinal ) {
+      this.p     = p;
+      this.d     = d;
+      this.state = mix ( SEED + GAMMA * ( ordinal + 1 ) );
+    }
 
     @Override
     public void accept ( E v ) {
-      if ( ThreadLocalRandom.current ().nextDouble () < p ) d.accept ( v );
+      final long s = state + GAMMA;
+      state = s;
+      // Top 53 bits of the mixed word as a double in [0, 1) — SplittableRandom.nextDouble's form.
+      if ( ( mix ( s ) >>> 11 ) * 0x1.0p-53 < p ) d.accept ( v );
+    }
+
+    /// Stafford variant 13, SplitMix64's output mix.
+    private static long mix ( long z ) {
+      z = ( z ^ ( z >>> 30 ) ) * 0xBF58476D1CE4E5B9L;
+      z = ( z ^ ( z >>> 27 ) ) * 0x94D049BB133111EBL;
+      return z ^ ( z >>> 31 );
+    }
+
+    private static long seed () {
+      final String given = System.getProperty ( SEED_PROPERTY );
+      if ( given != null ) {
+        try {
+          return Long.parseLong ( given.trim () );
+        } catch ( NumberFormatException e ) {
+          throw new IllegalArgumentException ( SEED_PROPERTY + " must be a decimal long, was: " + given, e );
+        }
+      }
+      final long drawn = new SecureRandom ().nextLong ();
+      System.setProperty ( SEED_PROPERTY, Long.toString ( drawn ) );
+      return drawn;
     }
   }
 

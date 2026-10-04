@@ -16,17 +16,34 @@ import java.util.function.Consumer;
 /// registered pipe is stored behind one [Admit] and *submitted* to its own circuit
 /// — see [#register(Pipe)] for why the two kinds differ.
 ///
-/// Enforces the @Temporal contract: register() only valid during callback.
+/// Enforces the @Temporal contract: register() is valid only during the callback, and only on
+/// the circuit context that issued it — see [#checkLive].
 @Provided
 public final class FsRegistrar < E > implements Registrar < E > {
 
   private final List < Consumer < Object > > consumers = new ArrayList <> ();
+
+  /// The worker that issued this registrar. §6.4 (3.6.0): a callback-scoped object "MUST NOT be
+  /// used from any other execution context, including one the callback itself starts, even while
+  /// the callback is still running", and for a Registrar that use MUST be detected (§15.1). A
+  /// registrar is constructed in the channel's rebuild, on the owning worker, so the constructing
+  /// thread is the issuing context.
+  private final Thread owner = Thread.currentThread ();
   private boolean closed;
+
+  /// Rejects a call after the callback returned, or from any thread but the issuing worker.
+  ///
+  /// The owner test runs first: `closed` is a plain field written by the worker, so a foreign
+  /// thread's read of it proves nothing, while the thread identity is fixed at construction.
+  private void checkLive () {
+    if ( Thread.currentThread () != owner ) throw new IllegalStateException ( "Registrar used outside the circuit context that issued it" );
+    if ( closed ) throw new IllegalStateException ( "Registrar is closed — register() only valid during callback" );
+  }
 
   @Override
   @SuppressWarnings ( "unchecked" )
   public void register ( Receptor < ? super E > receptor ) {
-    if ( closed ) throw new IllegalStateException ( "Registrar is closed — register() only valid during callback" );
+    checkLive ();
     // Wrap Receptor in Consumer<Object> — this is the cold path (subscriber callback).
     // A receptor stays inline in the dispatch walk: §6.3 and §16.3 let a provider
     // store it directly, and it has no owning circuit to submit to — it is the channel's.
@@ -50,7 +67,7 @@ public final class FsRegistrar < E > implements Registrar < E > {
   /// contracts" hold, and that one held neither.
   @Override
   public void register ( Pipe < ? super E > pipe ) {
-    if ( closed ) throw new IllegalStateException ( "Registrar is closed — register() only valid during callback" );
+    checkLive ();
     if ( pipe instanceof FsPipe < ? > fp ) {
       consumers.add ( new Admit ( fp.circuit (), fp.receiver () ) );
     } else {

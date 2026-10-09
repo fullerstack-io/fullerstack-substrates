@@ -71,11 +71,13 @@ final class FsScope implements Scope {
   /// Guards `resources`, `children` and `closureCache`.
   private final Object lock = new Object ();
 
-  /// Registered resources (closed in reverse order). Lazily initialized.
-  private List < Resource > resources;
-
-  /// Child scopes. Lazily initialized.
-  private List < FsScope > children;
+  /// Registered resources and child scopes, together, in creation order. Lazily initialized.
+  ///
+  /// One list, not two: `Scope.close()` (3.7.0) closes "registered resources and child scopes
+  /// together, in reverse creation order", so a child created between two registrations closes
+  /// between them. Two lists can only produce "resources first" or "children first", and neither is
+  /// that order. Each element is a [Resource] or an [FsScope].
+  private List < Object > members;
 
   /// Cache of closures per resource (cleared when consumed). Lazily initialized.
   private Map < Resource, FsClosure < ? > > closureCache;
@@ -106,8 +108,8 @@ final class FsScope implements Scope {
     synchronized ( lock ) {
       if ( closureCache != null )
         closureCache.remove ( resource );
-      if ( resources != null )
-        resources.remove ( resource );
+      if ( members != null )
+        members.remove ( resource );
     }
   }
 
@@ -188,11 +190,11 @@ final class FsScope implements Scope {
       }
       FsClosure < R > closure = new FsClosure <> ( resource, this );
       closureCache.put ( resource, closure );
-      if ( resources == null ) {
-        resources = new ArrayList <> ();
+      if ( members == null ) {
+        members = new ArrayList <> ();
       }
       // Register the resource so it gets closed when the scope closes (if not consumed)
-      resources.add ( resource );
+      members.add ( resource );
       return closure;
     }
   }
@@ -207,15 +209,15 @@ final class FsScope implements Scope {
     synchronized ( lock ) {
       requireOpen ( "register" );
 
-      if ( resources == null ) {
-        resources = new ArrayList <> ();
+      if ( members == null ) {
+        members = new ArrayList <> ();
       }
       // Idempotent: same instance (by identity) is a no-op, and keeps its
       // original close-order position (§9.2).
-      for ( int i = 0, len = resources.size (); i < len; i++ ) {
-        if ( resources.get ( i ) == resource ) return resource;
+      for ( int i = 0, len = members.size (); i < len; i++ ) {
+        if ( members.get ( i ) == resource ) return resource;
       }
-      resources.add ( resource );
+      members.add ( resource );
       return resource;
     }
   }
@@ -238,21 +240,25 @@ final class FsScope implements Scope {
     synchronized ( lock ) {
       requireOpen ( "scope" );
       FsScope child = new FsScope ( childName, this );
-      if ( children == null ) {
-        children = new ArrayList <> ();
+      if ( members == null ) {
+        members = new ArrayList <> ();
       }
-      children.add ( child );
+      members.add ( child );
       return child;
     }
   }
 
-  /// §9.2: "When a scope closes, all resources registered with it close
-  /// automatically in reverse registration order (last registered, first
-  /// closed)", then its child scopes. Terminal and idempotent (§16.1#8).
+  /// §9.2: "When a scope closes, all resources registered with it close automatically in reverse
+  /// registration order (last registered, first closed)". The Java projection (3.7.0) extends that to
+  /// child scopes: members close "together, in reverse creation order: whatever was registered or
+  /// created last closes first, and a child scope closes completely, its own members included, before
+  /// the next older member". Terminal and idempotent (§16.1#8).
   ///
-  /// Iterative, not recursive: a scope hierarchy is caller-shaped, and a
-  /// recursive walk turns a deep one into a StackOverflowError during cleanup —
-  /// the worst possible moment for it.
+  /// Iterative, not recursive: a scope hierarchy is caller-shaped, and a recursive walk turns a deep
+  /// one into a StackOverflowError during cleanup — the worst possible moment for it. Each frame on
+  /// the stack is one scope's members, taken under its lock, and a cursor walking them newest first;
+  /// meeting a child pushes the child's frame, so the child drains completely before its parent's
+  /// cursor moves to the next older member.
   @Idempotent
   @Override
   public void close () {
@@ -260,50 +266,50 @@ final class FsScope implements Scope {
     // a member's own close finds the scope already closed and returns.
     if ( closed.getAndSet ( true ) ) return;
 
-    Deque < FsScope > pending = new ArrayDeque <> ();
-    closeMembers ( this, pending );
-    while ( !pending.isEmpty () ) {
-      FsScope child = pending.pollLast ();
-      // The child's own terminal transition, taken here rather than through a
-      // recursive close: idempotence stays keyed on this one swap, so a child
-      // already closed through its own handle is skipped exactly as before.
-      if ( child.closed.getAndSet ( true ) ) continue;
-      closeMembers ( child, pending );
-    }
-  }
-
-  /// Closes one scope's registrations in reverse order and stages its children.
-  ///
-  /// The lists are taken under the lock and every close runs outside it
-  /// (§15.4 #2). Each close is individually guarded — §9.2: "If a resource
-  /// signals an error during close, the error MUST be suppressed and remaining
-  /// resources MUST still close." One guard around the whole loop would satisfy
-  /// the first half of that sentence and violate the second.
-  private static void closeMembers ( FsScope scope, Deque < FsScope > pending ) {
-    List < Resource > registered;
-    List < FsScope >  kids;
-    synchronized ( scope.lock ) {
-      registered = scope.resources;
-      kids       = scope.children;
-      scope.resources    = null;
-      scope.children     = null;
-      scope.closureCache = null;
-    }
-
-    if ( registered != null ) {
-      // §16.1#10: last registered, first closed.
-      for ( int i = registered.size () - 1; i >= 0; i-- ) {
+    Deque < Frame > stack = new ArrayDeque <> ();
+    stack.push ( new Frame ( takeMembers ( this ) ) );
+    while ( !stack.isEmpty () ) {
+      Frame frame = stack.peek ();
+      if ( frame.next < 0 ) {
+        stack.pop ();
+        continue;
+      }
+      Object member = frame.members.get ( frame.next-- );
+      if ( member instanceof FsScope child ) {
+        // The child's own terminal transition, taken here rather than through a recursive close:
+        // idempotence stays keyed on this one swap, so a child already closed through its own
+        // handle is skipped.
+        if ( !child.closed.getAndSet ( true ) ) stack.push ( new Frame ( takeMembers ( child ) ) );
+      } else {
         try {
-          registered.get ( i ).close ();
+          ( (Resource) member ).close ();
         } catch ( Throwable ignored ) {
-          // §9.2 — suppressed; remaining resources still close.
+          // §9.2: "If a resource signals an error during close, the error MUST be suppressed and
+          // remaining resources MUST still close." Guarded per member, never around the loop.
         }
       }
     }
+  }
 
-    // Staged in creation order, popped from the tail, so children close in
-    // reverse creation order — the same rule the registrations follow.
-    if ( kids != null ) pending.addAll ( kids );
+  /// Detaches a scope's members under its lock; every close then runs outside it (§15.4 #2).
+  private static List < Object > takeMembers ( FsScope scope ) {
+    synchronized ( scope.lock ) {
+      List < Object > taken = scope.members;
+      scope.members      = null;
+      scope.closureCache = null;
+      return taken == null ? List.of () : taken;
+    }
+  }
+
+  /// One scope's members and a cursor walking them newest first.
+  private static final class Frame {
+    final List < Object > members;
+    int                   next;
+
+    Frame ( List < Object > members ) {
+      this.members = members;
+      this.next    = members.size () - 1;
+    }
   }
 
   /// Optimized path() — walks parent chain directly instead of

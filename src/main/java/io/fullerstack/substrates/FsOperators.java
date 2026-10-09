@@ -850,10 +850,10 @@ final class FsOperators {
   /// the main pipeline; non-matching values pass through. Stateless. Spec §6.2.2.
   static final class Route < E > implements Consumer < E > {
     final Predicate < ? super E > p;
-    final Pipe < E >              side;
+    final Pipe < ? super E >      side;
     final Consumer < E >          d;
 
-    Route ( Predicate < ? super E > p, Pipe < E > side, Consumer < E > d ) {
+    Route ( Predicate < ? super E > p, Pipe < ? super E > side, Consumer < E > d ) {
       this.p = p; this.side = side; this.d = d;
     }
 
@@ -866,10 +866,10 @@ final class FsOperators {
 
   /// Tee: fan-out to `side` then continue downstream. Stateless. Spec §6.2.2.
   static final class Tee < E > implements Consumer < E > {
-    final Pipe < E >     side;
+    final Pipe < ? super E > side;
     final Consumer < E > d;
 
-    Tee ( Pipe < E > side, Consumer < E > d ) { this.side = side; this.d = d; }
+    Tee ( Pipe < ? super E > side, Consumer < E > d ) { this.side = side; this.d = d; }
 
     @Override
     public void accept ( E v ) {

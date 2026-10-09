@@ -5,6 +5,7 @@ import io.humainary.substrates.api.Substrates.Identity;
 import io.humainary.substrates.api.Substrates.Name;
 import io.humainary.substrates.api.Substrates.Provided;
 
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Member;
 import java.util.Iterator;
 import java.util.List;
@@ -165,8 +166,12 @@ public final class FsName implements Name {
   }
 
   /// Creates a Name from a Member (declaring class + member name).
+  ///
+  /// A constructor's member name is `<init>`, as in a stack trace (3.7.0): `Constructor.getName()`
+  /// is the binary name of its class, so using it appended the class path a second time.
   static FsName fromMember ( Member member ) {
-    return intern ( classNameOf ( member.getDeclaringClass () ) + FULLSTOP + member.getName () );
+    String part = member instanceof Constructor < ? > ? "<init>" : member.getName ();
+    return intern ( classNameOf ( member.getDeclaringClass () ) + FULLSTOP + part );
   }
 
   /// Creates a Name from an Iterable of parts.
@@ -444,7 +449,7 @@ public final class FsName implements Name {
 
   @Override
   public Name name ( Member member ) {
-    return name ( classNameOf ( member.getDeclaringClass () ) ).name ( member.getName () );
+    return name ( classNameOf ( member.getDeclaringClass () ) ).name ( member instanceof Constructor < ? > ? "<init>" : member.getName () );
   }
 
   /// Optimized: return cached path directly for '.' separator (the common case).

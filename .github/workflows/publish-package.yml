@@ -13,14 +13,14 @@ env:
   # repository is cloned at THIS tag — never at HEAD, which moves ahead of the version
   # in pom.xml and has broken this workflow before. Bump it with the two
   # *-api.version properties in pom.xml; the guard step below fails if they diverge.
-  HUMAINARY_TAG: '3.6.0'
+  HUMAINARY_TAG: '3.7.0'
   # Upstream publishes each release as a squashed commit on main and does not tag it.
   # Each repository is fetched at the commit the family was upgraded against on
-  # 2026-10-04 (the 3.6.0 release commits), so a later upstream commit cannot change
+  # 2026-10-09 (the 3.7.0 release commits), so a later upstream commit cannot change
   # what this provider is built and measured against. Bump these with HUMAINARY_TAG.
-  HUMAINARY_SPECS_SHA: '67725fa414319f26eaf00be6265a2bde4f08d49f'
-  HUMAINARY_SUBSTRATES_SHA: '4bb1679726f0de459a6ae161ed5e14eec8194573'
-  HUMAINARY_SERVENTIS_SHA: '284703866879c38f65f9c99b27197cb8974f53bf'
+  HUMAINARY_SPECS_SHA: 'fd30f57071a2c2ea62f03b0f9f873788f3e7581c'
+  HUMAINARY_SUBSTRATES_SHA: '4fb616464b90c1e40de473a479627c11e3b290fd'
+  HUMAINARY_SERVENTIS_SHA: 'd5affbaf6ace5b08e3ffe3aea172753d8796bb99'
 
 jobs:
   publish:

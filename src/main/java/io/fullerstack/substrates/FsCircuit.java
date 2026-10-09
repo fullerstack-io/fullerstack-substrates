@@ -836,7 +836,7 @@ public final class FsCircuit implements Circuit {
   @New
   @NotNull
   @Override
-  public < E > Sink < E > sink ( @NotNull Pipe < Capture < E > > endpoint ) {
+  public < E > Sink < E > sink ( @NotNull Pipe < ? super Capture < E > > endpoint ) {
     requireNonNull ( endpoint );
     requireOpen ( "sink" );
     // SPEC §1307 — endpoint must be a runtime-provided implementation. By provider, not by
@@ -852,7 +852,7 @@ public final class FsCircuit implements Circuit {
   @New
   @NotNull
   @Override
-  public < E > Sink < E > sink ( @NotNull Name name, @NotNull Pipe < Capture < E > > endpoint ) {
+  public < E > Sink < E > sink ( @NotNull Name name, @NotNull Pipe < ? super Capture < E > > endpoint ) {
     requireNonNull ( name );
     requireNonNull ( endpoint );
     requireOpen ( "sink" );
@@ -894,6 +894,13 @@ public final class FsCircuit implements Circuit {
     requireOpen ( "ticker" );
     if ( interval.isZero () || interval.isNegative () ) {
       throw new IllegalArgumentException ( "interval must be strictly positive" );
+    }
+    // 3.7.0: an interval "too large to represent in nanoseconds" is a configuration error, rejected
+    // here as the time-aware operators reject it, not left to overflow inside the ticker.
+    try {
+      interval.toNanos ();
+    } catch ( ArithmeticException e ) {
+      throw new IllegalArgumentException ( "interval is too large to represent in nanoseconds", e );
     }
     // SPEC §15.1 provider mismatch — target pipe must come from our provider. By provider, not
     // by concrete class, so a ticker may tick into a Sink channel. Only `emit` is used on it.

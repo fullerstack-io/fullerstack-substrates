@@ -141,9 +141,11 @@ public final class FsConduit < E > implements Conduit < E > {
   /// transforms T → E before reaching this conduit's pipes.
   @NotNull
   @Override
-  public < T > Pool < Pipe < T > > pool ( @NotNull Flow < T, E > flow ) {
+  public < T > Pool < Pipe < T > > pool ( @NotNull Flow < T, ? extends E > flow ) {
     requireNonNull ( flow );
-    if ( !( flow instanceof FsFlow < T, E > fsFlow ) ) {
+    // 3.7.0 widened the flow to `? extends E`: a flow producing a subtype of this conduit's emission
+    // type feeds its pipes, which accept every E.
+    if ( !( flow instanceof FsFlow < T, ? extends E > fsFlow ) ) {
       throw new IllegalArgumentException ( "flow must be an FsFlow instance" );
     }
     return new FsDerivedPool <> ( this, p -> fsFlow.pipe ( p ) );

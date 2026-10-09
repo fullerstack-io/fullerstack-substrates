@@ -77,7 +77,10 @@ final class FsState implements State {
 
   @Override
   public Spliterator < Slot < ? > > spliterator () {
-    return Arrays.spliterator ( slots );
+    // 3.7.0: the State spliterator reports ORDERED and NONNULL, so an ordered stream operation such
+    // as findFirst keeps "most recent write first" under parallel(). Arrays.spliterator reported
+    // ORDERED but not NONNULL, though no slot is ever null.
+    return Spliterators.spliterator ( slots, Spliterator.ORDERED | Spliterator.NONNULL | Spliterator.IMMUTABLE );
   }
 
   /// The §8.1 / §16.3 upsert.

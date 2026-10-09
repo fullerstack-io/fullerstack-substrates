@@ -30,7 +30,7 @@ import static io.humainary.substrates.api.Substrates.cortex;
 public final class FsSink < E > implements Sink < E > {
 
   private final FsCircuit            circuit;
-  private final Pipe < Capture < E > > endpoint;
+  private final Pipe < ? super Capture < E > > endpoint;
   private final Subject < Sink < E > > subject;
 
   /// Channels by name — the `Pool<Pipe<E>>` half of this type.
@@ -41,7 +41,7 @@ public final class FsSink < E > implements Sink < E > {
 
   @SuppressWarnings ( "unchecked" )
   public FsSink ( FsSubject < ? > parent, Name name, FsCircuit circuit,
-                  Pipe < Capture < E > > endpoint ) {
+                  Pipe < ? super Capture < E > > endpoint ) {
     this.circuit  = circuit;
     // A pipe is owned by its circuit and emits to its circuit — including this sink's channels,
     // whose captures must therefore land on *this* circuit before going anywhere else. Normalising
@@ -87,10 +87,10 @@ public final class FsSink < E > implements Sink < E > {
   static final class SinkPipe < E > implements Pipe < E > {
 
     private final Subject < Pipe < E > > subject;
-    private final Pipe < Capture < E > > endpoint;
+    private final Pipe < ? super Capture < E > > endpoint;
     private final FsCircuit              circuit;
 
-    SinkPipe ( Subject < Pipe < E > > subject, Pipe < Capture < E > > endpoint, FsCircuit circuit ) {
+    SinkPipe ( Subject < Pipe < E > > subject, Pipe < ? super Capture < E > > endpoint, FsCircuit circuit ) {
       this.subject  = subject;
       this.endpoint = endpoint;
       this.circuit  = circuit;

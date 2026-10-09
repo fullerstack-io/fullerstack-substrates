@@ -508,7 +508,7 @@ public final class FsFiber < E > implements Fiber < E > {
 
   @NotNull
   @Override
-  public Fiber < E > route ( @NotNull Predicate < ? super E > predicate, @NotNull Pipe < E > pipe ) {
+  public Fiber < E > route ( @NotNull Predicate < ? super E > predicate, @NotNull Pipe < ? super E > pipe ) {
     Objects.requireNonNull ( predicate );
     Objects.requireNonNull ( pipe );
     return append ( d -> new FsOperators.Route <> ( predicate, pipe, d ) );
@@ -526,7 +526,7 @@ public final class FsFiber < E > implements Fiber < E > {
 
   @NotNull
   @Override
-  public Fiber < E > tee ( @NotNull Pipe < E > pipe ) {
+  public Fiber < E > tee ( @NotNull Pipe < ? super E > pipe ) {
     Objects.requireNonNull ( pipe );
     return append ( d -> new FsOperators.Tee <> ( pipe, d ) );
   }

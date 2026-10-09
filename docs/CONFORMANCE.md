@@ -6,8 +6,8 @@ are](#what-the-local-tests-are-and-are-not).
 
 | Suite | Result |
 |---|---|
-| [`substrates-api-java-tck`](https://github.com/humainary-io/substrates-api-java-tck) 3.6.0 | **1074 run · 0 failures · 0 errors** |
-| [`serventis-api-java-tck`](https://github.com/humainary-io/serventis-api-java-tck) 3.6.0 | **1337 run · 0 failures · 0 errors** |
+| [`substrates-api-java-tck`](https://github.com/humainary-io/substrates-api-java-tck) 3.7.0 | **1083 run · 0 failures · 0 errors** |
+| [`serventis-api-java-tck`](https://github.com/humainary-io/serventis-api-java-tck) 3.7.0 | **1335 run · 0 failures · 0 errors** |
 
 ```bash
 ./scripts/tck.sh                              # both
@@ -16,6 +16,36 @@ are](#what-the-local-tests-are-and-are-not).
 
 The TCK resolves the provider from the local Maven repository, so **an edit that has not been
 installed is not under test**. `scripts/tck.sh` installs first for that reason.
+
+---
+
+## The 3.7.0 conformance run
+
+| | |
+|---|---|
+| **Date** | 2026-10-09 |
+| **Provider** | `io.fullerstack:fullerstack-substrates:3.0.0-SNAPSHOT`, built against Substrates/Serventis **3.7.0** |
+| **Substrates TCK** | `substrates-api-java-tck` at **3.7.0** (upstream `main` commit `0bb48f8`, tagged 3.7.0 locally) — **1083 run · 0 failures · 0 errors** |
+| **Serventis TCK** | `serventis-api-java-tck` at **3.7.0** (`23df5d1`) — **1335 run · 0 failures · 0 errors** |
+| **Baseline before the changes** | did not compile; once compiled, 1083 run · **4 failures** |
+
+**What 3.6.0 → 3.7.0 changed.** The specification text changed only its version line; the Java projection
+moved. Five parameters widened — `Circuit.sink` (both forms) takes `Pipe<? super Capture<E>>`,
+`Conduit.pool` takes `Flow<T, ? extends E>`, `Fiber.route` and `Fiber.tee` take `Pipe<? super E>` — so
+the provider's overrides no longer matched and it did not compile. `Fault` became serializable,
+`Basin.drain` gained `@Queued`, and four behaviours tightened in the API's own text, each with a kit test:
+
+| Kit failure | What the 3.7.0 API says | Fix |
+|---|---|---|
+| `ScopeContractTest.close_nestedScopes_closesMembersInReverseCreationOrder` | `Scope.close()` closes "registered resources and child scopes together, in reverse creation order … a child scope closes completely, its own members included, before the next older member" | `FsScope` kept resources and children in two lists, so it could only close all resources then all children. One creation-ordered member list, walked newest first with an explicit stack — still iterative, so a deep hierarchy cannot overflow the stack during cleanup. |
+| `TickerContractTest.ticker_intervalBeyondNanosecondRange_throwsIllegalArgumentException` | `ticker` throws `IllegalArgumentException` for an interval "too large to represent in nanoseconds" | `FsCircuit.ticker` let `Duration.toNanos()` overflow as `ArithmeticException`; it is now converted at the call. |
+| `StateContractTest.spliterator_populatedState_reportsOrderedAndNonNull` | the `State` spliterator is `ORDERED` and `NONNULL` | `Arrays.spliterator` reported `ORDERED` but not `NONNULL`; now `Spliterators.spliterator(…, ORDERED \| NONNULL \| IMMUTABLE)`. |
+| `NameContractTest.name_constructor_appendsInitSegmentBelowClass` | "A constructor's member name is `<init>`, as in a stack trace" | `Constructor.getName()` is the class's binary name, so the class path was appended twice. Both `Cortex.name(Member)` and `Name.name(Member)` now use `<init>`. |
+
+Serventis 3.7.0 needed nothing here (the provider implements Substrates only). Downstream it removed the
+published `OPERATION` map from nine instruments — Serventis now publishes one only where a subject
+"carries one lifecycle at a time" (Processes, Changes) — and moved `Processes.RESTART` from `ADVANCE` to
+`BEGIN`.
 
 ---
 

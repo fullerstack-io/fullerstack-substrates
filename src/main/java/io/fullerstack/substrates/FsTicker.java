@@ -16,10 +16,13 @@ import java.util.concurrent.TimeUnit;
 /// Periodic emitter (Substrates 2.8, SPEC §11.5).
 ///
 /// Emits monotonic gap-free `Long` sequence numbers (0, 1, 2, …) into the
-/// target pipe at a fixed-rate cadence. Scheduling is anchored to a grid
-/// (`anchor + (n+1) * interval`) so late ticks do not shift subsequent
-/// grid points. A stall of more than one interval re-anchors the grid
-/// (no burst of catch-up ticks), but the sequence remains gap-free.
+/// target pipe at a fixed-rate cadence. Scheduling is anchored to a grid —
+/// tick `n` at `anchor + (n - anchorSeq) * interval`, where `anchorSeq` is the
+/// sequence the grid was anchored at — so late ticks do not shift subsequent
+/// grid points. A stall of more than one interval re-anchors the grid to the
+/// current time and the current sequence (no burst of catch-up ticks, and no
+/// wait of the ticks already emitted: a one-time phase shift, SPEC §11.4), and
+/// the sequence remains gap-free.
 ///
 /// Scheduling runs on the circuit's shared [java.util.concurrent.ScheduledExecutorService].
 /// A tick emits into a pipe owned by the circuit, whose receptor forwards to the target. The
@@ -45,6 +48,10 @@ final class FsTicker implements Ticker {
   /// scheduler thread reschedules.
   private volatile long anchorNanos;
 
+  /// The sequence number the grid is anchored at: -1 at construction (tick 0 falls one interval after
+  /// the anchor), then the tick at which it was last re-anchored. Scheduler thread only.
+  private long anchorSeq;
+
   /// Monotonic gap-free sequence. Incremented on the scheduler thread only;
   /// no contention.
   private long seq;
@@ -65,6 +72,7 @@ final class FsTicker implements Ticker {
     this.intervalNanos = interval.toNanos ();
     this.anchorNanos   = System.nanoTime ();
     this.seq           = -1L;
+    this.anchorSeq     = -1L;
     schedule ( intervalNanos );
   }
 
@@ -86,10 +94,11 @@ final class FsTicker implements Ticker {
     // Re-anchor only if more than one interval behind the grid (SPEC §11.5
     // "bounded catch-up"); otherwise shorten the next wait to compensate.
     final long now      = System.nanoTime ();
-    final long nextGrid = anchorNanos + ( s + 2L ) * intervalNanos;
+    final long nextGrid = anchorNanos + ( s + 1L - anchorSeq ) * intervalNanos;
     long       delay    = nextGrid - now;
     if ( delay < -intervalNanos ) {
       anchorNanos = now;
+      anchorSeq   = s;
       delay       = intervalNanos;
     }
     schedule ( delay );

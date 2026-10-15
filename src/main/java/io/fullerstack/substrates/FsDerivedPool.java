@@ -5,8 +5,8 @@ import io.humainary.substrates.api.Substrates.NotNull;
 import io.humainary.substrates.api.Substrates.Pool;
 import io.humainary.substrates.api.Substrates.Provided;
 
-import java.util.IdentityHashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
 
 import static java.util.Objects.requireNonNull;
@@ -34,8 +34,10 @@ import static java.util.Objects.requireNonNull;
 ///
 /// - **EMPTY** — nothing resolved; neither the entry nor the map exists.
 /// - **SINGLE** — one entry, held inline as `(last, cached)`. No map.
-/// - **MULTI** — a second distinct name promotes to an [IdentityHashMap], and the inline pair
-///   stays live as the one-entry cache in front of it.
+/// - **MULTI** — a second distinct name promotes to a [ConcurrentHashMap], and the inline pair
+///   stays live as the one-entry cache in front of it. Each later name is inserted into that one map
+///   in place: a pool that resolves many names — a conduit whose channels are price levels — costs
+///   O(1) per new name, not a copy of every name so far.
 ///
 /// ## Concurrency
 ///
@@ -45,8 +47,8 @@ import static java.util.Objects.requireNonNull;
 /// - The inline entry publishes **cached-then-last**, with `last` volatile. That release/acquire
 ///   pair is what makes the lock-free fast path sound: a reader seeing a `last` sees the `cached`
 ///   written before it, and can never pair one entry's name with another's value.
-/// - [#overflow] is volatile and replaced, never mutated, so a reader holding the old map stays
-///   consistent.
+/// - [#overflow] is a [ConcurrentHashMap], created once and published through a volatile field;
+///   readers look it up without a lock while the resolver inserts into it.
 /// - Resolution is serialised on this pool's monitor and re-checks after acquiring it, so the
 ///   function runs **at most once per name** however many callers race — which is what §10.1's
 ///   exactly-once rests on.
@@ -73,7 +75,7 @@ final class FsDerivedPool < T, S > implements Pool < T > {
   private volatile Name last;
 
   /// Resolved outcomes by name — a value, [#NULL_RESULT], or a [CachedFailure]. Allocated on the
-  /// second distinct name and replaced on every insert.
+  /// second distinct name, then inserted into in place. Names are interned, so equality is identity.
   private volatile Map < Name, Object > overflow;
 
   FsDerivedPool ( Pool < S > source, Function < ? super S, ? extends T > fn ) {
@@ -121,11 +123,15 @@ final class FsDerivedPool < T, S > implements Pool < T > {
       return remember ( name, outcome );
     }
 
-    final Map < Name, Object > next =
-      current == null ? new IdentityHashMap <> ( 4 ) : new IdentityHashMap <> ( current );
-    if ( current == null ) next.put ( last, cached );
-    next.put ( name, outcome );
-    overflow = next;
+    if ( current == null ) {
+      // SINGLE → MULTI: the map is filled before it is published, so a reader never sees it partial.
+      final Map < Name, Object > map = new ConcurrentHashMap <> ();
+      map.put ( last, cached );
+      map.put ( name, outcome );
+      overflow = map;
+    } else {
+      current.put ( name, outcome );
+    }
 
     return remember ( name, outcome );
   }

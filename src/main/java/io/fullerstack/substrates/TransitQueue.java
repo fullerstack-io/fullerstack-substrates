@@ -76,7 +76,7 @@ final class TransitQueue {
       values[i] = null;
       head++;
       // §15.4 isolation: cascade hot path also reaches user code via fiber/flow
-      // operator functions. Same guard as ingress drainBatchLoop.
+      // operator functions. Same guard as the ingress drain (`IngressQueue.drainBatch`).
       try {
         r.accept ( v );
       } catch ( Throwable ignored ) {

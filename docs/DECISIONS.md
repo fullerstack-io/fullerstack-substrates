@@ -80,7 +80,7 @@ value. A volatile *read* costs nothing on x86 beyond forbidding a reordering.
 A sink channel is the one pipe this provider mints that is not an `FsPipe`: it stamps its `Capture`
 before the queue hop, which is what gives §11.1 the caller's context for an external emission.
 TCK-enforced — `SinkContractTest.current_externalEmission_identifiesCallerContext` fails the moment
-the channel queues first. That single difference leaked four ways; see `CAPABILITIES.md` §4.
+the channel queues first. That single difference leaked four ways; see *Capabilities over factories* above.
 
 The TCK passes unchanged before and after all four, so `src/test/java` now carries regression tests
 for them, each verified by reintroducing the defect it guards.

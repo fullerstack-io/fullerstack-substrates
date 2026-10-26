@@ -13,14 +13,16 @@ env:
   # repository is cloned at THIS tag — never at HEAD, which moves ahead of the version
   # in pom.xml and has broken this workflow before. Bump it with the two
   # *-api.version properties in pom.xml; the guard step below fails if they diverge.
-  HUMAINARY_TAG: '3.7.0'
+  HUMAINARY_TAG: '3.12.0'
   # Upstream publishes each release as a squashed commit on main and does not tag it.
   # Each repository is fetched at the commit the family was upgraded against on
-  # 2026-10-09 (the 3.7.0 release commits), so a later upstream commit cannot change
+  # 2026-10-22 (the 3.12.0 release commits), so a later upstream commit cannot change
   # what this provider is built and measured against. Bump these with HUMAINARY_TAG.
-  HUMAINARY_SPECS_SHA: 'fd30f57071a2c2ea62f03b0f9f873788f3e7581c'
-  HUMAINARY_SUBSTRATES_SHA: '4fb616464b90c1e40de473a479627c11e3b290fd'
-  HUMAINARY_SERVENTIS_SHA: 'd5affbaf6ace5b08e3ffe3aea172753d8796bb99'
+  # 3.12.0 declares Java 27 (early access); its source compiles unchanged for Java 26,
+  # and the family stays on a GA JDK, so the APIs are built with release 26 below.
+  HUMAINARY_SPECS_SHA: 'a878345b3b56b9a4e97d6bffeac100d638376c1e'
+  HUMAINARY_SUBSTRATES_SHA: '6071357934301c39838a88636e0f6fa20c73f75c'
+  HUMAINARY_SERVENTIS_SHA: 'b63902b592a5a8cbd49952218b8704d9fa973c32'
 
 jobs:
   publish:
@@ -36,7 +38,7 @@ jobs:
       - name: Set up Java 26
         uses: actions/setup-java@v4
         with:
-          java-version: '26-ea'
+          java-version: '26'
           distribution: 'temurin'
           cache: maven
 
@@ -79,7 +81,7 @@ jobs:
               echo "::error::$repo at $sha declares revision '$v', not $HUMAINARY_TAG"
               exit 1
             fi
-            mvn -B -f "$dir/pom.xml" clean install -DskipTests
+            mvn -B -f "$dir/pom.xml" clean install -DskipTests -Djava.version=26 -Dmaven.compiler.release=26
           done
 
       - name: Build and publish to GitHub Packages

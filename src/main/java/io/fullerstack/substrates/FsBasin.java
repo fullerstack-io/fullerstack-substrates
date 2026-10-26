@@ -33,7 +33,7 @@ public final class FsBasin < E > implements Basin < E > {
 
   /// The drain capability, issued by the owning circuit through `Circuit.pipe(Receptor)`. A
   /// drain is an emission whose value is the target — the receptor is fixed and built once, so
-  /// no carrier is allocated per drain. See `docs/CAPABILITIES.md`.
+  /// no carrier is allocated per drain. See `docs/DECISIONS.md`, *Capabilities over factories*.
   private final Pipe < Pipe < ? super E > > drains;
 
   /// Retained values — worker-confined: appended by the feed pipe's receptor

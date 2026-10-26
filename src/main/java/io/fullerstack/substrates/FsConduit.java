@@ -45,7 +45,7 @@ public final class FsConduit < E > implements Conduit < E > {
   /// The three lifecycle capabilities, issued by the owning circuit through
   /// `Circuit.pipe(Receptor)` and built once. Each operation is an emission whose value is the
   /// part that varies — the subscription joining, the subscription leaving, the hub being
-  /// cleared — so none of them allocates a carrier per call. See `docs/CAPABILITIES.md`.
+  /// cleared — so none of them allocates a carrier per call. See `docs/DECISIONS.md`, *Capabilities over factories*.
   ///
   /// The unit carried is the **subscription**, not the subscriber: §7.5 makes each subscribe
   /// "an independent subscription instance" and §7.3 keys the callback on the
@@ -61,7 +61,7 @@ public final class FsConduit < E > implements Conduit < E > {
   ///
   /// Obtained from `Cortex.pool(Function)`, the API's prescribed factory for a name-keyed pool,
   /// rather than written here. This type had its own copy-on-write map plus one-entry cache, and
-  /// so did [FsSink]; both were the storage `Pool` already provides. See `docs/CAPABILITIES.md`.
+  /// so did [FsSink]; both were the storage `Pool` already provides. See `docs/DECISIONS.md`, *Capabilities over factories*.
   private final Pool < FsChannel < E > > channels = cortex ().pool ( this::materialize );
 
   /// Closed flag — set by `close()`. Subscribe jobs check this on the

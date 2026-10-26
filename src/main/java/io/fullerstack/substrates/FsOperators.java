@@ -64,7 +64,7 @@ final class FsOperators {
   /// processing-time reading. Time advances on each ingress item … but does **not** advance
   /// across the internal transit hops of one cascade."
   ///
-  /// Plain fields, not volatile: the holder is written by `IngressQueue.drainBatchLoop` and
+  /// Plain fields, not volatile: the holder is written by `IngressQueue.drainBatch` and
   /// read by operators, both of which run only on the owning circuit's worker thread.
   static final class Stimulus {
     long    value;
@@ -100,8 +100,8 @@ final class FsOperators {
   }
 
   /// Operator factory: takes the downstream consumer and returns a wrapping
-  /// consumer. Single shared shape lets FsFiber and FsFlow store operators
-  /// in a uniform `Wrap[]` and materialise via a single loop with no
+  /// consumer. Single shared shape lets FsFiber and FsFlow hold operators
+  /// as nodes of one {@link Recipe} and materialise them with no
   /// `instanceof` checks.
   @FunctionalInterface
   interface Wrap < E > {
@@ -153,9 +153,11 @@ final class FsOperators {
     @Override
     @SuppressWarnings ( "unchecked" )
     public void accept ( E v ) {
-      final boolean fire = p.test ( (E) prev, v );
-      prev = v;                       // advance on every input, not only on pass
-      if ( fire ) d.accept ( v );
+      // §6.2.3: `prev` advances to every input — on pass, on drop, and when the predicate throws —
+      // so it is written before the predicate runs.
+      final Object p0 = prev;
+      prev = v;
+      if ( p.test ( (E) p0, v ) ) d.accept ( v );
     }
   }
 
@@ -306,10 +308,12 @@ final class FsOperators {
     @Override
     @SuppressWarnings ( "unchecked" )
     public void accept ( E v ) {
+      // §6.2.3 *State across a failing function*: the accumulator and the fire predicate both run
+      // before any state changes, so a throw from either leaves the state as it was.
       E r = op.apply ( (E) acc, v );
-      acc = r;
-      if ( fire.test ( r ) ) {
-        acc = initial;
+      final boolean fired = fire.test ( r );
+      acc = fired ? initial : r;
+      if ( fired ) {
         // Spec §6.2.3 (Integrate): "If the fire predicate returns true for an
         // absent state, the stage resets to the initial value but the absent
         // output still drops the current emission."
@@ -330,7 +334,11 @@ final class FsOperators {
     @Override
     @SuppressWarnings ( "unchecked" )
     public void accept ( E v ) {
-      E r = op.apply ( (E) prev, v ); prev = v;
+      // §6.2.3 *State across a failing function*: `prev` advances to the incoming value before
+      // `op` runs, so an `op` that throws drops the emission and the next pairs with this input.
+      final E p = (E) prev;
+      prev = v;
+      E r = op.apply ( p, v );
       if ( r != null ) d.accept ( r );
     }
   }
@@ -743,12 +751,14 @@ final class FsOperators {
     }
   }
 
-  /// Steady run length: emit when the (prev, curr) bi-predicate has held `count` times in a row.
+  /// Steady run length: emit when `count` successive values each satisfy the bi-predicate against the
+  /// run's candidate — the value that started the run — not against the value before it (§6.2.3), so
+  /// a gradual drift that stays close step by step still resets once it leaves the candidate.
   static final class SteadyPredicate < E > implements Consumer < E > {
     final int                                  count;
     final BiPredicate < ? super E, ? super E > p;
     final Consumer < E >                       d;
-    Object  prev;
+    Object  candidate;
     boolean has;
     int     run;
 
@@ -759,10 +769,13 @@ final class FsOperators {
     @Override
     @SuppressWarnings ( "unchecked" )
     public void accept ( E v ) {
-      if ( has && p.test ( (E) prev, v ) ) run++;
-      else run = 1;
-      prev = v;
-      has  = true;
+      if ( has && p.test ( (E) candidate, v ) ) {
+        run++;
+      } else {
+        candidate = v;
+        run = 1;
+      }
+      has = true;
       if ( run == count ) d.accept ( v );
     }
   }
@@ -786,21 +799,17 @@ final class FsOperators {
 
     @Override
     public void accept ( E v ) {
-      // §6.2.3: "Tumble fires after a fixed number of inputs regardless of
-      // content", so the count advances and the batch boundary is taken before
-      // the combiner runs — a raising combiner drops its batch without shifting
-      // the batch grid for the life of the materialization.
+      // §6.2.3 (3.12.0): Tumble "fires after a fixed number of successfully combined inputs …
+      // since an input whose combiner fails is not counted". The combiner runs first; only a normal
+      // return advances the count or touches the accumulator, so a throw leaves the batch as it was.
+      final E r = combiner.apply ( acc, v );
       if ( ++filled == size ) {
         filled = 0;
-        final E carried = acc;
-        // "if the batch fires with an absent accumulator the current emission
-        // is dropped **before the state resets** to `identity`" — so the reset
-        // is completed before user code is entered.
         acc = identity;
-        final E r = combiner.apply ( carried, v );
+        // an absent accumulator at the boundary drops the emission; the state still resets
         if ( r != null ) d.accept ( r );
       } else {
-        acc = combiner.apply ( acc, v );
+        acc = r;
       }
     }
   }

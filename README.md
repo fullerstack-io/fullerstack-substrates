@@ -5,10 +5,10 @@ SPI provider implementation of the [Humainary Substrates API](https://github.com
 | | |
 |---|---|
 | **Version** | 3.0.0-SNAPSHOT |
-| **API** | Substrates 3.3.0 + Serventis 3.3.0 |
-| **Java** | 26 (Virtual Threads + Preview) |
-| **Conformance** | Substrates TCK **1067/1067** · Serventis TCK **1227/1227** |
-| **Benchmarks** | [perfkit-java](https://github.com/humainary-io/perfkit-java) — 246 `@Benchmark` methods, 33 classes |
+| **API** | Substrates 3.12.0 + Serventis 3.12.0 |
+| **Java** | 26 (Virtual Threads + Preview) — see [Java version](#java-version) |
+| **Conformance** | Substrates TCK **1086/1086** · Serventis TCK **1302/1302** (3.12.0) |
+| **Benchmarks** | [perfkit-java](https://github.com/humainary-io/perfkit-java) — 246 `@Benchmark` methods, 39 classes |
 
 ## Conformance is external
 
@@ -21,7 +21,7 @@ contradiction, but the mechanism: tests written by the same process, from the sa
 at the same time as the code measure self-consistency rather than conformance. Several
 asserted the bugs outright.
 
-`src/test/java` holds 33 tests that claim nothing about conformance. Each exists because a
+`src/test/java` holds 44 tests that claim nothing about conformance. Each exists because a
 defect was found **that the TCK passes straight through**, and each is kept only because
 reintroducing that defect makes it fail. Benchmarks remain entirely Humainary's.
 
@@ -46,17 +46,26 @@ reintroducing that defect makes it fail. Benchmarks remain entirely Humainary's.
      git clone https://github.com/humainary-io/$r.git
    done
    for r in specs-api-java substrates-api-java serventis-api-java; do
-     ( cd $r && mvn clean install -DskipTests )
+     ( cd $r && mvn clean install -DskipTests -Djava.version=26 -Dmaven.compiler.release=26 )
    done
    ```
    Upstream publishes each release as a squashed commit on `main` and does **not** tag it.
-   Check out the commit matching `substrates-api.version` in `pom.xml` (3.3.0) — the three
+   Check out the commit matching `substrates-api.version` in `pom.xml` (3.12.0) — the three
    API commits are pinned by SHA in `.github/workflows/publish-package.yml` — not whatever
    `HEAD` has since become: `main` moves ahead of the version this provider is built and
    measured against.
    `specs-api-java` installs first: as of 3.0.2 the APIs depend on it for the
    `@SpecDoc` / `@SpecRef` traceability annotations, and a build that skips it fails with
    `Could not find artifact io.humainary.specs:humainary-specs-api`.
+
+### Java version
+
+Humainary 3.12.0 declares Java 27, which is early access until March 2027. Its source compiles
+unchanged for Java 26, and this provider stays on a GA JDK, so the APIs, the TCKs and perfkit are
+built with `-Djava.version=26 -Dmaven.compiler.release=26`. `scripts/tck.sh` and
+`scripts/benchmark.sh` pass this through `MAVEN_ARGS`, and the publish workflow passes it to each
+API build. Nothing in Humainary's sources or poms is changed. Revisit this when Java 27 ships, or
+when upstream first uses a Java 27 feature.
 
 ## Build
 
@@ -67,7 +76,7 @@ mvn clean install        # builds and runs the local regression tests
 
 ## Usage
 
-The artifact is published to [GitHub Packages](https://github.com/fullerstack-io/fullerstack-humainary/packages), which requires authentication even for public packages — so consumers need a repository declaration **and** credentials.
+The artifact is published to [GitHub Packages](https://github.com/fullerstack-io/fullerstack-substrates/packages), which requires authentication even for public packages — so consumers need a repository declaration **and** credentials.
 
 **1. Repository and dependency:**
 
@@ -75,7 +84,7 @@ The artifact is published to [GitHub Packages](https://github.com/fullerstack-io
 <repositories>
   <repository>
     <id>github-fullerstack</id>
-    <url>https://maven.pkg.github.com/fullerstack-io/fullerstack-humainary</url>
+    <url>https://maven.pkg.github.com/fullerstack-io/fullerstack-substrates</url>
     <releases><enabled>true</enabled></releases>
     <snapshots><enabled>true</enabled></snapshots>
   </repository>
@@ -140,7 +149,7 @@ emission resolves before the next external emission is admitted, without locks.
 
 Components hold the capability the circuit issued them rather than the circuit itself — a
 `Pipe` to emit, a `Pool` to resolve channels by name — which is what keeps the routing rule
-in one place. See [Capabilities](docs/CAPABILITIES.md).
+in one place. See [Decisions — Capabilities over factories](docs/DECISIONS.md#capabilities-over-factories--2026-08-30).
 
 See [Architecture](docs/ARCHITECTURE.md) for VarHandle memory ordering, false-sharing
 prevention, the ingress carrier layout, and the §5.8 stimulus-time and §6.4.1 Window-lease
@@ -164,10 +173,8 @@ and paired `_control_` rows are diagnostic — never subtracted from a target.
 
 | Document | What it covers |
 |----------|---------------|
-| [Developer Guide](docs/DEVELOPER-GUIDE.md) | Usage patterns, best practices, Serventis integration |
 | [Architecture](docs/ARCHITECTURE.md) | Implementation decisions, queue internals, async model, thread safety |
 | [Conformance](docs/CONFORMANCE.md) | How the TCKs are run, what is measured, and open questions against the spec |
-| [2.9 Migration](docs/2.9-MIGRATION.md) | Historical — upgrade notes from 2.8 to 2.9 |
 
 ### External References
 

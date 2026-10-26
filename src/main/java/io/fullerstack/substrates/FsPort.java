@@ -42,7 +42,7 @@ public final class FsPort < E > implements Port < E > {
   /// The three capabilities a Port needs, each issued by the owning circuit through
   /// `Circuit.pipe(Receptor)` — the API's own way to obtain one. A Port holds these and not the
   /// circuit that issued them: a `Pipe` can do exactly one thing, where a circuit reference also
-  /// carries `await`, `close`, `isClosed` and `pulse`. See `docs/CAPABILITIES.md`.
+  /// carries `await`, `close`, `isClosed` and `pulse`. See `docs/DECISIONS.md`, *Capabilities over factories*.
   ///
   /// Each operation is an **emission** whose value is the only part that varies between calls —
   /// the new value for `replace`, the caller's own function for `update`, the target for `emit`.

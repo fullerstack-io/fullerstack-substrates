@@ -85,12 +85,11 @@ final class FsState implements State {
 
   /// The §8.1 / §16.3 upsert.
   ///
-  /// 1. §16.3: "Writing a slot whose (name, type, value) already matches the existing entry MUST
-  ///    return the same state instance." The rule is applied only when the matching entry is
-  ///    already the most recently written one — rewriting an *older* entry has to move it to the
-  ///    head (§8.1), and iteration order is observable, so that is a genuine change and MUST
-  ///    produce a new state. Value equality is the boxed `equals`, which for `Float`/`Double` is
-  ///    bitwise; without that a `NaN` slot could never satisfy the same-instance MUST.
+  /// 1. §8.1 / §16.3 (3.12.0): "A write whose (name, type, value) already matches the existing
+  ///    entry is the exception: it MUST return the same state instance, so the existing slot keeps
+  ///    its position and nothing — iteration order included — changes." That holds wherever the
+  ///    matching slot sits, not only at the head. Value equality is the boxed `equals`, which for
+  ///    `Float`/`Double` is bitwise; without that a `NaN` slot could never satisfy this MUST.
   /// 2. Otherwise the new slot becomes the head and any prior slot with the same (name, type) is
   ///    *removed*, not shadowed. At most one such slot can exist, because every write maintains
   ///    that invariant.
@@ -100,13 +99,6 @@ final class FsState implements State {
     final Slot < ? >[] src = slots;
     final int         len  = src.length;
 
-    // (1) semantically equivalent write of the most recent entry (§16.3, §16.1#11)
-    if ( len > 0
-      && matches ( src[0], name, type )
-      && Objects.equals ( src[0].value (), slot.value () ) ) {
-      return this;
-    }
-
     // (2) locate the prior entry for this (name, type) pair, if any
     int prior = -1;
     for ( int i = 0; i < len; i++ ) {
@@ -114,6 +106,11 @@ final class FsState implements State {
         prior = i;
         break;
       }
+    }
+
+    // (1) an equal write, wherever the matching slot sits, changes nothing (§8.1, §16.3)
+    if ( prior >= 0 && Objects.equals ( src[prior].value (), slot.value () ) ) {
+      return this;
     }
 
     if ( prior < 0 ) {

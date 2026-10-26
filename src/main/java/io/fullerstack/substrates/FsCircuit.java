@@ -186,16 +186,15 @@ public final class FsCircuit implements Circuit {
   /// long as the circuit has work.
   private volatile boolean parked;
 
-  // Pre-allocated marker receivers — ReceptorAdapter wrapping marker lambdas.
-  // Drain loop splits the call site: isMarker() identity check routes markers
-  // to fireMarker() (cold, separate type profile), keeping the hot-path
-  // r.accept(v) and receptor.receive() fully monomorphic — zero class_check traps.
+  // Pre-allocated marker receivers. A marker is admitted with its `marker` flag set, and the
+  // drain (IngressQueue.run) branches on that flag, so markers never reach the hot-path
+  // r.accept(v) call site and it stays monomorphic — no class_check traps.
   private final Consumer < Object > awaitMarkerReceiver;
   private final Consumer < Object > closeMarkerReceiver;
 
   /// §5.8's processing-time reading for the ingress chain in progress.
   ///
-  /// Invalidated once per ingress item by `IngressQueue.drainBatchLoop` and established lazily
+  /// Invalidated once per ingress item by `IngressQueue.drainBatch` and established lazily
   /// by the first time-aware operator that observes it, so a whole transit cascade — however
   /// long it takes in wall time — is one causal moment. Package-private: the ingress drain and
   /// the worker bind are the only writers, and both run on this circuit's worker.
@@ -244,10 +243,8 @@ public final class FsCircuit implements Circuit {
   // Collapsing any of these into a shared base reintroduces a bimorphic (or
   // worse) call-site profile on r.accept(v) in the drain loop. HotSpot then
   // emits a class_check trap that deoptimizes the inlined receptor chain,
-  // regressing PipeOps.async_emit_batch_await from ~22 ns to ~30+ ns.
-  //
-  // Canary benchmark: io.humainary.substrates.jmh.PipeOps.async_emit_batch_await
-  // Structural test:  FsCircuitMarkerInvariantTest
+  // regressing the batch-await path from ~22 ns to ~30+ ns (measured when it was introduced;
+  // the perfkit row that showed it has since been retired).
   // ─────────────────────────────────────────────────────────────────────────────
 
   /// One awaiter's barrier: a released flag and the thread to wake if it parked.
@@ -269,7 +266,7 @@ public final class FsCircuit implements Circuit {
     ThreadLocal.withInitial ( () -> new AwaitBarrier ( Thread.currentThread () ) );
 
   /// Await marker — delivered through the ingress queue and routed to
-  /// {@link FsCircuit#onAwaitMarker(Object)} via isMarker() identity check.
+  /// {@link FsCircuit#onAwaitMarker(Object)}; the drain recognises it by the admission's marker flag.
   static final class AwaitMarker implements Consumer < Object > {
     final FsCircuit circuit;
     AwaitMarker ( FsCircuit circuit ) { this.circuit = circuit; }
@@ -277,7 +274,7 @@ public final class FsCircuit implements Circuit {
   }
 
   /// Close marker — delivered through the ingress queue and routed to
-  /// {@link FsCircuit#onCloseMarker(Object)} via isMarker() identity check.
+  /// {@link FsCircuit#onCloseMarker(Object)}; the drain recognises it by the admission's marker flag.
   static final class CloseMarker implements Consumer < Object > {
     final FsCircuit circuit;
     CloseMarker ( FsCircuit circuit ) { this.circuit = circuit; }
@@ -400,23 +397,6 @@ public final class FsCircuit implements Circuit {
    */
   boolean drainTransit () {
     return transit.drain ();
-  }
-
-  /**
-   * Identity check: is this receiver a marker (await/close)?
-   * Splits the call site so the hot path {@code r.accept(v)} only
-   * ever sees regular ReceptorAdapters — monomorphic, no class_check traps.
-   */
-  boolean isMarker ( Consumer < Object > r ) {
-    return r == awaitMarkerReceiver || r == closeMarkerReceiver;
-  }
-
-  /**
-   * Fire a marker receiver. NOT inlined — cold path with its own
-   * type profile so marker receptor types don't pollute the hot path.
-   */
-  void fireMarker ( Consumer < Object > marker, Object value ) {
-    marker.accept ( value );
   }
 
 
@@ -717,14 +697,6 @@ public final class FsCircuit implements Circuit {
   }
 
   /**
-   * Inject a marker admission into the ingress queue.
-   */
-  private void marker ( Consumer < Object > callback ) {
-    if ( closed ) return;
-    submitIngress ( callback, null );
-  }
-
-  /**
    * Close marker callback - signals worker to exit.
    */
   private void onCloseMarker ( Object ignored ) {
@@ -876,10 +848,8 @@ public final class FsCircuit implements Circuit {
   public Ticker ticker ( @NotNull Duration interval, @NotNull Pipe < ? super Long > target ) {
     requireNonNull ( interval );
     requireNonNull ( target );
-    // §11.4 / §16.3: the two-argument form "uses a default name". Aligned with
-    // the owning circuit's name, as `cell` / `port` / `pin` are required to be —
-    // §16.3 leaves the ticker's default implementation-defined, so this is an
-    // alignment choice, not a correction (see TCK-GAPS §D2).
+    // §11.4 / §16.3 (3.12.0): with no name supplied, the ticker "uses the owning
+    // circuit's name, as the circuit's other unnamed factories do".
     return ticker ( subject.name (), interval, target );
   }
 
@@ -978,7 +948,7 @@ public final class FsCircuit implements Circuit {
   /// 3.0: list fan-out. Targets are snapshotted at creation and dispatched in
   /// list order; duplicates receive the emission once per occurrence. Empty
   /// collapses to [#pipe()], single-element to [#pipe(Pipe)].
-  @New
+  @New ( conditional = true )
   @NotNull
   @Override
   public < E > Pipe < E > pipe ( @NotNull List < ? extends Pipe < ? super E > > targets ) {

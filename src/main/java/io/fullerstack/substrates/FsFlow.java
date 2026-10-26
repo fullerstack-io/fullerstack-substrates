@@ -26,10 +26,9 @@ import java.util.function.Supplier;
 /// Per-emission operators (diff, guard, limit, peek, etc.) live on Fiber<E>;
 /// their implementations are in {@link FsOperators}.
 ///
-/// Operators are stored as a uniform {@code Wrap[]} array — `map` becomes
-/// a {@link MapWrap}, `fiber(...)` and `flow(...)` inline the source's Wraps
-/// directly into the destination's array. Materialise walks the array with
-/// no `instanceof` dispatch.
+/// Operators are held in a {@link Recipe} — an immutable plan that each composition step extends
+/// by one node, sharing everything before it — and materialised afresh against every target the
+/// flow is attached to.
 ///
 /// @param <I> input type (what {@code Pipe.pipe(Flow)} receives)
 /// @param <O> output type (what the target pipe emits)
@@ -42,7 +41,7 @@ public final class FsFlow < I, O > implements Flow < I, O > {
 
   /// Map operator — the only Flow-specific operator. Drops null results so
   /// `map` can act as a filter when the function returns null. Type-erased
-  /// because operators travel through the {@code Wrap[]} alongside
+  /// because operators travel through the same {@link Recipe} as the
   /// type-preserving ones.
   @SuppressWarnings ( { "unchecked", "rawtypes" } )
   static final class MapWrap implements Wrap < Object > {

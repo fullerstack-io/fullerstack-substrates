@@ -57,7 +57,7 @@ public final class FsSubscription implements Subscription {
   /// The capability that carries [#terminate]'s callback into the circuit context, issued
   /// through `Circuit.pipe(Receptor)`. Null when no callback was supplied, which is the common
   /// case — a subscription that will never fire one builds nothing. The subscription itself is
-  /// the emission, so closing allocates no carrier. See `docs/CAPABILITIES.md`.
+  /// the emission, so closing allocates no carrier. See `docs/DECISIONS.md`, *Capabilities over factories*.
   private final Pipe < Subscription > closures;
 
   /// Circuit reference — needed by closeAwait() to block until the

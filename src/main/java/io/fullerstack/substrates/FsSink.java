@@ -36,7 +36,7 @@ public final class FsSink < E > implements Sink < E > {
   /// Channels by name — the `Pool<Pipe<E>>` half of this type.
   ///
   /// Obtained from `Cortex.pool(Function)`, the API's prescribed factory, rather than written
-  /// here. See [FsConduit] and `docs/CAPABILITIES.md`.
+  /// here. See [FsConduit] and `docs/DECISIONS.md`, *Capabilities over factories*.
   private final Pool < Pipe < E > > channels = cortex ().pool ( this::materialize );
 
   @SuppressWarnings ( "unchecked" )

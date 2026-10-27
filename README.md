@@ -21,9 +21,10 @@ contradiction, but the mechanism: tests written by the same process, from the sa
 at the same time as the code measure self-consistency rather than conformance. Several
 asserted the bugs outright.
 
-`src/test/java` holds 44 tests that claim nothing about conformance. Each exists because a
-defect was found **that the TCK passes straight through**, and each is kept only because
-reintroducing that defect makes it fail. Benchmarks remain entirely Humainary's.
+`src/test/java` holds 47 tests that claim nothing about conformance. Each class exists because a
+defect was found **that the TCK passes straight through**; each defect test is kept only because
+reintroducing that defect makes it fail, and the few guards beside them keep a fix from going too
+far. Benchmarks remain entirely Humainary's.
 
 ```bash
 ./scripts/tck.sh                 # both TCKs against this provider

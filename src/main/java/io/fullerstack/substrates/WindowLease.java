@@ -1,5 +1,7 @@
 package io.fullerstack.substrates;
 
+import io.fullerstack.substrates.FsOperators.Stimulus;
+
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 
@@ -13,12 +15,12 @@ import java.lang.invoke.VarHandle;
 /// argument is the design here — "one branch per operator entry … entirely
 /// off the framework emission hot path".
 ///
-/// The lease is a **(context, generation)** pair, opened afresh on every emission rather
+/// The lease is a **(context, generation, cascade)** triple, opened afresh on every emission rather
 /// than captured once, because the operator array reaches `wrap` without a circuit
 /// reference and the stage always runs on the context that will deliver the window;
 /// latching there gets the owner without threading a circuit through materialisation.
 ///
-/// **Both halves are load-bearing, and the second one was missing.**
+/// **Every part is load-bearing; the second and third were each missing in turn.**
 ///
 /// The *context* catches a window that has left the worker — another thread, another
 /// circuit, a caller that came back for it after the circuit moved on. That is the escape
@@ -36,6 +38,19 @@ import java.lang.invoke.VarHandle;
 /// Closing the lease around the operator call instead — latch, `accept`, release — does not
 /// work: a transit hop queues the window and the receptor runs after `accept` has returned,
 /// so release would fault every delivery the hop legitimately makes.
+///
+/// **The third half is the cascade.** The generation moves only when the same stage emits again,
+/// so a window kept in a field and read from an unrelated later callback on the same worker still
+/// validated until then. Everything a window may legitimately reach — inline operators, a
+/// same-circuit pipe hop to its receiving callback — runs inside the cascade of the ingress item
+/// that minted it, because transit is drained fully before the next ingress item (§5.3). A later
+/// ingress item is therefore a later callback, and the lease records the worker's cascade epoch
+/// ([FsOperators.Stimulus#epoch]) at mint and fails once it has moved. The epoch is advanced where
+/// the §5.8 stimulus reading was already reset, so it costs the emission path nothing new.
+///
+/// What it does not see: inside one cascade, a window stashed by one callback and read by a
+/// *different* callback of the same cascade. Telling those apart needs a token per dispatch — the
+/// framework hot path §6.4.1 keeps this check off — and would fault the legitimate hop above.
 final class WindowLease {
 
   private static final VarHandle GENERATION;
@@ -69,6 +84,13 @@ final class WindowLease {
   /// thread check cannot see, because the worker is still the worker.
   private long generation;
 
+  /// The minting worker's stimulus holder, bound at the first latch on a worker; `null` off a
+  /// worker, where there is no cascade to bound and the check is skipped.
+  private Stimulus cascade;
+
+  /// The cascade epoch the current window was minted in.
+  private long epoch;
+
   /// Opens a new generation and binds it to the minting context.
   ///
   /// Returns the generation the caller must stamp on the window it is about to emit.
@@ -78,6 +100,8 @@ final class WindowLease {
   /// store while a volatile store is a locked instruction.
   long latch () {
     final long next = generation + 1;
+    if ( cascade == null ) cascade = FsOperators.STIMULUS.get ();
+    if ( cascade != null ) epoch = cascade.epoch;
     owner = Thread.currentThread ();
     GENERATION.setRelease ( this, next );
     return next;
@@ -85,17 +109,19 @@ final class WindowLease {
 
   /// §6.4.1: is `stamp`'s window still the one this lease describes?
   ///
-  /// Two questions, and both are needed. The generation catches a window retained into a
-  /// LATER callback — the buffer has been rewritten under it, so the values it would return
-  /// are not the ones it was handed. The owner catches a window that has left the context
-  /// entirely, which the generation alone cannot see while the circuit is idle and the
-  /// generation has not moved.
+  /// Three questions, and all are needed. The generation catches a window retained into a
+  /// later callback once the stage has emitted again — the buffer has been rewritten under it.
+  /// The owner catches a window that has left the context entirely, which the generation alone
+  /// cannot see while the circuit is idle. The cascade catches a window kept into a later
+  /// ingress item before the stage emits again, which neither of the others can see.
   ///
-  /// The acquire load orders the `owner` read after it, which is what makes the pair sound
-  /// from a thread that never latched.
+  /// The acquire load orders the `owner` read after it, which is what makes the check sound
+  /// from a thread that never latched. The cascade check runs only once the owner check has
+  /// passed, so it reads the worker's own plain field from the worker.
   boolean valid ( long stamp ) {
     return (long) GENERATION.getAcquire ( this ) == stamp
-           && owner == Thread.currentThread ();
+           && owner == Thread.currentThread ()
+           && ( cascade == null || cascade.epoch == epoch );
   }
 
 }

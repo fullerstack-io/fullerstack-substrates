@@ -149,9 +149,9 @@ final class IngressQueue extends IngressQueuePad2 {
       t.next = null;                       // unlink the consumed node for GC
       t = j;
 
-      // §5.8: one clock reading per ingress chain — invalidated before dispatch
-      // and deliberately not inside the transit drain.
-      circuit.stimulus.valid = false;
+      // §5.8: one clock reading per ingress chain — and §6.4.1: one Window lease per
+      // cascade. Advanced before dispatch and deliberately not inside the transit drain.
+      circuit.stimulus.epoch++;
 
       run ( j, circuit );
 

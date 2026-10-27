@@ -192,7 +192,9 @@ public final class FsCircuit implements Circuit {
   private final Consumer < Object > awaitMarkerReceiver;
   private final Consumer < Object > closeMarkerReceiver;
 
-  /// §5.8's processing-time reading for the ingress chain in progress.
+  /// §5.8's processing-time reading for the ingress chain in progress, and the §6.4.1 cascade
+  /// boundary: its `epoch` advances once per ingress item, which ends the lease of every `Window`
+  /// minted in the cascade before ([WindowLease]).
   ///
   /// Invalidated once per ingress item by `IngressQueue.drainBatch` and established lazily
   /// by the first time-aware operator that observes it, so a whole transit cascade — however

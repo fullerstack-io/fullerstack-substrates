@@ -70,7 +70,7 @@ FsCortexProvider (SPI entry point)
               │             shut down on circuit close; each tick reaches the target through a
               │             circuit-owned pipe, so from the worker)
               ├── FsWindow (strided view over a DelayLine ring; restriction ops share buffer)
-              │     └── WindowLease (§6.4.1 (context, generation) lease; owns the ring reference)
+              │     └── WindowLease (§6.4.1 (context, generation, cascade) lease; owns the ring reference)
               ├── FsSink (capture-producing pool of channels; endpoint normalised through
               │           circuit.pipe(...) so a capture lands on this circuit before crossing)
               └── FsBasin (bounded buffered emission capture, DelayLine-backed)
@@ -584,16 +584,22 @@ That is what the spec sanctions — §6.2.3 puts the obligation on the caller (*
 implementation to **detect** violations: *"undefined behavior is not an acceptable choice for this
 type."*
 
-`WindowLease` is that detector, and it is a **(context, generation)** pair, shared by a root
-window and every view derived from it. Both halves are load-bearing:
+`WindowLease` is that detector, and it is a **(context, generation, cascade)** triple, shared by a
+root window and every view derived from it. All three are load-bearing:
 
 - the **context** (the minting `Thread`) catches a window that left the worker — removing it fails
   `window_afterCallbackReturn_throwsFault` and `window_allOperationsAfterCallbackReturn_throwFault`,
   measured;
 - the **generation** catches a window retained into a later callback **on the same worker**, which
-  a bare context check cannot see because the worker is still the worker.
+  a bare context check cannot see because the worker is still the worker — but only once the same
+  stage has emitted its next window;
+- the **cascade** closes that gap: the lease records the worker's cascade epoch at mint
+  (`FsOperators.Stimulus.epoch`, advanced once per ingress item in `IngressQueue.drainBatch`, where
+  the §5.8 stimulus reading was already reset) and fails once it has moved. A later ingress item is a
+  later callback (§5.3 drains transit fully first), so a window kept in a field faults in any later
+  cascade. Pinned by `WindowCascadeLeaseTest`.
 
-That second case is not a stale read. The buffer has been rewritten, so the retained view reports
+The retained-window case is not a stale read. The buffer has been rewritten, so the retained view reports
 whatever is in it *now* while presenting itself as the window from an earlier callback — a silent
 wrong answer, which is the worst reading of §6.4.1.
 
@@ -603,7 +609,9 @@ a volatile store is a locked instruction.
 
 Closing the lease around the operator call instead — latch, `accept`, release — does not work: a
 transit hop queues the window and the receptor runs after `accept` has returned, so release would
-fault every delivery the hop legitimately makes.
+fault every delivery the hop legitimately makes. The cascade is the finest boundary that keeps that
+hop valid without a token on every dispatch; inside one cascade, a window kept by one callback and
+read by a different one is still not detected (`docs/CONFORMANCE.md`, *Known gaps, added*).
 
 ## Name Interning
 

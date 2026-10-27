@@ -95,13 +95,16 @@ contract tests asserting that `@NotNull`, `@Idempotent`, `@Identity`, `@New`, `@
 
 ## What the local tests are, and are not
 
-`src/test/java` holds 44 tests across 11 classes. None asserts a spec requirement, and none is a
-substitute for the TCK. Every one exists because a **defect was found that the TCK passes straight
-through**, and each is held to a rule the deleted suite was not:
+`src/test/java` holds 47 tests across 12 classes. None asserts a spec requirement, and none is a
+substitute for the TCK. Every class exists because a **defect was found that the TCK passes straight
+through**, and each defect test is held to a rule the deleted suite was not:
 
 > A regression test is only kept if reintroducing the defect makes it fail.
 
-That was checked for each — the bug was put back, the test failed, the bug was removed again. A
+That was checked for each — the bug was put back, the test failed, the bug was removed again. A few
+tests beside them are **guards** instead: they pass on the old code and exist so that a fix cannot go
+too far (`WindowCascadeLeaseTest`'s pipe-hop and queued-emission cases keep the lease from faulting a
+window's legitimate receiving callback). The table names which is which. A
 test written from the implementation's behaviour can only confirm it; a test written from a
 demonstrated defect, and shown to fail without the fix, cannot.
 
@@ -116,6 +119,7 @@ demonstrated defect, and shown to fail without the fix, cannot.
 | `ChanceReplayTest` | 3 | §5.1: `chance` replays from its published seed in a fresh JVM |
 | `SubscriptionCloseBeforeAddTest` | 1 | §7.6.1: a subscription closed before its registration job runs is never selected |
 | `FailingFunctionStateTest` | 5 | 3.12.0 §6.2.3 / §8.1: `edge`, `tumble`, `integrate` across a failing function; an equal `State` write to an older slot returns the same instance |
+| `WindowCascadeLeaseTest` | 3 | §6.4.1: a window read from a later cascade faults (defect); one delivered a queued hop later, and one across its own queued emission, stays valid (2 guards) |
 | `TickerReanchorTest` | 1 | §11.4: a re-anchor after falling behind shifts the grid's phase rather than freezing for seq × interval |
 | `PoolGrowthTest` | 1 | a pool resolving many distinct names grows in place, not by copying its map per name |
 
@@ -207,14 +211,15 @@ Pinned by `ExtentDepthTest`. Portable code should still assume only the guarante
 
 ## Known gaps, added
 
-**§6.4.1 — a `Window` retained into a later callback on the same worker is not always detected**
-(MUST since 3.12.0's §16.1 table agrees with §6.4.1). The lease is `(context, generation)` and the
-generation moves when the stage emits its next window, so a window kept in a field and used from an
-unrelated later callback on the same worker, before that stage emits again, still validates. Ending
-the lease when the downstream call returns would close it, but it adds a store on the emission path
-(the performance rules require a profile and a prediction first) and would invalidate a window
-delivered one queued hop later through a registered pipe — whether that delivery counts as "the
-callback it was handed to" needs deciding first. Open; not fixed in the 3.12.0 pass.
+**§6.4.1 — inside one cascade, a `Window` stashed by one callback and read by another is not
+detected.** The lease is the owner thread, a generation, and the worker's **cascade epoch**: it ends
+when the ingress item that minted the window has finished its cascade (fixed after 3.12.0; pinned by
+`WindowCascadeLeaseTest`, which failed before the fix). Everything a window may legitimately reach — its
+receiving callback, including one queued hop downstream through a same-circuit pipe — runs inside that
+cascade, because transit drains fully before the next ingress item (§5.3); any later ingress item is a
+later callback and faults. What remains is a different callback *of the same cascade* reading a window
+another callback kept. Distinguishing the two needs a token per dispatch, which is the framework hot
+path §6.4.1 keeps this check off, and would fault the legitimate pipe-hop delivery.
 
 **The transit ring never shrinks.** `TransitQueue` doubles on demand and keeps its high-water mark
 for the life of the circuit: one 5 000-element fan-out leaves 8 192 slots across two arrays, about

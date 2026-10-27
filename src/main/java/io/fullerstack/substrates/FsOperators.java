@@ -66,9 +66,14 @@ final class FsOperators {
   ///
   /// Plain fields, not volatile: the holder is written by `IngressQueue.drainBatch` and
   /// read by operators, both of which run only on the owning circuit's worker thread.
+  ///
+  /// `epoch` advances once per ingress item — the cascade boundary (§5.3) — and `read` is the epoch at
+  /// which `value` was taken, so the reading is current while `read == epoch`. The epoch also ends the
+  /// §6.4.1 lease of every `Window` minted in the cascade it counts ([WindowLease]).
   static final class Stimulus {
-    long    value;
-    boolean valid;
+    long value;
+    long epoch;
+    long read = -1;
   }
 
   /// The worker thread's stimulus holder, bound **once** when the worker starts.
@@ -76,8 +81,9 @@ final class FsOperators {
   /// A circuit's worker is a single virtual thread that lives as long as the circuit
   /// (`FsCircuit`), so this is set once per circuit and never per emission. Reading it here
   /// rather than capturing the circuit at materialisation is also more correct: a chain
-  /// reports the stimulus of the circuit *currently running it*, which §16.1 #16 allows to
-  /// differ from the one it was materialised against.
+  /// reports the stimulus of the circuit *currently running it*, which §16.1 #17 allows to
+  /// differ from the one it was materialised against (each materialisation is its own stage, so in
+  /// this provider a chain always runs on its own target's circuit).
   static final ThreadLocal < Stimulus > STIMULUS = new ThreadLocal <> ();
 
   /// §5.8's processing time for the ingress chain in progress.
@@ -92,9 +98,9 @@ final class FsOperators {
   static long stimulus () {
     final Stimulus s = STIMULUS.get ();
     if ( s == null ) return System.nanoTime ();
-    if ( !s.valid ) {
+    if ( s.read != s.epoch ) {
       s.value = System.nanoTime ();
-      s.valid = true;
+      s.read  = s.epoch;
     }
     return s.value;
   }

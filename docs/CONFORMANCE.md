@@ -6,8 +6,8 @@ are](#what-the-local-tests-are-and-are-not).
 
 | Suite | Result |
 |---|---|
-| [`substrates-api-java-tck`](https://github.com/humainary-io/substrates-api-java-tck) 3.12.0 | **1086 run · 0 failures · 0 errors** |
-| [`serventis-api-java-tck`](https://github.com/humainary-io/serventis-api-java-tck) 3.12.0 | **1302 run · 0 failures · 0 errors** |
+| [`substrates-api-java-tck`](https://github.com/humainary-io/substrates-api-java-tck) 3.15.3 | **1099 run · 0 failures · 0 errors** |
+| [`serventis-api-java-tck`](https://github.com/humainary-io/serventis-api-java-tck) 3.15.3 | **1302 run · 0 failures · 0 errors** |
 
 ```bash
 ./scripts/tck.sh                              # both
@@ -15,7 +15,7 @@ are](#what-the-local-tests-are-and-are-not).
 ```
 
 The TCK resolves the provider from the local Maven repository, so **an edit that has not been
-installed is not under test**. `scripts/tck.sh` installs first for that reason. Humainary 3.12.0
+installed is not under test**. `scripts/tck.sh` installs first for that reason. Humainary 3.15.3
 declares Java 27; the script builds the kits for Java 26 through `MAVEN_ARGS` (see the README's
 *Java version*).
 
@@ -23,51 +23,42 @@ The run for each earlier release, and what it changed here, is in this file's gi
 
 ---
 
-## The 3.12.0 conformance run
+## The 3.15.3 conformance run
 
 | | |
 |---|---|
-| **Date** | 2026-10-22 |
-| **Provider** | `io.fullerstack:fullerstack-substrates:3.0.0-SNAPSHOT`, built against Substrates/Serventis **3.12.0** |
-| **Substrates TCK** | `substrates-api-java-tck` at **3.12.0** (upstream `main` commit `16de9e1`, tagged 3.12.0 locally) — **1086 run · 0 failures · 0 errors** |
-| **Serventis TCK** | `serventis-api-java-tck` at **3.12.0** (`36c3f8f`) — **1302 run · 0 failures · 0 errors** |
-| **Baseline before the changes** | compiled unchanged; 1086 run · **2 failures** (Serventis 1302/1302) |
+| **Date** | 2026-11-18 |
+| **Provider** | `io.fullerstack:fullerstack-substrates:3.15.3-SNAPSHOT`, built against Substrates/Serventis **3.15.3** |
+| **Substrates TCK** | `substrates-api-java-tck` at **3.15.3** (upstream `main` commit `2df44a3`, tagged 3.15.3 locally) — **1099 run · 0 failures · 0 errors** |
+| **Serventis TCK** | `serventis-api-java-tck` at **3.15.3** (`dc4c373`) — **1302 run · 0 failures · 0 errors** |
+| **Baseline before the changes** | compiled unchanged; 1099 run · **1 failure** (Serventis 1302/1302) |
 
-**What 3.7.0 → 3.12.0 changed.** The Java API moved little: `Circuit.pipe(List)` may return the sole
-target itself when it is already on the circuit (`@New(conditional = true)`), an unnamed ticker takes
-the circuit's name, and `relate`'s javadoc fixes its state across a throwing operator. The
-specification tightened more:
-- a `State` write matching an existing slot **must** return the same instance (was *may*);
-- each operator's state across a failing function is specified: `relate`, `edge` and `rolling` keep
-  the input, `scan` replaces its state only on a normal return, `tumble` counts only combined inputs;
-- `diff` with an initial value drops a first emission equal to it;
-- a subscription closed before its registration job runs takes no effect, its `onClose` firing once;
-- `Window` temporal misuse and `Pin` context misuse are **must** detect;
-- `NoSuchElementException` for an empty `Window`'s `first()`/`last()`;
-- the routing selector is part of the required `conduit` and `bank` forms.
+**What 3.12.0 → 3.15.3 changed.** One removal from the Java API: `Receptor.NOOP` and the three
+`Receptor.of(...)` factories are gone (write `_ -> { }`, or `circuit.pipe()` / `circuit.pipe(name)` for
+a discarding pipe). The provider used none of them. Everything else is text:
+- a `Closure` consumed once makes every later `consume` a **no-op** — no block, no error (§6.4, §16.3;
+  it was an illegal temporal use). `FsClosure` already returned silently;
+- `closeAwait()` from the owning circuit's context must be rejected **before** close is requested,
+  leaving the resource open (§9.1). Every `closeAwait` here already checks the caller first;
+- a subscription's window ends at the earliest of three close jobs — its own, its subscriber's and its
+  source's — each at its own position in processing order (§7.6.1), and an empty window's `onClose`
+  fires no later than the point its registration job executes;
+- closing a circuit does not close the conduits, banks, tickers, subscribers or subscriptions created
+  from it (§9.3 step 4); their channels deliver nothing once the circuit context has terminated;
+- javadoc now states what the 3.12.0 spec already required of `diff(key)`, `edge`, `rolling` and
+  `tumble` across a throwing function. Read against `FsOperators`: all four already conform.
 
-Every module now declares Java 27; the source compiles unchanged for Java 26, which this family stays
-on.
+The kit grew 1086 → 1099 with no new contract class: quiet-period liveness for `await`, `close` and
+ingress (four tests), name identity under concurrent and wide extension and for enums (three), scope
+close order after out-of-order departures and with repeats (two), `closeAwait` from the owning circuit
+leaving a subscription open, a throwing `onClose` preserving sibling cleanup, and the two
+close-from-callback position tests.
 
-| Kit failure | What 3.12.0 says | Fix |
+| Kit failure | What 3.15.3 says | Fix |
 |---|---|---|
-| `FiberContractTest.relate_operationThrows_advancesPreviousInput` | §6.2.3: Relate's previous input advances to the incoming value, and is kept when the operator throws | `FsOperators.Relate` called the operator before advancing `prev`, so a throw left `prev` behind. It now advances first, as `Flow.relate` (`FsFlow.Relation`) already did. |
-| `FiberContractTest.steady_gradualDrift_resetsAgainstCandidate` | §6.2.3: the generalized `steady` compares each value with the run's **candidate**, not with the value before it | `FsOperators.SteadyPredicate` compared with the previous value, so a drift that stays close step by step never reset. It now holds the candidate and resets it on a miss. |
+| `CallbackTopologyContractTest.subscriberCloseFromCallback_endsItsSubscriptionsAtItsOwnPosition` | §7.6.1 / §5.3: a subscriber's close ends each of its subscriptions at the subscriber's close **job**; transit `[1, close(subscriber), 2]` delivers `1` and not `2` | `FsSubscriber.activate` skipped the callback whenever the subscriber's `closed` flag was set — a flag written the moment `close()` is *called*, not when its job executes. The channel processing `1` rebuilt for the subscription, found the flag, registered nothing, and `1` was lost. The gate is removed: the hub roster, which the retire job edits at its own position, already bounds the window. Cold path (channel rebuild) only. |
 
-**Four more, found by review rather than by the kit.** The kit tests the failing-function rule only for
-`relate` and `scan`, and the same-instance `State` rule only at the newest slot, so these passed it while
-broken. Each now has a regression test in `FailingFunctionStateTest` that failed before its fix:
-
-| Rule (3.12.0) | Defect | Fix |
-|---|---|---|
-| §6.2.3: Edge's previous input advances even when the predicate throws | `FsOperators.Edge` tested before advancing `prev` | `prev` is written first, as in `Relate` |
-| §6.2.3: Tumble counts only successfully combined inputs | `FsOperators.Tumble` advanced its count, and reset at a boundary, before the combiner ran — a failed input counted, and a failure on the last input discarded the batch | the combiner runs first; only a normal return moves the count or the accumulator |
-| §6.2.3: a failing predicate leaves state as it was | `FsOperators.Integrate` stored the new accumulator before testing `fire` | `fire` is tested on the candidate, and the state is committed after |
-| §8.1/§16.3: an equal write returns the same instance, the slot keeping its position | `FsState` returned `this` only when the match was the newest slot; an equal write to an older slot built a new state and moved it to the head | `this` whenever the matching slot's value is equal, wherever it sits |
-
-Serventis 3.12.0 needed nothing here (the provider implements Substrates only). For consumers it is
-source-compatible: instrument constructors take `Conduit<? super Sign>`, and no sign or dimension was
-added or removed.
+Serventis 3.15.3 is version strings and two javadoc lines; no sign, dimension or signature moved.
 
 ---
 

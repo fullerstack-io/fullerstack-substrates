@@ -4,11 +4,11 @@ SPI provider implementation of the [Humainary Substrates API](https://github.com
 
 | | |
 |---|---|
-| **Version** | 3.0.0-SNAPSHOT |
-| **API** | Substrates 3.12.0 + Serventis 3.12.0 |
+| **Version** | 3.15.3-SNAPSHOT |
+| **API** | Substrates 3.15.3 + Serventis 3.15.3 |
 | **Java** | 26 (Virtual Threads + Preview) — see [Java version](#java-version) |
-| **Conformance** | Substrates TCK **1086/1086** · Serventis TCK **1302/1302** (3.12.0) |
-| **Benchmarks** | [perfkit-java](https://github.com/humainary-io/perfkit-java) — 246 `@Benchmark` methods, 39 classes |
+| **Conformance** | Substrates TCK **1099/1099** · Serventis TCK **1302/1302** (3.15.3) |
+| **Benchmarks** | [perfkit-java](https://github.com/humainary-io/perfkit-java) — 258 `@Benchmark` methods, 39 classes |
 
 ## Conformance is external
 
@@ -51,7 +51,7 @@ far. Benchmarks remain entirely Humainary's.
    done
    ```
    Upstream publishes each release as a squashed commit on `main` and does **not** tag it.
-   Check out the commit matching `substrates-api.version` in `pom.xml` (3.12.0) — the three
+   Check out the commit matching `substrates-api.version` in `pom.xml` (3.15.3) — the three
    API commits are pinned by SHA in `.github/workflows/publish-package.yml` — not whatever
    `HEAD` has since become: `main` moves ahead of the version this provider is built and
    measured against.
@@ -61,12 +61,12 @@ far. Benchmarks remain entirely Humainary's.
 
 ### Java version
 
-Humainary 3.12.0 declares Java 27, which is early access until March 2027. Its source compiles
-unchanged for Java 26, and this provider stays on a GA JDK, so the APIs, the TCKs and perfkit are
+Humainary 3.15.3 declares Java 27 (GA since 15 September 2026). Its source compiles unchanged for
+Java 26, and this provider still builds for Java 26, so the APIs, the TCKs and perfkit are
 built with `-Djava.version=26 -Dmaven.compiler.release=26`. `scripts/tck.sh` and
 `scripts/benchmark.sh` pass this through `MAVEN_ARGS`, and the publish workflow passes it to each
-API build. Nothing in Humainary's sources or poms is changed. Revisit this when Java 27 ships, or
-when upstream first uses a Java 27 feature.
+API build. Nothing in Humainary's sources or poms is changed. Revisit this when the
+family moves to Java 27 (the owner's decision), or when upstream first uses a Java 27 feature.
 
 ## Build
 
@@ -95,7 +95,7 @@ The artifact is published to [GitHub Packages](https://github.com/fullerstack-io
   <dependency>
     <groupId>io.fullerstack</groupId>
     <artifactId>fullerstack-substrates</artifactId>
-    <version>3.0.0-SNAPSHOT</version>
+    <version>3.15.3-SNAPSHOT</version>
   </dependency>
 </dependencies>
 ```

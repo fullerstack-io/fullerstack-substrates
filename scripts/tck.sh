@@ -11,8 +11,8 @@
 #   ./scripts/tck.sh serventis        # Serventis only
 #   ./scripts/tck.sh substrates CellContractTest   # one contract class
 #
-# Expected at API 3.3.0, TCKs at 3.3.0 (upstream main, tagged 3.3.0 locally):
-#   Substrates 1067/0/0, Serventis 1227/0/0.  (3.1.2 was 992/0/0; 3.0.7 was 974/0/0.)
+# Expected at API 3.15.3, TCKs at 3.15.3 (upstream main, tagged 3.15.3 locally):
+#   Substrates 1099/0/0, Serventis 1302/0/0.  (3.12.0 was 1086/0/0 and 1302/0/0.)
 #
 # Read the console "Tests run:" total, not a sum of the surefire XML reports: the
 # XML total reads lower than the console for Substrates because FiberContractTest's five @Nested
@@ -24,8 +24,8 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 FS="$ROOT/fullerstack-substrates"
 
-# Humainary 3.12.0 declares Java 27 (early access); its source compiles unchanged for Java 26,
-# and this family stays on a GA JDK. Maven 3.9 reads MAVEN_ARGS, so the kits and perfkit build
+# Humainary 3.15.3 declares Java 27; its source compiles unchanged for Java 26,
+# and this family still builds for Java 26. Maven 3.9 reads MAVEN_ARGS, so the kits and perfkit build
 # for Java 26 without any change to Humainary's own scripts or poms.
 export MAVEN_ARGS="${MAVEN_ARGS:-} -Djava.version=26 -Dmaven.compiler.release=26"
 GROUP=io.fullerstack

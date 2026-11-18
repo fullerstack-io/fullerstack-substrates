@@ -913,7 +913,7 @@ public final class FsCircuit implements Circuit {
   @Override
   public < E > Pipe < E > pipe () {
     // 2.3: no-arg pipe — queues emissions and discards them on the circuit thread.
-    // Equivalent to circuit.pipe(Receptor.NOOP) but without the wrapper.
+    // Equivalent to circuit.pipe(_ -> { }) but without a receptor to supply.
     requireOpen ( "pipe" );
     return newPipe ( v -> { /* no-op */ } );
   }

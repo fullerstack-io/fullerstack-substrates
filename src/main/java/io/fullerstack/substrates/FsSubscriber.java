@@ -51,10 +51,17 @@ public final class FsSubscriber < E > implements Subscriber < E > {
   }
 
   /// Invokes the callback for a pipe activation.
+  ///
+  /// Not gated on [#closed]. §7.6.1 (3.15.3): "A subscription's window ends at the earliest of
+  /// three close jobs: its own, its subscriber's, and its source's" — a position in the circuit's
+  /// processing order, whereas `closed` is set the moment the caller calls [#close()]. A callback
+  /// that emits, closes this subscriber, and emits again leaves transit holding
+  /// `[1, close(subscriber), 2]`; the channel processes `1` ahead of the close job, the
+  /// subscription is still effective there, and §7.3 requires its callback. The roster is the
+  /// gate: a channel only activates subscriptions [FsHub] still lists, and the retire job each
+  /// subscription queues from [#close()] is what removes them, at its own position.
   public void activate ( Subject < Pipe < E > > pipeSubject, Registrar < E > registrar ) {
-    if ( !closed ) {
-      callback.accept ( pipeSubject, registrar );
-    }
+    callback.accept ( pipeSubject, registrar );
   }
 
   void trackSubscription ( FsSubscription subscription ) {

@@ -13,16 +13,16 @@ env:
   # repository is cloned at THIS tag — never at HEAD, which moves ahead of the version
   # in pom.xml and has broken this workflow before. Bump it with the two
   # *-api.version properties in pom.xml; the guard step below fails if they diverge.
-  HUMAINARY_TAG: '3.12.0'
+  HUMAINARY_TAG: '3.15.3'
   # Upstream publishes each release as a squashed commit on main and does not tag it.
   # Each repository is fetched at the commit the family was upgraded against on
-  # 2026-10-22 (the 3.12.0 release commits), so a later upstream commit cannot change
+  # 2026-11-18 (the 3.15.3 release commits), so a later upstream commit cannot change
   # what this provider is built and measured against. Bump these with HUMAINARY_TAG.
-  # 3.12.0 declares Java 27 (early access); its source compiles unchanged for Java 26,
-  # and the family stays on a GA JDK, so the APIs are built with release 26 below.
-  HUMAINARY_SPECS_SHA: 'a878345b3b56b9a4e97d6bffeac100d638376c1e'
-  HUMAINARY_SUBSTRATES_SHA: '6071357934301c39838a88636e0f6fa20c73f75c'
-  HUMAINARY_SERVENTIS_SHA: 'b63902b592a5a8cbd49952218b8704d9fa973c32'
+  # 3.15.3 declares Java 27; its source compiles unchanged for Java 26, and the family
+  # still builds for Java 26, so the APIs are built with release 26 below.
+  HUMAINARY_SPECS_SHA: 'd9a59a469a35920d438c3fa9b671dfcedd4dfb70'
+  HUMAINARY_SUBSTRATES_SHA: '9c1b9067ee5e88dddcb39ffa783dc438bacf7bec'
+  HUMAINARY_SERVENTIS_SHA: 'c792e4da317e22e391a8507dff2505fd8aea5a9b'
 
 jobs:
   publish:

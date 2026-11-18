@@ -1,6 +1,6 @@
 # Fullerstack Substrates — Implementation Architecture
 
-This document describes how Fullerstack implements the [Substrates Specification](https://github.com/humainary-io/substrates-api-spec) (Humainary 3.12.0). For what Substrates is and why it works this way, read the official [Specification](https://github.com/humainary-io/substrates-api-spec/blob/main/SPEC.md) and [Rationale](https://github.com/humainary-io/substrates-api-spec/blob/main/RATIONALE.md). Designs that were built, measured and rejected are recorded in [Decisions](DECISIONS.md).
+This document describes how Fullerstack implements the [Substrates Specification](https://github.com/humainary-io/substrates-api-spec) (Humainary 3.15.3). For what Substrates is and why it works this way, read the official [Specification](https://github.com/humainary-io/substrates-api-spec/blob/main/SPEC.md) and [Rationale](https://github.com/humainary-io/substrates-api-spec/blob/main/RATIONALE.md). Designs that were built, measured and rejected are recorded in [Decisions](DECISIONS.md).
 
 ---
 
@@ -717,7 +717,7 @@ The classes `AwaitMarker`, `CloseMarker`, `PulseProbe`, and `ReceptorAdapter` mu
 ## Performance
 
 Measurement is [perfkit-java](https://github.com/humainary-io/perfkit-java), run against this
-provider by Maven coordinate — 246 benchmark methods across 39 classes in the current checkout,
+provider by Maven coordinate — 258 benchmark methods across 39 classes in the current checkout,
 covering Substrates and Serventis. This project keeps no benchmarks and publishes no standing
 figures: numbers move with the host.
 

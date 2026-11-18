@@ -23,8 +23,8 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 FS="$ROOT/fullerstack-substrates"
 
-# Humainary 3.12.0 declares Java 27 (early access); its source compiles unchanged for Java 26,
-# and this family stays on a GA JDK. Maven 3.9 reads MAVEN_ARGS, so the kits and perfkit build
+# Humainary 3.15.3 declares Java 27; its source compiles unchanged for Java 26,
+# and this family still builds for Java 26. Maven 3.9 reads MAVEN_ARGS, so the kits and perfkit build
 # for Java 26 without any change to Humainary's own scripts or poms.
 export MAVEN_ARGS="${MAVEN_ARGS:-} -Djava.version=26 -Dmaven.compiler.release=26"
 PK="$ROOT/perfkit-java"

@@ -102,7 +102,7 @@ The performance-critical core. Spec requirements:
 - **Stack safe** — even deeply cascading chains don't overflow the stack
 - **Wait-free producer** — callers never block when emitting
 
-The routing decision between the two queues has one definition, `FsCircuit.submit`: a call on this circuit's worker enqueues to transit, any other thread (another circuit's worker included) admits to ingress, and an emission after close is dropped. `FsPipe.emit`, every Flow/Fiber terminal and every registered pipe's `Admit` reach the queues through it.
+The routing decision between the two queues has one definition, `FsCircuit.submit`: a call on this circuit's worker enqueues to transit, any other thread (another circuit's worker included) admits to ingress, and a submission from such a thread once close has been accepted is dropped. A worker's own emission after close is still transit and completes. `FsPipe.emit`, every Flow/Fiber terminal and every registered pipe's `Admit` reach the queues through it.
 
 ### Admission — the ingress carrier
 
@@ -179,8 +179,8 @@ if ( j == null ) return false;          // nothing committed
 do {
   t.next = null;                        // unlink the consumed node for GC
   t = j;
-  circuit.stimulus.valid = false;       // §5.8: one clock reading per ingress item
-  run ( j, circuit );                   // dispatch, then drain transit to empty
+  circuit.stimulus.epoch++;             // §5.8: one clock reading per ingress item
+  if ( run ( j, circuit ) ) break;      // dispatch, then drain transit to empty; true = the close marker ran
   j = (Admission) NEXT.getAcquire ( t );
 } while ( j != null );
 tail = t;
@@ -189,6 +189,12 @@ tail = t;
 `run` sends a marker straight to its receiver; any other admission is dispatched inside the §15.4
 isolation guard and then, if transit has work, transit is drained. Causal completion (§5.3): each
 admission's transit cascade is drained to empty before the next ingress admission runs.
+
+The pass ends at the close marker: `run` returns the circuit's exit flag from its marker branch (and
+`false`, a constant, from the hot path), `drainLoop` tests the flag once per pass, discards whatever
+is linked behind the marker without running it (`IngressQueue.discard`) and the worker leaves. Nothing
+is processed behind the close position (§9.1); see [Conformance](CONFORMANCE.md), *The close marker is
+the line*.
 
 ### TransitQueue — single-threaded ring
 
@@ -242,8 +248,12 @@ private void drainLoop() {
   final IngressQueue q = ingress;
 
   for (;;) {
-    if (q.drainBatch(this)) continue;      // drain ingress + interleaved transit
-    if (shouldExit) return;
+    boolean didWork = q.drainBatch(this);  // drain ingress + interleaved transit; ends at the close marker
+    if (shouldExit) {                      // the close marker ran: it is the last admission
+      q.discard();                         // whatever is linked behind it is dropped, unrun
+      return;
+    }
+    if (didWork) continue;
 
     // Spin first: a circuit fed faster than the spin lasts never parks at all
     Object found = null;
@@ -257,7 +267,7 @@ private void drainLoop() {
     VarHandle.fullFence();
 
     // quiescent() = nothing linked AND no producer holding an unlinked slot
-    while (q.quiescent() && !shouldExit) LockSupport.parkNanos(PARK_NANOS);
+    while (q.quiescent()) LockSupport.parkNanos(PARK_NANOS);
 
     parked = false;
   }
@@ -468,7 +478,7 @@ for (int round = 0; round < 3; round++) {
 
 ### How `await()` works
 
-`await()` admits a marker into the ingress queue at the caller's own position and waits for the worker to reach it. Each awaiter admits its own marker carrying its own barrier, so concurrent awaiters never share one (§5.5: the barrier covers every operation accepted before *that* call). When the circuit thread processes the marker (after all preceding admissions and their transit cascades), it releases that barrier. This guarantees all emissions submitted before `await()` have been fully processed, including any cascading transit emissions they triggered.
+`await()` admits a marker into the ingress queue at the caller's own position and waits for the worker to reach it. Each awaiter admits its own marker carrying its own barrier, so concurrent awaiters never share one (§5.5: the barrier covers every operation accepted before *that* call). When the circuit thread processes the marker (after all preceding admissions and their transit cascades), it releases that barrier. This guarantees all emissions submitted before `await()` have been fully processed, including any cascading transit emissions they triggered. The one marker never dispatched is one linked behind a circuit's close marker: its caller returns once the worker has terminated, and whatever else sits behind the close marker has been dropped, not processed.
 
 The thread-identity check that prevents worker-thread callers from deadlocking is centralised in `checkExternalCaller(op)` and reused by `await()`, `pulse()`, and every `closeAwait()` (circuit, conduit, bank, ticker, subscriber, subscription). `closeAwait()` calls `checkExternalCaller` *before* any close side-effect, so an illegal call fails fast with no partial state change (spec §16.1 #13).
 
@@ -496,7 +506,7 @@ private void awaitImpl() {
     Thread.onSpinWait();
   }
   while (!barrier.released) {                         // slow path: bounded parks
-    if (closed && !worker.isAlive()) return;          // a marker behind close never fires (§9.1)
+    if (closed && !worker.isAlive()) return;          // a marker behind the close marker is never dispatched (§9.1)
     LockSupport.parkNanos(AWAIT_PARK_NANOS);
   }
 }

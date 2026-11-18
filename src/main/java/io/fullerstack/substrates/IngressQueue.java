@@ -139,6 +139,12 @@ final class IngressQueue extends IngressQueuePad2 {
 
   /// Runs every committed admission, interleaving transit exactly as the chunked
   /// drain does. Returns true if any admission ran.
+  ///
+  /// **The pass ends at the close marker.** §9.1: work positioned after a close job "MUST be
+  /// silently dropped", so once the marker has run nothing linked behind it may be dispatched —
+  /// `tail` is left on the marker and the caller ([FsCircuit#drainLoop]) discards the rest and
+  /// leaves. [#run] reports it, and only from its marker branch, so the test costs the hot path
+  /// nothing.
   boolean drainBatch ( FsCircuit circuit ) {
 
     Admission t = tail;
@@ -153,7 +159,7 @@ final class IngressQueue extends IngressQueuePad2 {
       // cascade. Advanced before dispatch and deliberately not inside the transit drain.
       circuit.stimulus.epoch++;
 
-      run ( j, circuit );
+      if ( run ( j, circuit ) ) break;     // the close marker: nothing behind it runs
 
       j = (Admission) NEXT.getAcquire ( t );
     } while ( j != null );
@@ -162,17 +168,42 @@ final class IngressQueue extends IngressQueuePad2 {
     return true;
   }
 
-  /// Runs one admitted admission.
+  /// Drops everything linked behind `tail` without running it. Worker only, called once, after
+  /// the close marker has run.
+  ///
+  /// Each dropped node is unlinked and emptied, so neither the chain nor the receivers and values
+  /// it carried stay reachable from a closed circuit. A producer still between its exchange and
+  /// its link when this walk ends links its node afterwards, and with it any nodes later producers
+  /// chained behind it; nothing consumes them, and they are held — with the node `head` always
+  /// holds — until the circuit itself is unreachable. Only a
+  /// caller that read the circuit as open before `close()` can be in that position, so the
+  /// residue is bounded by the callers in flight at the close.
+  void discard () {
+    Admission t = tail;
+    Admission j;
+    while ( ( j = (Admission) NEXT.getAcquire ( t ) ) != null ) {
+      t.next     = null;
+      j.receiver = null;
+      j.value    = null;
+      t = j;
+    }
+    tail = t;
+  }
+
+  /// Runs one admitted admission. Returns true when it was the close marker, which ends the pass.
   ///
   /// A marker skips both the §15.4 isolation wrapper and the transit drain. This was a virtual
   /// `Admission.run` dispatched through a subclass per kind; markers are 0.009% of admissions, and the
   /// call was measured failing to inline into the drain, so a predicted branch is the cheaper
   /// shape for something that almost never happens.
-  private static void run ( Admission admission, FsCircuit circuit ) {
+  ///
+  /// On the drain path the circuit's exit flag is read here and only here: inside the marker
+  /// branch, after the marker has run ([FsCircuit#drainLoop] reads it once more, per pass). An await marker leaves it false; the close marker has just set it.
+  private static boolean run ( Admission admission, FsCircuit circuit ) {
 
     if ( admission.marker ) {
       admission.receiver.accept ( admission.value );
-      return;
+      return circuit.exiting ();
     }
 
     try {
@@ -182,5 +213,7 @@ final class IngressQueue extends IngressQueuePad2 {
     }
 
     if ( circuit.transitHasWork () ) circuit.drainTransit ();
+
+    return false;
   }
 }

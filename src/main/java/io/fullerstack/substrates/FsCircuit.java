@@ -168,8 +168,10 @@ public final class FsCircuit implements Circuit {
   // Synchronization state
   // ─────────────────────────────────────────────────────────────────────────────
 
-  // Set by close marker (runs on circuit thread) to signal worker exit.
-  // Plain field - only accessed from circuit thread.
+  // Set by the close marker, on the worker, when the worker reaches it: the marker is the last
+  // admission this circuit runs. Plain field — worker only. Read in two places, both off the
+  // per-emission path: by the ingress drain inside its marker branch, to end the batch at the
+  // marker, and by `drainLoop` once per batch, to leave.
   private boolean shouldExit;
 
   // Set when close() is called. Read by the ingress branch of `submit` — close stops new
@@ -266,7 +268,9 @@ public final class FsCircuit implements Circuit {
     AwaitBarrier ( Thread thread ) { this.thread = thread; }
   }
 
-  private static final ThreadLocal < AwaitBarrier > AWAIT_BARRIER =
+  /// Package-private for `CloseMarkerIsTheLineTest`, which reads a returned awaiter's flag to tell
+  /// "its marker was dispatched" from "it returned because the worker is gone".
+  static final ThreadLocal < AwaitBarrier > AWAIT_BARRIER =
     ThreadLocal.withInitial ( () -> new AwaitBarrier ( Thread.currentThread () ) );
 
   /// Await marker — delivered through the ingress queue and routed to
@@ -365,6 +369,15 @@ public final class FsCircuit implements Circuit {
     if ( parked ) LockSupport.unpark ( worker );
   }
 
+  /// **Test seam — never called by the provider.** Links an admission without reading `closed`,
+  /// which is what a producer does when it passed the check in [#submit] just before `close()`
+  /// and was linked just after the close marker. No public call can be placed there on purpose —
+  /// `submit` drops it on the caller's side — and the race cannot be staged from outside, so
+  /// `CloseMarkerIsTheLineTest` uses this to put an admission behind the marker deterministically.
+  void admitAsIfRacingClose ( Consumer < Object > receiver, Object value ) {
+    submitIngress ( receiver, value );
+  }
+
   /// Admits one emission to this circuit — **the** §5.3 routing decision, and the only copy.
   ///
   /// A cascade re-entry raised on this circuit's own worker is transit work; anything raised from
@@ -385,10 +398,15 @@ public final class FsCircuit implements Circuit {
   /// the worker had reached when a caller called `close()`: `[emit(x), close()]` from one caller
   /// dispatched x to its first receptor and lost everything that receptor raised.
   ///
-  /// Two consequences. The worker does not stop *at* the marker — it finishes draining ingress and
-  /// then exits — so a submission that read `closed` as false and linked just behind the marker is
-  /// still dispatched, and, being dispatched, its cascade completes too. And nothing here can end a
-  /// cascade that does not end itself (`docs/CONFORMANCE.md`, *Non-terminating cascades*).
+  /// **The close marker is the line.** `close()` links the marker and then sets `closed`, so a
+  /// submission that read `closed` as false in between is linked just behind the marker. It is not
+  /// dispatched: the worker stops at the marker ([IngressQueue#drainBatch], [#drainLoop]) and what
+  /// is linked behind it is discarded unrun, which is §9.1's rule for work positioned after a
+  /// close job. So an admission either sits ahead of the marker and completes with its whole
+  /// cascade, or sits behind it and has no effect at all; there is no third case.
+  ///
+  /// Nothing here can end a cascade that does not end itself (`docs/CONFORMANCE.md`,
+  /// *Non-terminating cascades*).
   ///
   /// `FsPipe.emit` and `FsPort` both used to carry their own copy of this branch, and the copy
   /// that called itself canonical was the one missing the close check — which is how three
@@ -455,7 +473,7 @@ public final class FsCircuit implements Circuit {
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // Worker Loop - FIFO depth-first processing, spin then park until woken
+  // Worker Loop - FIFO processing, each admission's transit drained before the next; spin then park until woken
   // ─────────────────────────────────────────────────────────────────────────────
 
   private void workerLoop () {
@@ -470,8 +488,8 @@ public final class FsCircuit implements Circuit {
     FsOperators.STIMULUS.set ( stimulus );
     drainLoop ();
     // §5.7: the binding lives exactly as long as the worker does. Released here
-    // rather than in close(), because work admitted before the close marker is
-    // still dispatched afterwards and must keep observing the circuit's Current.
+    // rather than in close(), because work admitted ahead of the close marker is
+    // still dispatched after close() returns and must keep observing the circuit's Current.
     cortex.unbindCurrent ();
     FsOperators.STIMULUS.remove ();
   }
@@ -484,17 +502,20 @@ public final class FsCircuit implements Circuit {
 
       // Run every admission linked so far, in order, each followed by the whole of the transit
       // it raises (§5.3) before the next is looked at. There is no batch cap: the pass ends when
-      // it finds no successor.
+      // it finds no successor, or at the close marker.
       boolean didWork = q.drainBatch ( this );
 
-      if ( didWork ) continue;
+      // The close marker is the line (§9.1). It is an admission run by the pass above, which
+      // ends there; everything ahead of it has completed, cascades included. Whatever is linked
+      // behind it — by a producer, an awaiter or a probe that read the circuit as open just
+      // before `close()` — is discarded unrun, and the worker leaves. Tested before `didWork`:
+      // a pass that ran the marker did work, and must not go round again.
+      if ( shouldExit ) {
+        q.discard ();
+        return;
+      }
 
-      // `shouldExit` is set by the close marker, which is itself an admission run by the pass
-      // above. It is tested only here, after a pass that found nothing, and not where it is set:
-      // the marker is a position, not a stop. Admissions linked behind it by producers that read
-      // the circuit as open are still dispatched, with their cascades, and only an empty ingress
-      // lets the worker leave.
-      if ( shouldExit ) return;
+      if ( didWork ) continue;
 
       // Spin before parking. A circuit fed faster than the spin lasts never parks at all,
       // so a busy worker keeps its sub-microsecond pickup and no producer ever pays an
@@ -520,7 +541,10 @@ public final class FsCircuit implements Circuit {
       // Re-park rather than re-spin: a wake that finds nothing is either the safety timeout or
       // a stale permit, and spinning 26µs on each of those is what an idle circuit would spend
       // its CPU on.
-      while ( q.quiescent () && !shouldExit ) LockSupport.parkNanos ( PARK_NANOS );
+      // `shouldExit` is not consulted: only a drain pass sets it, and the loop leaves straight
+      // after that pass. `close()` unparks, the marker makes the queue non-quiescent, and the next
+      // pass runs it.
+      while ( q.quiescent () ) LockSupport.parkNanos ( PARK_NANOS );
 
       parked = false;
     }
@@ -657,8 +681,12 @@ public final class FsCircuit implements Circuit {
    *
    * Every awaiter gets its own marker and its own barrier — see the note in the body for
    * why callers must not share one.
+   *
+   * Package-private for `CloseMarkerIsTheLineTest` only: `await()` reads `closed` first and
+   * joins the worker instead, so an await marker lands behind the close marker only when its
+   * caller read the circuit as open just before `close()` — which this lets a test reproduce.
    */
-  private void awaitImpl () {
+  void awaitImpl () {
 
     // §5.5 is positional: the barrier covers "every circuit operation accepted BEFORE the
     // await call". Each awaiter therefore admits its OWN marker at its OWN position.
@@ -695,9 +723,10 @@ public final class FsCircuit implements Circuit {
     }
 
     // Only a genuinely slow circuit reaches here. Bounded parks rather than an indefinite
-    // one: a marker admitted after the worker has drained past the close marker and exited is
-    // never dispatched, so its flag is never set, and §5.5 requires await to return immediately once the circuit
-    // is closed. Re-checking on each wake also covers spurious returns from park.
+    // one: an await marker linked behind the close marker is never dispatched — the worker
+    // stops at the close marker and discards what follows — so its flag is never set, and §5.5
+    // requires await to return immediately once the circuit is closed. This check is that
+    // return. Re-checking on each wake also covers spurious returns from park.
     while ( !barrier.released ) {
       if ( closed && !worker.isAlive () ) return;
       LockSupport.parkNanos ( AWAIT_PARK_NANOS );
@@ -720,10 +749,16 @@ public final class FsCircuit implements Circuit {
   }
 
   /**
-   * Close marker callback - signals worker to exit.
+   * Close marker callback — this is the last admission the worker runs.
    */
   private void onCloseMarker ( Object ignored ) {
     shouldExit = true;
+  }
+
+  /// Whether the close marker has run. Worker only; asked by the ingress drain straight
+  /// after it runs a marker, and nowhere on the per-emission path.
+  boolean exiting () {
+    return shouldExit;
   }
 
   @Queued
@@ -733,11 +768,12 @@ public final class FsCircuit implements Circuit {
     if ( closed ) return;
 
 
-    // Inject close marker FIRST (while still accepting emissions)
-    // This ensures all emissions before close() are processed
+    // Link the close marker FIRST, while submissions are still accepted: everything a caller
+    // submitted before this call is then ahead of the marker, and is processed to completion.
     ingress.enqueue ( closeMarkerReceiver, null, true );
 
-    // NOW reject new emissions
+    // NOW stop ingress. A submission that slipped between these two statements is behind the
+    // marker and is discarded with it — the marker is the line, not this flag.
     closed = true;
 
     // Always wake worker on close (may be parked)
@@ -747,8 +783,8 @@ public final class FsCircuit implements Circuit {
     // awaitImpl), so there is nothing to release here and nothing to pay for on the
     // common path.
 
-    // 2.8: stop scheduling further ticks; in-flight ticks already submitted
-    // to the ingress queue may still be delivered (spec §11.5).
+    // 2.8: stop scheduling further ticks. A tick admitted ahead of the marker is delivered
+    // (§11.4); one that raced this call and was linked behind the marker is discarded with it.
     ScheduledExecutorService s = scheduler;
     if ( s != null ) s.shutdownNow ();
   }

@@ -73,7 +73,8 @@ Two flags exist per closeable component and they are not the same thing. **Close
 written on the caller's side the moment `close()` is called; only the synchronous open-required
 guards read it (`subscribe`, the circuit factories, `Bank.get`), with `await` and the ticker's scheduler task. **Close executed** is the close job
 running on the worker; it alone decides what queued work takes effect. No queued job consults a
-caller-side flag, with the one exception stated for the circuit.
+caller-side flag. The circuit's flag is read where a caller context *submits* — never by work the
+worker raises.
 
 | Resource | Its close job | Ahead of the close job | Behind the close job |
 |---|---|---|---|
@@ -82,9 +83,22 @@ caller-side flag, with the one exception stated for the circuit.
 | **Conduit** | One job: the roster empties, every subscription not already ended is ended — one whose registration job has not run yet included — then each of their `onClose` callbacks runs, in subscription order. | **Drains.** `[subscribe(S), emit 1, close()]` from one caller delivers `1` to `S`. | Emissions to its pipes are accepted and reach no one. A registration job behind it takes no effect. `subscribe` is rejected synchronously from the moment close is accepted. The pool keeps its channels: `get(name)` still returns the same pipe. |
 | **Bank** | No job of its own: `close()` closes each materialized conduit in creation order, one close job per conduit. Two conduits of one bank therefore close at two positions, and another caller's work can land between them. | As for each conduit. | As for each conduit. `get` is rejected synchronously from the moment close is accepted. |
 | **Ticker** | No job. `close()` cancels the schedule on the caller's side. | Ticks already admitted are delivered (§11.4 MAY). | See *Known gaps*: one tick whose scheduler task was already running can be admitted after `close()` returns. |
-| **Circuit** | The close marker, an ingress position. `close()` admits the marker and then marks the circuit closed. | Ingress admissions ahead of the marker are each **dispatched**. Work they *raise* once close has been accepted — cascade emissions, a registered pipe's delivery, subscribe and close jobs, `onClose` — is **dropped**: the one place a caller-side flag decides a queued operation, and it is the §9.3 step 3 choice. Transit already queued when close was accepted drains. | An emission submitted once close has been accepted is dropped silently on the caller's side, with no error and no side channel (§9.3 step 1). The worker does not stop at the marker; it exits once ingress is empty. So an admission that raced the `close()` call — it read the circuit as open and was linked just behind the marker — is still dispatched. No other emission or lifecycle job behind the marker is; an `await` marker or `pulse` probe that raced the close the same way may be. Cleanup of the circuit's conduits, subscribers and subscriptions queued after this point never runs, and their `onClose` never fires (§9.1, §9.3 step 4). |
+| **Circuit** | The close marker, an ingress position. `close()` admits the marker and then marks the circuit closed. | **Drains, cascades included.** Every ingress admission ahead of the marker is dispatched and processed *to completion*: everything it raises on the worker — cascade emissions, a registered pipe's delivery, subscribe and close jobs, `onClose`, `Port`/`Cell`/`Basin` operations — is transit, and transit completes (§5.3), whether or not `close()` had been called by then. This is the §9.3 step 3 choice: emissions already admitted **complete**. A tick admitted before the close is such an admission. | Close stops **ingress**: an emission, or any other queued operation, submitted from a caller context once close has been accepted is dropped silently on the caller's side, with no error and no side channel (§9.3 step 1) — another circuit's worker is a caller context here. The worker does not stop at the marker; it exits once ingress is empty. So an admission that raced the `close()` call — it read the circuit as open and was linked just behind the marker — is still dispatched, and its cascade completes like any other. An `await` marker or `pulse` probe that raced the close the same way may be too. Factories called from a cascade after close is accepted are open-required and are rejected synchronously with the circuit's `Fault` (§9.1); the cascade's emissions around the rejected call still complete. Cleanup of the circuit's conduits, subscribers and subscriptions requested from a caller context after this point never runs, and its `onClose` never fires (§9.1, §9.3 step 4). |
 
 So the portable sequence is the one §9.3 gives: stop submitting, `await()`, then `close()`.
+
+**Non-terminating cascades.** Causal completion has no bound. A cascade that feeds itself — a pipe
+whose receptor emits to itself, a feedback loop between two conduits — runs at constant stack depth
+however long it is (§5.3: transit is queued and drained iteratively, never recursed into;
+`CascadeCompletesAfterCloseTest` runs a million hops), and it is never interleaved with ingress: the
+worker does not look at the next admission, the close marker included, until the cascade in progress
+has drained. So there is no termination guarantee, and none is added here — no hop cap, no abort.
+`close()` cannot interrupt a cascade in progress; it still returns at once, but the worker never
+reaches the marker, and `await()` and `closeAwait()` on that circuit do not return. Until
+2026-11-18 a caller-side flag happened to end such a loop at the hop after `close()` was called; that
+was the truncation of every cascade, not a stop mechanism, and it is gone. A cascade that does not end
+is a defect of the system built on the circuit: give every feedback loop a condition under which it
+stops emitting.
 
 **A subscribe that races a close.** `subscribe` re-checks both closed flags and records the
 subscription with its subscriber and its source as one step, under both monitors. A close of either

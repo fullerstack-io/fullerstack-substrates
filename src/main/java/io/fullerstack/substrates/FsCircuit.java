@@ -172,7 +172,8 @@ public final class FsCircuit implements Circuit {
   // Plain field - only accessed from circuit thread.
   private boolean shouldExit;
 
-  // Set when close() is called to reject new emissions
+  // Set when close() is called. Read by the ingress branch of `submit` — close stops new
+  // emissions from caller contexts, never the worker's own cascade — and by the open guards.
   volatile boolean closed;
 
   /// Whether the worker has committed to a park and needs an unpark to run again.
@@ -371,20 +372,32 @@ public final class FsCircuit implements Circuit {
   /// circuit. The transit ring is single-threaded, so routing a foreign-thread emission into it
   /// is a data race, not merely a lost emission.
   ///
-  /// §9.1: an emission submitted once `closed` is set is dropped here rather than linked behind
-  /// the close marker. The worker does not stop *at* the marker — it finishes draining ingress
-  /// and then exits — so a submission that read `closed` as false and linked just behind the
-  /// marker is still dispatched; that race is the only work processed behind the close position
-  /// (documented in `docs/CONFORMANCE.md`, *Close: what drains and what is dropped*).
+  /// **Close stops ingress, not the cascade.** §9.3 step 1: "New emissions from caller contexts MUST
+  /// NOT be processed" — so `closed` is read on the ingress branch only, and a submission from any
+  /// thread but the worker once close has been accepted is dropped here, silently, rather than
+  /// linked behind the close marker. The transit branch does not read it: whatever the worker is
+  /// dispatching was admitted, and §5.3 completes what an admitted item raises — emissions, a
+  /// registered pipe's delivery, subscribe and close jobs, `onClose`, Port, Cell and Basin
+  /// operations alike, since every one of them arrives through this method. That is the §9.3
+  /// step 3 choice, documented in `docs/CONFORMANCE.md`, *Close: what drains and what is dropped*.
+  ///
+  /// It used to read `closed` before the routing test, which cut a cascade off at whichever hop
+  /// the worker had reached when a caller called `close()`: `[emit(x), close()]` from one caller
+  /// dispatched x to its first receptor and lost everything that receptor raised.
+  ///
+  /// Two consequences. The worker does not stop *at* the marker — it finishes draining ingress and
+  /// then exits — so a submission that read `closed` as false and linked just behind the marker is
+  /// still dispatched, and, being dispatched, its cascade completes too. And nothing here can end a
+  /// cascade that does not end itself (`docs/CONFORMANCE.md`, *Non-terminating cascades*).
   ///
   /// `FsPipe.emit` and `FsPort` both used to carry their own copy of this branch, and the copy
   /// that called itself canonical was the one missing the close check — which is how three
   /// copies of one rule drift.
   final void submit ( Consumer < Object > receiver, Object value ) {
-    if ( closed ) return;
     if ( onWorker () ) {
       transit.enqueue ( receiver, value );
     } else {
+      if ( closed ) return;
       submitIngress ( receiver, value );
     }
   }
@@ -469,13 +482,18 @@ public final class FsCircuit implements Circuit {
 
     for ( ; ; ) {
 
-      // Drain up to 64 ingress slots with depth-first cascade interleaving.
+      // Run every admission linked so far, in order, each followed by the whole of the transit
+      // it raises (§5.3) before the next is looked at. There is no batch cap: the pass ends when
+      // it finds no successor.
       boolean didWork = q.drainBatch ( this );
 
       if ( didWork ) continue;
 
-      // shouldExit is set by close marker (runs as ingress admission on this thread).
-      // Check here after drain confirms empty — no work left, safe to exit.
+      // `shouldExit` is set by the close marker, which is itself an admission run by the pass
+      // above. It is tested only here, after a pass that found nothing, and not where it is set:
+      // the marker is a position, not a stop. Admissions linked behind it by producers that read
+      // the circuit as open are still dispatched, with their cascades, and only an empty ingress
+      // lets the worker leave.
       if ( shouldExit ) return;
 
       // Spin before parking. A circuit fed faster than the spin lasts never parks at all,

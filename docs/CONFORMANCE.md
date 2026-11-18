@@ -62,6 +62,46 @@ Serventis 3.15.3 is version strings and two javadoc lines; no sign, dimension or
 
 ---
 
+## Close: what drains and what is dropped (§9.1, §9.3)
+
+§9.1 requires work positioned *behind* a component's close job to be dropped, and lets a provider
+choose what happens to work positioned *ahead* of it — "implementations MUST document this choice".
+§9.3 asks the same of a circuit. This is that document. "Position" is a position in the circuit's
+logical processing order (§7.6.1): transit ahead of ingress, each FIFO.
+
+Two flags exist per closeable component and they are not the same thing. **Close accepted** is
+written on the caller's side the moment `close()` is called; only the synchronous open-required
+guards read it (`subscribe`, the circuit factories, `Bank.get`), with `await` and the ticker's scheduler task. **Close executed** is the close job
+running on the worker; it alone decides what queued work takes effect. No queued job consults a
+caller-side flag, with the one exception stated for the circuit.
+
+| Resource | Its close job | Ahead of the close job | Behind the close job |
+|---|---|---|---|
+| **Subscription** | One job: the subscription leaves the roster, then its `onClose` runs — one position. Its window ends at whichever close job reaches it first on the worker — its own, its subscriber's or its source's — and the later ones find it ended and do nothing; no close is discarded on the caller's side. | **Drains.** Its registration job and every emission ahead of the close are processed; deliveries already selected are performed (§7.5). | Not selected by any later emission. A registration job still behind it takes no effect (empty window); `onClose` has by then already run, once (§7.6.1). |
+| **Subscriber** | One job for all its subscriptions: every one still open leaves its roster, then each of their `onClose` callbacks runs, in subscription order. One job is enough because §7.2 confines a subscriber's subscriptions to one circuit. | **Drains**, as for a subscription. A subscriber callback due for an emission ahead of the close job is still invoked (§7.3). | None of its subscriptions is selected. Whatever an `onClose` raises is behind the close of all of them. `subscribe` with it is rejected synchronously from the moment close is accepted. |
+| **Conduit** | One job: the roster empties, every subscription not already ended is ended — one whose registration job has not run yet included — then each of their `onClose` callbacks runs, in subscription order. | **Drains.** `[subscribe(S), emit 1, close()]` from one caller delivers `1` to `S`. | Emissions to its pipes are accepted and reach no one. A registration job behind it takes no effect. `subscribe` is rejected synchronously from the moment close is accepted. The pool keeps its channels: `get(name)` still returns the same pipe. |
+| **Bank** | No job of its own: `close()` closes each materialized conduit in creation order, one close job per conduit. Two conduits of one bank therefore close at two positions, and another caller's work can land between them. | As for each conduit. | As for each conduit. `get` is rejected synchronously from the moment close is accepted. |
+| **Ticker** | No job. `close()` cancels the schedule on the caller's side. | Ticks already admitted are delivered (§11.4 MAY). | See *Known gaps*: one tick whose scheduler task was already running can be admitted after `close()` returns. |
+| **Circuit** | The close marker, an ingress position. `close()` admits the marker and then marks the circuit closed. | Ingress admissions ahead of the marker are each **dispatched**. Work they *raise* once close has been accepted — cascade emissions, a registered pipe's delivery, subscribe and close jobs, `onClose` — is **dropped**: the one place a caller-side flag decides a queued operation, and it is the §9.3 step 3 choice. Transit already queued when close was accepted drains. | An emission submitted once close has been accepted is dropped silently on the caller's side, with no error and no side channel (§9.3 step 1). The worker does not stop at the marker; it exits once ingress is empty. So an admission that raced the `close()` call — it read the circuit as open and was linked just behind the marker — is still dispatched. No other emission or lifecycle job behind the marker is; an `await` marker or `pulse` probe that raced the close the same way may be. Cleanup of the circuit's conduits, subscribers and subscriptions queued after this point never runs, and their `onClose` never fires (§9.1, §9.3 step 4). |
+
+So the portable sequence is the one §9.3 gives: stop submitting, `await()`, then `close()`.
+
+**A subscribe that races a close.** `subscribe` re-checks both closed flags and records the
+subscription with its subscriber and its source as one step, under both monitors. A close of either
+accepted before that step rejects the call synchronously — nothing recorded, nothing admitted, no
+`onClose` (§7.2). A close accepted after it carries the subscription in its close job; if that job
+runs ahead of the registration job the window is empty and `onClose` fires once, in the close job and
+so ahead of the registration job (§7.6.1).
+
+**Closed handles.** A source and a subscriber each keep their live subscriptions until a close job
+ends them; the job, not the caller, drops the handle. A subscription closed after its circuit has
+closed is therefore kept until its source and subscriber are themselves unreachable.
+
+**`closeAwait`** on every one of these rejects a call from the owning circuit before close is
+requested (§9.1), a subscriber with no subscriptions included.
+
+---
+
 ## Why there is no in-house conformance suite
 
 The in-house suite was 657 tests and every one passed — while the upstream TCK failed 68 and
@@ -86,7 +126,7 @@ contract tests asserting that `@NotNull`, `@Idempotent`, `@Identity`, `@New`, `@
 
 ## What the local tests are, and are not
 
-`src/test/java` holds 47 tests across 12 classes. None asserts a spec requirement, and none is a
+`src/test/java` holds 51 tests across 13 classes. None asserts a spec requirement, and none is a
 substitute for the TCK. Every class exists because a **defect was found that the TCK passes straight
 through**, and each defect test is held to a rule the deleted suite was not:
 
@@ -109,6 +149,7 @@ demonstrated defect, and shown to fail without the fix, cannot.
 | `CaptureProvenanceTest` | 3 | all three `Capture#current()` cases — caller, emitting circuit, owning circuit for a ticker |
 | `ChanceReplayTest` | 3 | §5.1: `chance` replays from its published seed in a fresh JVM |
 | `SubscriptionCloseBeforeAddTest` | 1 | §7.6.1: a subscription closed before its registration job runs is never selected |
+| `ClosePositionTest` | 4 | §7.6.1 / §9.1: a source's and a subscriber's close are each one job at one position — `[subscribe, emit 1, close]` delivers `1`; what one `onClose` raises reaches no sibling subscription (3 defects). An empty window's `onClose` runs ahead of everything behind its registration job (1 guard: the single-caller order already held. The cross-thread cases — two routes closing one subscription, a close racing a subscribe — have no deterministic test: nothing outside the provider can hold a caller between accepting a close and admitting its job. They rest on the construction: each close admits its job under the lock that accepts it, and exactly-once is decided on the worker) |
 | `FailingFunctionStateTest` | 5 | 3.12.0 §6.2.3 / §8.1: `edge`, `tumble`, `integrate` across a failing function; an equal `State` write to an older slot returns the same instance |
 | `WindowCascadeLeaseTest` | 3 | §6.4.1: a window read from a later cascade faults (defect); one delivered a queued hop later, and one across its own queued emission, stays valid (2 guards) |
 | `TickerReanchorTest` | 1 | §11.4: a re-anchor after falling behind shifts the grid's phase rather than freezing for seq × interval |
@@ -211,6 +252,13 @@ cascade, because transit drains fully before the next ingress item (§5.3); any 
 later callback and faults. What remains is a different callback *of the same cascade* reading a window
 another callback kept. Distinguishing the two needs a token per dispatch, which is the framework hot
 path §6.4.1 keeps this check off, and would fault the legitimate pipe-hop delivery.
+
+**§11.4 — one tick can be admitted after `Ticker.close()` returns.** `close()` sets a flag and cancels
+the pending schedule; a scheduler task that had already passed its flag check emits its tick anyway.
+At most one, and only in that race. §11.4 says closing "stops further emissions" and allows only
+ticks "already admitted … before the close" to be delivered, so this one is outside the text. Closing
+it means either a close job the tick's receptor checks or a monitor around the check-and-emit; neither
+has been done.
 
 **The transit ring never shrinks.** `TransitQueue` doubles on demand and keeps its high-water mark
 for the life of the circuit: one 5 000-element fan-out leaves 8 192 slots across two arrays, about

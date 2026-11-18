@@ -5,10 +5,9 @@ import io.humainary.substrates.api.Substrates.Name;
 import io.humainary.substrates.api.Substrates.Provided;
 import io.humainary.substrates.api.Substrates.Queued;
 import io.humainary.substrates.api.Substrates.Subject;
-import io.humainary.substrates.api.Substrates.Pipe;
 import io.humainary.substrates.api.Substrates.Subscription;
 
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.List;
 import java.util.function.Consumer;
 
 /// A cancellable handle representing an active subscription to a source.
@@ -23,13 +22,26 @@ import java.util.function.Consumer;
 /// 1. **Active**: Created by `subscribe()`, subscriber receives callbacks
 /// 2. **Closed**: After `close()` is called, no more callbacks occur
 ///
-/// ## Three routes in, one latch (§7.5, §16.3)
+/// ## Three routes in, each its own job, exactly-once decided on the worker (§7.5, §7.6.1, §16.3)
 ///
 /// §16.3: the `onClose` callback "fires exactly once when the returned
 /// subscription is terminated — whether by explicit close, subscriber close, or
-/// **source close**". All three arrive at [#terminate()], and the
-/// compare-and-set there is the whole of "exactly once": however many callers
-/// race, one wins and every loser returns having done nothing.
+/// **source close**", and §7.6.1: the window "ends at the earliest of three close jobs:
+/// its own, its subscriber's, and its source's". So every close that is called queues its
+/// **own** job — [#close()] here, [FsSubscriber#close()], [FsConduit#close()] — and each
+/// job carries every subscription that close covers. None is filtered out on the caller's
+/// side because another route "got there first": a route that had only *accepted* a close
+/// has no position yet, and a caller-side winner would leave the other close without one.
+///
+/// Which job ends the subscription is decided where the jobs execute: the first to reach it
+/// on the worker finds it not [#retired], takes it off the roster and runs `onClose`; the
+/// others find it retired and do nothing. That is "the earliest of three" and "exactly once"
+/// as one worker-confined flag.
+///
+/// Retiring and `onClose` share a job on purpose. As two admissions, another caller's
+/// registration job could be admitted between them, and `onClose` would then run after
+/// the registration job of a window that was already empty — against §7.6.1's "no
+/// later than the point its registration job executes".
 ///
 /// @see FsConduit#subscribe(Subscriber)
 /// @see FsSubscriber
@@ -42,9 +54,9 @@ public final class FsSubscription implements Subscription {
   private final    FsSubject < ? >          parent;
   private volatile Subject < Subscription > subject;
 
-  /// Retires the registration: unsubscribes from the source and untracks this
-  /// subscription there. Runs for exactly one caller — the one that wins the latch.
-  private final Consumer < FsSubscription > detach;
+  /// The source this subscription was made on. It holds the roster this subscription sits in
+  /// and the pipe that carries its own close job.
+  final FsConduit < ? > source;
 
   /// The subscriber this subscription was made from. §7.3 keys the callback on the
   /// subscription/channel *pair*, so the channel-side memo is keyed by this subscription
@@ -54,46 +66,40 @@ public final class FsSubscription implements Subscription {
   /// User-supplied close callback — fires exactly once when subscription terminates.
   private final Consumer < ? super Subscription > onCloseCallback;
 
-  /// The capability that carries [#terminate]'s callback into the circuit context, issued
-  /// through `Circuit.pipe(Receptor)`. Null when no callback was supplied, which is the common
-  /// case — a subscription that will never fire one builds nothing. The subscription itself is
-  /// the emission, so closing allocates no carrier. See `docs/DECISIONS.md`, *Capabilities over factories*.
-  private final Pipe < Subscription > closures;
-
-  /// Circuit reference — needed by closeAwait() to block until the
-  /// queued unsubscribe admission has been processed, and to dispatch `onClose`
-  /// into the circuit context.
+  /// Circuit reference — lifecycle authority only: [#closeAwait()] blocks on it until the
+  /// queued close job has been processed.
   private final FsCircuit circuit;
 
-  /// §7.5's idempotence and §16.3's exactly-once, as one word. A plain
-  /// check-then-set would let two racing closers both fire the callback.
-  private final AtomicBoolean closed = new AtomicBoolean ();
+  /// §7.5's idempotence for this route only: a second [#close()] queues no second job. Guarded
+  /// by this object's monitor, together with the admission of the job, so a caller that finds
+  /// it set can rely on the job already being queued (§9.1 `closeAwait`).
+  private boolean closeAccepted;
+
+  /// Whether a close job has EXECUTED for this subscription on the circuit worker — the close end
+  /// of the §7.6.1 window in processing order. Worker-confined: written by a close job, read by
+  /// close jobs and by the conduit's registration job.
+  private boolean retired;
+
+  /// Whether `onClose` has run. Worker-confined. Separate from [#retired] only because a job that
+  /// ends several subscriptions retires all of them before it runs any `onClose`.
+  private boolean notified;
 
   /// Creates a new subscription with lazy subject creation and an onClose callback.
   ///
   /// @param name            the name for the subscription subject
   /// @param parent          the parent subject for hierarchy
   /// @param circuit         the owning circuit, used for [#closeAwait()]
+  /// @param source          the conduit this subscription was made on
   /// @param subscriber      the subscriber this subscription was made from
-  /// @param detach          retires the registration when the subscription terminates
   /// @param onCloseCallback user-supplied callback fired exactly once on termination, or null
-  FsSubscription ( Name name, FsSubject < ? > parent, FsCircuit circuit, FsSubscriber < ? > subscriber,
-                   Consumer < FsSubscription > detach, Consumer < ? super Subscription > onCloseCallback ) {
+  FsSubscription ( Name name, FsSubject < ? > parent, FsCircuit circuit, FsConduit < ? > source,
+                   FsSubscriber < ? > subscriber, Consumer < ? super Subscription > onCloseCallback ) {
     this.name = name;
     this.parent = parent;
     this.circuit = circuit;
+    this.source = source;
     this.subscriber = subscriber;
-    this.detach = detach;
     this.onCloseCallback = onCloseCallback;
-    this.closures = onCloseCallback == null ? null
-      : circuit.< Subscription >pipe ( subscription -> {
-          try {
-            onCloseCallback.accept ( subscription );
-          } catch ( Throwable ignored ) {
-            // §15.4: an onClose callback is external code. Its failure is isolated
-            // here so a sibling subscription's cleanup still runs (§15.4 #2).
-          }
-        } );
   }
 
   /// Returns the subject identity of this subscription. Lazy creation with
@@ -115,55 +121,61 @@ public final class FsSubscription implements Subscription {
     return s;
   }
 
-  /// Closes this subscription, unregistering from the source.
+  /// Closes this subscription: its own close job, queued on the source's circuit (§7.5).
   /// Idempotent - repeated calls have no effect.
   @Idempotent
   @Queued
   @Override
   public void close () {
-    terminate ();
-  }
-
-  /// Whether this subscription has accepted close, by any of the three routes.
-  boolean isClosed () {
-    return closed.get ();
-  }
-
-  /// Whether the retire job has EXECUTED on the circuit worker — the close end of the §7.6.1 window
-  /// in processing order, as distinct from `isClosed`, which is the caller having accepted close.
-  /// Worker-confined: written by the conduit's unsubscribe job and read by its subscribe job.
-  private boolean retired;
-
-  void retired () {
-    retired = true;
+    synchronized ( this ) {
+      if ( closeAccepted ) return;
+      closeAccepted = true;
+      // Admitted under the monitor: a wait-free enqueue, no external code. A second closer
+      // returns only once this job has a position.
+      source.unsubscribe ( this );
+    }
   }
 
   boolean isRetired () {
     return retired;
   }
 
-  /// The single termination path, shared by explicit close, subscriber close and
-  /// source close (§7.5, §16.3).
+  /// Worker side of a close job, first half: if no earlier close job has, end the window here
+  /// (§7.6.1). After this the registration job, if it has not run yet, takes no effect, and no
+  /// channel selects this subscription at a later position.
   ///
-  /// The latch comes first, so the two things after it — retiring the
-  /// registration and firing `onClose` — happen for exactly one caller.
-  void terminate () {
-    if ( closed.getAndSet ( true ) ) return;
+  /// The tracking lists are trimmed here and not by the caller that asked: until its close job
+  /// runs, a subscription must stay visible to the *other* routes, so that a subscriber's or a
+  /// source's close queued in the meantime carries it too.
+  void retire () {
+    if ( retired ) return;
+    retired = true;
+    source.hub.removeSubscription ( this );
+    source.untrackSubscription ( this );
+    subscriber.untrackSubscription ( this );
+  }
 
-    detach.accept ( this );
-
+  /// Worker side of a close job, second half: `onClose`, once, in the circuit context (§16.3),
+  /// observing a topology this subscription has already left.
+  void notifyClosed () {
+    if ( notified ) return;
+    notified = true;
     final Consumer < ? super Subscription > callback = onCloseCallback;
     if ( callback == null ) return;
+    try {
+      callback.accept ( this );
+    } catch ( Throwable ignored ) {
+      // §15.4: an onClose callback is external code. Its failure is isolated here so a
+      // sibling subscription's cleanup, in the same close job, still runs (§15.4 #2).
+    }
+  }
 
-    // §16.3: the callback "receives the subscription being closed and executes
-    // within the circuit context". Admitted to ingress *behind* the retire, so it
-    // observes a topology this subscription has already left. Running it on the
-    // closing caller's thread satisfies neither property.
-    //
-    // §16.3 also covers the shutdown case: "If the owning circuit has already
-    // terminated and cannot accept the cleanup work, the callback is not required
-    // to run" — an admission after the close marker is simply never drained.
-    closures.emit ( this );
+  /// A close job for many subscriptions at once — a subscriber's, or a source's (§7.6.1: "its
+  /// subscriber's, and its source's"). Every window still open ends before any `onClose` runs,
+  /// so whatever an `onClose` raises is positioned behind the close of all of them.
+  static void closeAll ( List < FsSubscription > subscriptions ) {
+    for ( int i = 0, n = subscriptions.size (); i < n; i++ ) subscriptions.get ( i ).retire ();
+    for ( int i = 0, n = subscriptions.size (); i < n; i++ ) subscriptions.get ( i ).notifyClosed ();
   }
 
   @Idempotent
@@ -172,12 +184,6 @@ public final class FsSubscription implements Subscription {
     circuit.checkExternalCaller ( "closeAwait" );
     close ();
     circuit.await ();
-  }
-
-  /// Package-internal accessor for the owning circuit, used by FsSubscriber
-  /// to thread an await through closeAwait().
-  FsCircuit awaitCircuit () {
-    return circuit;
   }
 
 }

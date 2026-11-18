@@ -206,8 +206,9 @@ public final class FsCircuit implements Circuit {
   // ReceptorAdapter — wraps a user Receptor in a Consumer<Object>.
   //
   // Hot path: ingress/transit drain → r.accept(v) → receptor.receive(v).
-  // Used ONLY for user receptors (circuit.pipe(receptor) and friends).
-  // Markers and circuit jobs use distinct concrete classes below so the
+  // Used for receptors — a user's (circuit.pipe(receptor) and friends) and the provider's own
+  // queued jobs, which are receptors too (FsConduit's pipes, FsSubscriber's close job).
+  // Markers use distinct concrete classes below so the
   // bci=5 receptor.receive call site here stays monomorphic per circuit.
   // ─────────────────────────────────────────────────────────────────────────────
 
@@ -353,7 +354,7 @@ public final class FsCircuit implements Circuit {
   /// predictable branch here and lets an idle circuit consume nothing.
   /// **Private on purpose.** Admitting straight to ingress skips the §5.3 routing decision, and
   /// five classes used to do exactly that — `FsBasin.drain`, `FsConduit`'s subscribe / close /
-  /// unsubscribe, and `FsSubscription`'s onClose — so work raised on the worker was admitted as
+  /// unsubscribe, and the subscription's onClose — so work raised on the worker was admitted as
   /// ingress instead of transit. The rule survived only by convention, and convention is what let
   /// it drift. [#submit] is the way in; the only callers left here are the ones for which ingress
   /// is the specified answer: `pulse`, which rejects a worker caller before it asks, and the
@@ -370,9 +371,11 @@ public final class FsCircuit implements Circuit {
   /// circuit. The transit ring is single-threaded, so routing a foreign-thread emission into it
   /// is a data race, not merely a lost emission.
   ///
-  /// §9.1: an emission admitted after close never runs, because the close marker is enqueued
-  /// before `closed` is set and the worker stops at it. Dropping here rather than enqueueing is
-  /// therefore the same behaviour, minus a carrier linked onto a queue nothing will drain.
+  /// §9.1: an emission submitted once `closed` is set is dropped here rather than linked behind
+  /// the close marker. The worker does not stop *at* the marker — it finishes draining ingress
+  /// and then exits — so a submission that read `closed` as false and linked just behind the
+  /// marker is still dispatched; that race is the only work processed behind the close position
+  /// (documented in `docs/CONFORMANCE.md`, *Close: what drains and what is dropped*).
   ///
   /// `FsPipe.emit` and `FsPort` both used to carry their own copy of this branch, and the copy
   /// that called itself canonical was the one missing the close check — which is how three
@@ -674,8 +677,8 @@ public final class FsCircuit implements Circuit {
     }
 
     // Only a genuinely slow circuit reaches here. Bounded parks rather than an indefinite
-    // one: a marker admitted at or after the close marker is never dispatched (§9.1), so
-    // its flag is never set, and §5.5 requires await to return immediately once the circuit
+    // one: a marker admitted after the worker has drained past the close marker and exited is
+    // never dispatched, so its flag is never set, and §5.5 requires await to return immediately once the circuit
     // is closed. Re-checking on each wake also covers spurious returns from park.
     while ( !barrier.released ) {
       if ( closed && !worker.isAlive () ) return;
@@ -1160,7 +1163,7 @@ public final class FsCircuit implements Circuit {
     requireNonNull ( callback );
     requireOpen ( "subscriber" );
     return new FsSubscriber <> (
-      new FsSubject <> ( name, (FsSubject < ? >) subject, Subscriber.class ), callback );
+      new FsSubject <> ( name, (FsSubject < ? >) subject, Subscriber.class ), this, callback );
   }
 
 }

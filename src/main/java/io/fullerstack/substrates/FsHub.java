@@ -40,8 +40,24 @@ final class FsHub < E > {
   }
 
   void removeSubscription ( FsSubscription subscription ) {
+    // The version moves only when the roster does: a close job for a subscription whose
+    // registration never ran removes nothing, and must not make every channel rebuild.
+    if ( subscribersList != null && subscribersList.remove ( subscription ) ) {
+      subscriberVersion++;
+    }
+  }
+
+  /// Set by the conduit's close job, on the worker, and never cleared. It is the conduit's close
+  /// **position** (§9.1): a registration job the worker reaches after it takes no effect. The
+  /// conduit's own `closed` flag cannot serve — a caller writes that the moment `close()` is
+  /// called, which is ahead of work the same caller queued before it.
+  boolean closed;
+
+  /// The conduit's close job: every window on this source ends here (§7.6.1).
+  void close () {
+    closed = true;
     if ( subscribersList != null ) {
-      subscribersList.remove ( subscription );
+      subscribersList.clear ();
       subscriberVersion++;
     }
   }

@@ -44,18 +44,23 @@ public final class FsConduit < E > implements Conduit < E > {
 
   /// The three lifecycle capabilities, issued by the owning circuit through
   /// `Circuit.pipe(Receptor)` and built once. Each operation is an emission whose value is the
-  /// part that varies — the subscription joining, the subscription leaving, the hub being
-  /// cleared — so none of them allocates a carrier per call. See `docs/DECISIONS.md`, *Capabilities over factories*.
+  /// part that varies — the subscription joining, the subscription leaving, the subscriptions
+  /// this conduit's close ends — so none of them allocates a carrier per call. See
+  /// `docs/DECISIONS.md`, *Capabilities over factories*.
   ///
   /// The unit carried is the **subscription**, not the subscriber: §7.5 makes each subscribe
   /// "an independent subscription instance" and §7.3 keys the callback on the
   /// subscription/channel pair, so the roster [FsHub] keeps is a roster of subscriptions.
   ///
+  /// Each is one job at one position in the circuit's processing order (§7.6.1): `subscribes`
+  /// is a registration job, `unsubscribes` one subscription's own close job, `closes` this
+  /// source's close job.
+  ///
   /// The conduit still holds its circuit: unlike these three, `await`, `isClosed` and
   /// `checkExternalCaller` are lifecycle authority and no pipe confers them.
-  private final Pipe < FsSubscription > subscribes;
-  private final Pipe < FsSubscription > unsubscribes;
-  private final Pipe < FsHub < E > >    clears;
+  private final Pipe < FsSubscription >          subscribes;
+  private final Pipe < FsSubscription >          unsubscribes;
+  private final Pipe < List < FsSubscription > > closes;
 
   /// Channels by name — the `Pool<Pipe<E>>` half of this type.
   ///
@@ -64,10 +69,11 @@ public final class FsConduit < E > implements Conduit < E > {
   /// so did [FsSink]; both were the storage `Pool` already provides. See `docs/DECISIONS.md`, *Capabilities over factories*.
   private final Pool < FsChannel < E > > channels = cortex ().pool ( this::materialize );
 
-  /// Closed flag — set by `close()`. Subscribe jobs check this on the
-  /// circuit thread and silently drop (per Resource §9.1 queued-drop semantics).
-  /// Written under `subscriptionLock` so a subscribe racing a close either
-  /// registers before the drain or is terminated by it, never neither.
+  /// Close **accepted** — set by `close()` on the caller's side. It is what the synchronous
+  /// open-required guard reads (§9.1) and nothing else: no queued job consults it, because a job's
+  /// effect is decided by its position relative to the close job, which is worker-confined state.
+  /// Written under `subscriptionLock`, as the tracking in `subscribe` is, so a subscribe racing a
+  /// close is either in the list the close job carries or rejected, never neither.
   private volatile boolean closed;
 
   /// Live subscriptions issued by this source, so §9.1's "closing a source
@@ -91,35 +97,34 @@ public final class FsConduit < E > implements Conduit < E > {
     this.hub     = new FsHub <> ();
     this.subject = (Subject < Conduit < E > >) (Subject < ? >) new FsSubject <> ( name, parent, Conduit.class );
 
-    // §7.6.1: a subscription's window runs from the point its registration job EXECUTES to the point
-    // its close job executes — both positions in the circuit's processing order, neither the moment
-    // the caller called close(). A close raised on the worker (transit) can execute before the
-    // caller's add job (ingress): the remove then runs against an empty roster, and the add would
-    // install a subscription whose close job has already run and can never be retired again. So the
-    // add job asks whether the RETIRE JOB has executed (`retired`, set on the worker), not whether
-    // close was accepted (`isClosed`, set on the caller): `subscribe(); emit(X); close(); emit(Y)`
-    // from one caller has the add job execute ahead of the retire job, and X must be delivered.
+    // §7.6.1: a subscription's window runs from the point its registration job EXECUTES to the
+    // point the earliest of three close jobs executes — its own, its subscriber's, this source's —
+    // all positions in the circuit's processing order, none the moment a caller called close().
+    // So the registration job asks two worker-confined questions and no caller-side one: has this
+    // subscription's close job already run (`isRetired` — a transit close can overtake an ingress
+    // subscribe, and the window is then empty), and has this source's (`hub.closed`, §9.1). From
+    // one caller, `subscribe(); emit(X); close(); emit(Y)` — whichever of the three closes that
+    // is — has the registration ahead of the close job, and X is delivered.
     this.subscribes   = circuit.pipe ( subscription -> {
-      if ( !closed && !subscription.isRetired () ) hub.addSubscription ( subscription );
+      if ( !hub.closed && !subscription.isRetired () ) hub.addSubscription ( subscription );
     } );
+    // One subscription's own close job: its window ends, then its onClose runs — one position.
     this.unsubscribes = circuit.pipe ( subscription -> {
-      subscription.retired ();
-      hub.removeSubscription ( subscription );
+      subscription.retire ();
+      subscription.notifyClosed ();
     } );
-    this.clears       = circuit.pipe ( FsConduit::clear );
+    // This source's close job: the roster empties and every subscription still tracked when close
+    // was called is retired — including one whose registration job has not run yet — before any
+    // onClose runs. One an earlier close job already ended is skipped (see FsSubscription).
+    this.closes       = circuit.pipe ( ended -> {
+      hub.close ();
+      FsSubscription.closeAll ( ended );
+    } );
   }
 
   @Override
   public Subject < Conduit < E > > subject () {
     return subject;
-  }
-
-  /// Clear receptor — runs on the circuit worker when the conduit closes.
-  private static < E > void clear ( FsHub < E > hub ) {
-    if ( hub.subscribersList != null ) {
-      hub.subscribersList.clear ();
-      hub.subscriberVersion++;
-    }
   }
 
   // ─── Pool<Pipe<E>> ───
@@ -265,22 +270,32 @@ public final class FsConduit < E > implements Conduit < E > {
     }
 
     FsSubscription subscription = new FsSubscription ( subscriber.subject ().name (),
-      (FsSubject < ? >) subject, circuit, fs, s -> retire ( s, fs ), onClose );
+      (FsSubject < ? >) subject, circuit, this, fs, onClose );
 
-    trackSubscription ( subscription );
-    fs.trackSubscription ( subscription );
+    // The guards again, this time together with the tracking and under both locks — the
+    // subscriber's, then this source's; `subscribe` is the only place the two nest. A close of
+    // either accepted before this point rejects the call with nothing tracked and nothing admitted:
+    // "no subscription exists and any supplied onClose callback MUST NOT be invoked" (§7.2). One
+    // accepted after it finds the subscription in its list and carries it in its close job, which
+    // may then run ahead of the registration job below: an empty window (§7.6.1).
+    synchronized ( fs.lock ) {
+      if ( fs.isClosed () ) {
+        throw new Fault ( subject, "subscribe", "subscriber is closed: " + subSubject );
+      }
+      synchronized ( subscriptionLock ) {
+        if ( closed ) throw new Fault ( subject, "subscribe", "conduit is closed" );
+        if ( subscriptions == null ) subscriptions = new ArrayList <> ();
+        subscriptions.add ( subscription );
+      }
+      fs.trackSubscription ( subscription );
+    }
 
-    // The subscription is the emission; the receptor is fixed and built once. If the conduit is
-    // closed by the time this runs on the circuit thread, silently drop per Resource §9.1
-    // queued-operation semantics.
+    // The registration job. The subscription is the emission; the receptor is fixed and built once.
     subscribes.emit ( subscription );
 
     return subscription;
   }
 
-  /// Closes the conduit. Sets the closed flag so any pending or future
-  /// subscribe jobs are silently dropped on the circuit thread, and queues
-  /// a admission to release the subscriber list. Idempotent (Resource §9.1).
   /// §9.1 open-required guard. Rejects if either this conduit or its owning
   /// circuit has accepted close — circuit-closed leaves work undrainable, so
   /// the conduit is effectively closed too.
@@ -289,34 +304,25 @@ public final class FsConduit < E > implements Conduit < E > {
       throw new Fault ( subject, op, "conduit is closed" );
   }
 
-  /// §9.1: closing a source "cancels any outstanding subscriptions to it", and
-  /// §16.3 makes source close one of the three routes that fires a subscription's
-  /// `onClose`. Terminating each live subscription is what discharges both.
+  /// Closes the conduit: **one** close job (§7.6.1 "its source's"), queued where the caller's
+  /// earlier work already is. §9.1: closing a source "cancels any outstanding subscriptions to
+  /// it", and §16.3 makes source close one of the three routes that fires a subscription's
+  /// `onClose`. The job carries every subscription tracked at this moment; everything queued
+  /// ahead of it is processed to completion, everything behind it finds an empty roster.
+  /// Idempotent (§9.1).
   @Idempotent
   @Queued
   @Override
   public void close () {
-    List < FsSubscription > live;
     synchronized ( subscriptionLock ) {
       if ( closed ) return;
       closed = true;
-      live = subscriptions;
+      List < FsSubscription > live = subscriptions;
       subscriptions = null;
+      // Admitted under the lock: a wait-free enqueue, no external code. A second closer, and
+      // its closeAwait, return only once this job has a position.
+      closes.emit ( live == null ? List.of () : live );
     }
-
-    if ( live != null ) {
-      // Outside the lock, and one guard per subscription: §15.4 #2 — a failing
-      // termination must not strand its siblings' cleanup.
-      for ( FsSubscription s : live ) {
-        try {
-          s.terminate ();
-        } catch ( Throwable ignored ) {
-          // §15.4 — suppressed; remaining subscriptions still terminate.
-        }
-      }
-    }
-
-    clears.emit ( hub );
   }
 
   @Idempotent
@@ -327,32 +333,16 @@ public final class FsConduit < E > implements Conduit < E > {
     circuit.await ();
   }
 
-  /// Records a live subscription so that source close can terminate it (§9.1).
-  /// A subscribe that loses the race with close terminates immediately rather
-  /// than leaving a handle nobody will ever close.
-  private void trackSubscription ( FsSubscription subscription ) {
-    boolean alreadyClosed;
-    synchronized ( subscriptionLock ) {
-      alreadyClosed = closed;
-      if ( !alreadyClosed ) {
-        if ( subscriptions == null ) subscriptions = new ArrayList <> ();
-        subscriptions.add ( subscription );
-      }
-    }
-    if ( alreadyClosed ) subscription.terminate ();
-  }
-
-  /// Retires one subscription: drops it from both tracking lists and queues the
-  /// hub unsubscribe. Runs once per subscription — [FsSubscription#terminate()]
-  /// holds the latch.
-  private void retire ( FsSubscription subscription, FsSubscriber < E > subscriber ) {
+  /// Drops a subscription a close job has ended, so a long-lived source does not accumulate
+  /// dead handles. Called on the worker, by that job.
+  void untrackSubscription ( FsSubscription subscription ) {
     synchronized ( subscriptionLock ) {
       if ( subscriptions != null ) subscriptions.remove ( subscription );
     }
-    subscriber.untrackSubscription ( subscription );
-    // §7.5: close "removes all pipes registered by this subscription" — this subscription's
-    // roster entry is what the job deletes; the *other* subscriptions of the same subscriber
-    // keep theirs.
+  }
+
+  /// Queues one subscription's own close job (§7.5).
+  void unsubscribe ( FsSubscription subscription ) {
     unsubscribes.emit ( subscription );
   }
 
